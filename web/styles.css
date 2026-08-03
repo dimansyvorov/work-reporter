@@ -2001,13 +2001,17 @@ th.col-task {
 
 .rating-modal-row {
   display: grid;
-  grid-template-columns: 2.4rem minmax(0, 1fr) auto;
+  grid-template-columns: 2.4rem minmax(0, 1fr) minmax(7rem, 40%);
   gap: 0.75rem;
-  align-items: center;
+  align-items: start;
   padding: 0.7rem 0.85rem;
   border-radius: 12px;
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.72);
+}
+
+.rating-modal-person {
+  min-width: 0;
 }
 
 .rating-modal-person .muted {
@@ -2019,6 +2023,12 @@ th.col-task {
   font-family: var(--mono);
   font-weight: 700;
   font-size: 1rem;
+  white-space: nowrap;
+}
+
+.rating-modal-row .rating-score {
+  min-width: 0;
+  white-space: normal;
 }
 
 .rating-modal-row.place-1 {
@@ -2341,9 +2351,9 @@ th.col-task {
 
 .rating-person {
   display: grid;
-  grid-template-columns: 2.4rem minmax(0, 1fr) auto;
-  gap: 0.75rem;
-  align-items: center;
+  grid-template-columns: 2.4rem minmax(0, 1fr) minmax(6.5rem, 42%);
+  gap: 0.65rem;
+  align-items: start;
 }
 
 .medal {
@@ -2383,15 +2393,38 @@ th.col-task {
   font-weight: 600;
   color: var(--accent);
   text-align: right;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.rating-score-main,
+.rating-score-value {
   white-space: nowrap;
 }
 
-.rating-person .person {
+.rating-score-detail {
+  margin-top: 0.15rem;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.25;
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.rating-person .person,
+.rating-modal-row .person,
+.rating-podium-slot .person {
   min-width: 0;
+  max-width: 100%;
 }
 
 .rating-person .person span {
-  white-space: normal;
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   line-height: 1.25;
   font-size: 0.92rem;
 }

@@ -239,11 +239,7 @@ def compute_ratings(
                 "score": score,
                 "tiebreak": closed_n,
                 "value": f"{_round(mean_day * 100.0, 0)}% к норме",
-                "detail": (
-                    f"σ={_round(spread, 1)} · "
-                    f"последние 2 дня {_round(binge * 100.0, 0)}% · "
-                    f"закрыто {closed_n}"
-                ),
+                "detail": f"σ={_round(spread, 1)} · закрыто {closed_n}",
             }
         )
     stability_top = _with_places(stability_rows)
@@ -329,7 +325,7 @@ def compute_ratings(
                 "direction": TEAM_ROSTER[name],
                 "score": score,
                 "tiebreak": closed_n,
-                "value": f"{_round(score, 2)} эст.ч/ч",
+                "value": f"{_round(score, 2)} оценки на час",
                 "detail": (
                     f"оценка {_round(est_closed, 1)} ч · "
                     f"списано {_round(hours, 1)} ч · "
@@ -344,7 +340,7 @@ def compute_ratings(
             "id": "efficiency",
             "title": "Эффективность",
             "description": (
-                "Сумма Original Estimate закрытых задач / часы worklog за спринт "
+                "Сколько часов оценки закрытых задач приходится на 1 час списаний "
                 f"(минимум {min_hours:.0f} ч списаний). "
                 "При равном score выше тот, у кого больше закрытых задач"
             ),

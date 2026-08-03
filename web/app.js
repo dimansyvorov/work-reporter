@@ -1232,10 +1232,10 @@ function renderRatings(ratings) {
                 (p) => `
               <div class="rating-person">
                 ${medalHtml(p.place)}
-                ${personCell(p.name, p.avatar_url, { short: false })}
+                ${personCell(p.name, p.avatar_url, { short: true })}
                 <div class="rating-score">
-                  <div>${escapeHtml(p.value || "")}</div>
-                  <div class="muted">${escapeHtml(p.detail || p.direction || "")}</div>
+                  <div class="rating-score-main">${escapeHtml(p.value || "")}</div>
+                  <div class="muted rating-score-detail">${escapeHtml(p.detail || p.direction || "")}</div>
                 </div>
               </div>`
               )
@@ -1571,7 +1571,7 @@ function openRatingModal(catId) {
           </div>
           <div class="rating-score">
             <div class="rating-score-value">${escapeHtml(p.value || "")}</div>
-            <div class="muted">${escapeHtml(p.detail || "")}</div>
+            <div class="muted rating-score-detail">${escapeHtml(p.detail || "")}</div>
           </div>
         </div>`;
         })

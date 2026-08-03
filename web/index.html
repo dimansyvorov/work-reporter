@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Отчет</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="header">
+        <div class="header-row">
+          <div>
+            <p class="eyebrow">Локальный отчёт · GitLab + Jira</p>
+            <h1 id="sprint-title">Спринт</h1>
+            <p id="meta" class="meta">Загрузка…</p>
+          </div>
+          <div class="header-actions">
+            <div id="data-freshness" class="data-freshness" title="Время последнего успешного сбора данных">
+              <span class="data-freshness-label">Данные</span>
+              <strong id="data-freshness-value">—</strong>
+            </div>
+            <button type="button" id="refresh-btn" class="refresh-btn" disabled>
+              Обновить данные
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <section id="loading" class="panel loading-panel">
+        <div class="loading-head">
+          <div class="spinner" aria-hidden="true"></div>
+          <div class="loading-copy">
+            <h2 id="loading-title">Готовим отчёт</h2>
+            <p id="loading-message" class="muted">Подключаюсь к серверу…</p>
+          </div>
+          <div class="loading-progress-meta">
+            <span id="loading-pct">0%</span>
+            <span id="loading-count" class="muted"></span>
+          </div>
+        </div>
+        <div class="loading-bar" aria-hidden="true">
+          <div id="loading-bar-fill" class="loading-bar-fill"></div>
+        </div>
+        <ol id="loading-steps" class="steps"></ol>
+      </section>
+
+      <section id="error" class="panel error hidden"></section>
+
+      <div id="report-root" class="hidden">
+        <section id="sprint-header" class="summary"></section>
+
+        <section id="directions-section" class="panel collapsible-panel">
+          <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="false">
+            <div class="section-head tight">
+              <h2>Направления</h2>
+              <p class="muted">Сводка по командам</p>
+            </div>
+            <span class="collapse-toggle-btn">
+              <span class="collapse-chevron" aria-hidden="true">▾</span>
+              <span class="collapse-label" data-collapse-label>Развернуть</span>
+            </span>
+          </button>
+          <div id="directions-mini" class="collapsible-summary"></div>
+          <div id="directions-summary" class="directions-summary collapsible-body"></div>
+        </section>
+
+        <section id="releases-section" class="panel collapsible-panel hidden">
+          <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="false">
+            <div class="section-head tight">
+              <h2>Релизы</h2>
+              <p class="muted">Ближайшие версии</p>
+            </div>
+            <span class="collapse-toggle-btn">
+              <span class="collapse-chevron" aria-hidden="true">▾</span>
+              <span class="collapse-label" data-collapse-label>Развернуть</span>
+            </span>
+          </button>
+          <div id="releases-mini" class="collapsible-summary"></div>
+          <div id="releases" class="releases-list collapsible-body"></div>
+        </section>
+
+        <section id="epic-timeline-section" class="panel collapsible-panel hidden">
+          <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="true">
+            <div class="section-head tight">
+              <h2>Эпики</h2>
+              <p class="muted">Длина полосы — оценка; заливка — доля закрытых задач</p>
+            </div>
+            <span class="collapse-toggle-btn">
+              <span class="collapse-chevron" aria-hidden="true">▾</span>
+              <span class="collapse-label" data-collapse-label>Свернуть</span>
+            </span>
+          </button>
+          <div id="epics-mini" class="collapsible-summary"></div>
+          <div class="collapsible-body">
+            <div id="epic-timeline-legend" class="epic-legend"></div>
+            <p id="epic-timeline-note" class="muted epic-timeline-note"></p>
+            <div id="epic-timeline" class="epic-timeline"></div>
+          </div>
+        </section>
+
+        <section id="direction-details"></section>
+
+        <section id="team-section" class="panel collapsible-panel">
+          <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="false">
+            <div class="section-head tight">
+              <h2>Списание времени</h2>
+              <p class="muted">По дням спринта</p>
+            </div>
+            <span class="collapse-toggle-btn">
+              <span class="collapse-chevron" aria-hidden="true">▾</span>
+              <span class="collapse-label" data-collapse-label>Развернуть</span>
+            </span>
+          </button>
+          <div id="worklog-mini" class="collapsible-summary"></div>
+          <div class="collapsible-body">
+            <div class="toolbar">
+              <div class="toolbar-right day-nav">
+                <button type="button" id="day-prev" class="nav-btn" aria-label="Предыдущий день">←</button>
+                <div class="day-current">
+                  <div id="worklog-day-label">—</div>
+                  <div id="worklog-day-note" class="muted"></div>
+                </div>
+                <button type="button" id="day-next" class="nav-btn" aria-label="Следующий день">→</button>
+              </div>
+            </div>
+            <div id="team-by-direction"></div>
+          </div>
+        </section>
+
+        <section id="risks-section" class="panel">
+          <div class="section-head">
+            <h2>Риски спринта</h2>
+            <p class="muted">Задачи, на которые стоит обратить внимание</p>
+          </div>
+          <div id="risks" class="risks"></div>
+        </section>
+
+        <section id="ratings-section" class="panel">
+          <div class="section-head">
+            <h2>Рейтинг</h2>
+            <p class="muted">Топ сотрудников по категориям спринта</p>
+          </div>
+          <div id="ratings" class="ratings-grid"></div>
+        </section>
+      </div>
+    </main>
+
+    <div id="app-modal" class="modal hidden" aria-hidden="true">
+      <div class="modal-backdrop" data-modal-close></div>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="app-modal-title">
+        <button type="button" class="modal-close" data-modal-close aria-label="Закрыть">×</button>
+        <div id="app-modal-body"></div>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

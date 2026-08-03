@@ -715,8 +715,8 @@ function renderSprintHeader(sprint, mood) {
       value: timePct == null ? "—" : `${fmtNumber(timePct)}%`,
       hint:
         sprint.day_index != null && sprint.day_total != null
-          ? `день ${sprint.day_index} из ${sprint.day_total}`
-          : "по календарю",
+          ? `день ${sprint.day_index} из ${sprint.day_total} · календарные дни`
+          : "календарные дни",
       tone: timeTone,
     },
     {
@@ -773,9 +773,9 @@ function renderEpicTimeline(timeline) {
     return;
   }
   section.classList.remove("hidden");
-  section.classList.add("is-open");
+  section.classList.remove("is-open");
   const toggle = section.querySelector("[data-collapse-toggle]");
-  if (toggle) syncCollapseLabel(toggle, true);
+  if (toggle) syncCollapseLabel(toggle, false);
 
   if (mini) {
     mini.innerHTML = epics
@@ -1450,11 +1450,24 @@ function openPersonModal(name) {
       const remainPx = isWeekend ? 0 : Math.round((remain / maxH) * chartH);
       const over = !isWeekend && h > expected + 0.05;
       const barCls = h <= 0 ? "is-zero" : over ? "is-over" : h + 0.05 < expected && !isWeekend ? "is-low" : "is-ok";
-      const tipText = isWeekend
+      const issueLines = (d.issues || [])
+        .map((issue) => {
+          const summary = String(issue.summary || "").trim();
+          const label = summary ? `${issue.key}: ${summary}` : issue.key;
+          return `${label} — ${fmtNumber(issue.hours)} ч`;
+        })
+        .join("\n");
+      const head = isWeekend
         ? `${wd} ${fmtDay(d.date)}: списано ${fmtNumber(h)} ч (выходной)`
         : `${wd} ${fmtDay(d.date)}: списано ${fmtNumber(h)} ч, до нормы ${fmtNumber(remain)} ч`;
+      const tipText = issueLines
+        ? `${head}\n${issueLines}`
+        : h > 0
+          ? `${head}\nНет разбивки по задачам`
+          : head;
+      const tipAttr = escapeHtml(tipText).replaceAll("\n", "&#10;");
       return `
-        <div class="person-hours-col has-tip" tabindex="0" data-tip="${escapeHtml(tipText)}">
+        <div class="person-hours-col has-tip" tabindex="0" data-tip="${tipAttr}">
           <div class="person-hours-bar-wrap" style="height:${chartH}px">
             <div class="person-hours-stack">
               ${remainPx > 0 ? `<div class="person-hours-remain" style="height:${remainPx}px"></div>` : ""}

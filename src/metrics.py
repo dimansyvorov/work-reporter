@@ -1299,6 +1299,8 @@ def _build_people_profiles(
     issues: list[dict],
     team_rows: list[dict],
     hours_by_person_day: dict[str, dict[str, float]],
+    hours_by_person_day_issue: dict[str, dict[str, dict[str, float]]],
+    issue_summary_by_key: dict[str, str],
     hours_by_issue: dict[str, float],
     links: dict,
     ratings: list[dict],
@@ -1389,13 +1391,28 @@ def _build_people_profiles(
                 t.get("key") or "",
             ),
         )
-        day_hours = [
-            {
-                "date": day,
-                "hours": _round(hours_by_person_day.get(name, {}).get(day, 0.0), 2) or 0.0,
-            }
-            for day in sprint_days
-        ]
+        day_hours = []
+        for day in sprint_days:
+            day_total = _round(hours_by_person_day.get(name, {}).get(day, 0.0), 2) or 0.0
+            by_issue = hours_by_person_day_issue.get(name, {}).get(day) or {}
+            issues_day = [
+                {
+                    "key": key,
+                    "summary": issue_summary_by_key.get(key) or key,
+                    "hours": _round(hours, 2) or 0.0,
+                }
+                for key, hours in sorted(
+                    by_issue.items(), key=lambda item: (-item[1], item[0])
+                )
+                if hours > 0
+            ]
+            day_hours.append(
+                {
+                    "date": day,
+                    "hours": day_total,
+                    "issues": issues_day,
+                }
+            )
         active_tasks = [t for t in tasks if t.get("direction_state") == "active"]
         risk_tasks = [t for t in active_tasks if t.get("risk") or _has_risk_tags(t.get("tags"))]
         remain_sum = sum(
@@ -1509,8 +1526,12 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
 
     # Worklogs only from roster
     hours_by_person_day: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    hours_by_person_day_issue: dict[str, dict[str, dict[str, float]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(float))
+    )
     hours_by_issue: dict[str, float] = defaultdict(float)
     hours_by_person_issue: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    issue_summary_by_key: dict[str, str] = {}
     jira_avatar_by_person: dict[str, str | None] = {}
 
     for log in jira_raw.get("worklogs") or []:
@@ -1528,12 +1549,21 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
             key = str(log["issue_key"]).upper()
             hours_by_issue[key] += hours
             hours_by_person_issue[canonical][key] += hours
+            hours_by_person_day_issue[canonical][day][key] += hours
+            summary = (log.get("issue_summary") or "").strip()
+            if summary:
+                issue_summary_by_key.setdefault(key, summary)
         jira_avatar_by_person.setdefault(canonical, _jira_avatar(log.get("author")))
 
     for issue in issues:
         fields = issue.get("fields") or {}
         canonical = issue["_canonical_assignee"]
         jira_avatar_by_person.setdefault(canonical, _jira_avatar(fields.get("assignee")))
+        key = (issue.get("key") or "").upper()
+        if key:
+            summary = (fields.get("summary") or "").strip()
+            if summary:
+                issue_summary_by_key.setdefault(key, summary)
 
     selected_day_date = today if today in sprint_day_dates else (
         sprint_day_dates[-1] if sprint_day_dates else today
@@ -1959,6 +1989,8 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         issues=issues,
         team_rows=team_rows,
         hours_by_person_day=hours_by_person_day,
+        hours_by_person_day_issue=hours_by_person_day_issue,
+        issue_summary_by_key=issue_summary_by_key,
         hours_by_issue=hours_by_issue,
         links=links,
         ratings=ratings,
@@ -2032,6 +2064,91 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
 
 def _clamp_score(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
     return max(lo, min(hi, float(value)))
+
+
+def _mood_copy(
+    *,
+    score: float,
+    time_pct: float,
+    tasks_pct: float,
+    drivers: list[dict],
+) -> tuple[str, str, str]:
+    """Human, phase-aware recommendation / tone / emoji for team mood."""
+    top = drivers[0] if drivers else None
+    top_id = (top or {}).get("id")
+
+    if time_pct < 20:
+        if drivers and score < 55:
+            recommendation = "Старт с напряжением — лучше разобрать риски сразу"
+            tone = "warn"
+        elif drivers:
+            recommendation = "Спринт только начался — есть точки внимания"
+            tone = "ok"
+        elif tasks_pct >= 15:
+            recommendation = "Бойкий старт — так держать"
+            tone = "good"
+        else:
+            recommendation = "Спринт только начался — самое время взять ритм"
+            tone = "ok"
+    elif time_pct < 50:
+        if score >= 78 and not drivers:
+            recommendation = "Идём ровно — держим темп"
+            tone = "good"
+        elif score >= 72:
+            recommendation = "Середина спринта: темп есть, не расслабляемся"
+            tone = "good"
+        elif score >= 55:
+            recommendation = "Есть напряжение — ещё можно выровнять курс"
+            tone = "ok"
+        else:
+            recommendation = "Темп проседает — стоит подтянуть фокус"
+            tone = "warn"
+    elif score >= 88 and not drivers:
+        recommendation = "Успели всё сделать"
+        tone = "great"
+    elif score >= 88:
+        recommendation = "Хорошо потрудились"
+        tone = "great"
+    elif score >= 72:
+        recommendation = "Идём по плану"
+        tone = "good"
+    elif score >= 55:
+        recommendation = "Есть напряжение, но держимся"
+        tone = "ok"
+    else:
+        if top_id == "releases_risk":
+            recommendation = "Не успеваем в релиз"
+        elif top_id == "tasks_stale":
+            recommendation = "Много неактивных задач"
+        elif top_id in {"schedule_slip", "low_completion_late"}:
+            recommendation = "Отстаём от плана спринта"
+        elif top_id == "tasks_at_risk":
+            recommendation = "Много задач под риском"
+        elif top_id == "tasks_no_worklogs":
+            recommendation = "Мало списаний по задачам"
+        else:
+            recommendation = "Спринт под давлением"
+        tone = "bad" if score < 40 else "warn"
+
+    if tone == "great" or score >= 88:
+        emoji = "🥳"
+    elif tone == "good" or score >= 72:
+        emoji = "😊"
+    elif tone == "ok" or score >= 55:
+        emoji = "🙂"
+    elif score >= 40:
+        emoji = "😐"
+    elif score >= 25:
+        emoji = "😟"
+    else:
+        emoji = "😫"
+
+    # Early sprint: never celebrate like a finished race.
+    if time_pct < 20 and tone == "great":
+        tone = "good"
+        emoji = "😊"
+
+    return recommendation, tone, emoji
 
 
 def _compute_team_mood(
@@ -2265,46 +2382,20 @@ def _compute_team_mood(
     # keep top contributors
     drivers = drivers[:8]
 
-    if score >= 88 and not drivers:
-        recommendation = "Успели всё сделать"
-        tone = "great"
-    elif score >= 88:
-        recommendation = "Хорошо потрудились"
-        tone = "great"
-    elif score >= 72:
-        recommendation = "Идём по плану"
-        tone = "good"
-    elif score >= 55:
-        recommendation = "Есть напряжение, но держимся"
-        tone = "ok"
-    else:
-        top = drivers[0] if drivers else None
-        if top and top.get("id") == "releases_risk":
-            recommendation = "Не успеваем в релиз"
-        elif top and top.get("id") in {"tasks_stale"}:
-            recommendation = "Много неактивных задач"
-        elif top and top.get("id") in {"schedule_slip", "low_completion_late"}:
-            recommendation = "Отстаём от плана спринта"
-        elif top and top.get("id") == "tasks_at_risk":
-            recommendation = "Много задач под риском"
-        elif top and top.get("id") == "tasks_no_worklogs":
-            recommendation = "Мало списаний по задачам"
-        else:
-            recommendation = "Спринт под давлением"
-        tone = "bad" if score < 40 else "warn"
+    # Early sprint: absence of risks ≠ victory — dampen celebratory scores.
+    if time_pct < 25:
+        evidence = min(1.0, (tasks_pct / 20.0) + done_n * 0.04)
+        neutral = 66.0
+        score = _clamp_score(neutral + (score - neutral) * (0.30 + 0.70 * evidence))
+        if tasks_pct < 12 and done_n < 3:
+            score = min(score, 74.0)
 
-    if score >= 88:
-        emoji = "🥳"
-    elif score >= 72:
-        emoji = "😊"
-    elif score >= 55:
-        emoji = "🙂"
-    elif score >= 40:
-        emoji = "😐"
-    elif score >= 25:
-        emoji = "😟"
-    else:
-        emoji = "😫"
+    recommendation, tone, emoji = _mood_copy(
+        score=score,
+        time_pct=time_pct,
+        tasks_pct=tasks_pct,
+        drivers=drivers,
+    )
 
     components = {
         "schedule": _round(schedule_score, 0) or 0.0,

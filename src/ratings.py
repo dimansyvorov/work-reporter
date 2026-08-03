@@ -51,7 +51,17 @@ def _with_places(
 ) -> list[dict]:
     if limit is None:
         limit = _top_n()
-    rows = sorted(rows, key=lambda r: r["score"], reverse=reverse)
+    # Optional numeric "tiebreak": used only when scores are equal.
+    # For reverse=True (higher score wins) higher tiebreak also wins;
+    # for reverse=False the tuple is inverted so lower score wins first.
+    def sort_key(row: dict) -> tuple:
+        score = float(row.get("score") or 0)
+        tie = float(row.get("tiebreak") or 0)
+        if reverse:
+            return (score, tie)
+        return (-score, -tie)
+
+    rows = sorted(rows, key=sort_key, reverse=True)
     result = []
     for idx, row in enumerate(rows[:limit]):
         item = dict(row)
@@ -155,6 +165,7 @@ def compute_ratings(
 
     person_issue_hours = hours_by_person_issue or {}
     closed_by_person: dict[str, int] = defaultdict(int)
+    closed_estimate_by_person: dict[str, float] = defaultdict(float)
     over_estimate: dict[str, float] = defaultdict(float)
     under_estimate_closed: dict[str, int] = defaultdict(int)
 
@@ -176,6 +187,8 @@ def compute_ratings(
         )
         if direction_done:
             closed_by_person[person] += 1
+            if estimate is not None and estimate > 0:
+                closed_estimate_by_person[person] += float(estimate)
             if estimate is not None and spent > 0 and spent < estimate:
                 under_estimate_closed[person] += 1
         if estimate is not None and spent > estimate:
@@ -218,13 +231,19 @@ def compute_ratings(
         tail = sum(daily[-2:]) if len(daily) >= 2 else total_hours
         binge = (tail / total_hours) if total_hours > 0 else 0.0
         score = mean_day * 100.0 - spread * 2.0 - binge * 25.0
+        closed_n = int(closed_by_person.get(name, 0))
         stability_rows.append(
             {
                 "name": name,
                 "direction": TEAM_ROSTER[name],
                 "score": score,
+                "tiebreak": closed_n,
                 "value": f"{_round(mean_day * 100.0, 0)}% к норме",
-                "detail": f"σ={_round(spread, 1)} · хвост {_round(binge * 100.0, 0)}%",
+                "detail": (
+                    f"σ={_round(spread, 1)} · "
+                    f"последние 2 дня {_round(binge * 100.0, 0)}% · "
+                    f"закрыто {closed_n}"
+                ),
             }
         )
     stability_top = _with_places(stability_rows)
@@ -233,7 +252,11 @@ def compute_ratings(
         {
             "id": "stability",
             "title": "Человек-стабильность",
-            "description": "Близость ежедневных списаний к норме; штраф за свалку в конце спринта",
+            "description": (
+                "Близость ежедневных списаний к норме; "
+                "учитывается доля часов в последних 2 рабочих днях. "
+                "При равном score выше тот, у кого больше закрытых задач"
+            ),
             "enabled": True,
             "people": stability_top,
             "all_people": _rank_all(stability_rows),
@@ -287,6 +310,47 @@ def compute_ratings(
             "enabled": len(list(TEAM_ROSTER)) >= 3,
             "people": statist_top,
             "all_people": _rank_all(statist_rows),
+        }
+    )
+
+    # Эффективность — закрытый Original Estimate / часы worklog
+    min_hours = 4.0
+    efficiency_rows = []
+    for name in TEAM_ROSTER:
+        hours = float(sum(hours_by_person_day.get(name, {}).values()))
+        est_closed = float(closed_estimate_by_person.get(name, 0.0))
+        if hours < min_hours or est_closed <= 0:
+            continue
+        score = est_closed / hours
+        closed_n = int(closed_by_person.get(name, 0))
+        efficiency_rows.append(
+            {
+                "name": name,
+                "direction": TEAM_ROSTER[name],
+                "score": score,
+                "tiebreak": closed_n,
+                "value": f"{_round(score, 2)} эст.ч/ч",
+                "detail": (
+                    f"оценка {_round(est_closed, 1)} ч · "
+                    f"списано {_round(hours, 1)} ч · "
+                    f"закрыто {closed_n}"
+                ),
+            }
+        )
+    efficiency_top = _with_places(efficiency_rows)
+    track_prizes(efficiency_top)
+    categories.append(
+        {
+            "id": "efficiency",
+            "title": "Эффективность",
+            "description": (
+                "Сумма Original Estimate закрытых задач / часы worklog за спринт "
+                f"(минимум {min_hours:.0f} ч списаний). "
+                "При равном score выше тот, у кого больше закрытых задач"
+            ),
+            "enabled": len(efficiency_rows) >= 1,
+            "people": efficiency_top,
+            "all_people": _rank_all(efficiency_rows),
         }
     )
 

@@ -82,6 +82,32 @@ PUBLISH_REMOTE_DIR=/home/USER/path/to/sprint-report
 
 `raw.json` на сервер не отправляется и после успешного `--publish` удаляется локально.
 
+### Автопубликация на Mac (VPN + launchd)
+
+LaunchAgent опрашивает раз в **2 минуты**, но публикует не чаще чем раз в **30 минут**, и только в окне **09:00–19:00** (локальное время). Jira/VPN проверяются только когда публикация уже «должна» произойти (прошло ≥30 мин с прошлого успеха).
+
+```bash
+chmod +x scripts/publish-if-vpn.sh scripts/install-launch-agent.sh
+./scripts/install-launch-agent.sh
+```
+
+- Лог: `~/Library/Logs/work-reporter.log`
+- Метка последнего успеха: `~/Library/Logs/work-reporter.last-publish`
+- Ручной прогон: `./scripts/publish-if-vpn.sh`
+- Снять агент: `launchctl bootout gui/$(id -u)/com.work-reporter.publish && rm -f ~/Library/LaunchAgents/com.work-reporter.publish.plist`
+
+### Telegram-уведомления (только с сервера)
+
+После успешного/неуспешного `--publish` Mac по SSH вызывает скрипт на сервере; **токен Telegram и вызов Bot API только на сервере**.
+
+На сервере: `~/work-reporter-notify/` (шаблон в [`scripts/server-notify/`](scripts/server-notify/)).
+
+В Mac `.env`:
+
+```bash
+PUBLISH_NOTIFY_SCRIPT=~/work-reporter-notify/notify-telegram.sh
+```
+
 ## Конфигурация
 
 | Файл | Назначение | В git? |

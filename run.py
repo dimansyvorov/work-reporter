@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -90,12 +91,42 @@ def _publish_settings() -> tuple[str, str]:
     return ssh_host, remote_dir
 
 
+def _notify_remote(status: str, text: str) -> None:
+    """
+    Ask the home server to call Telegram API.
+    Secrets and network access to Telegram live only on the server.
+    """
+    ssh_host = (os.getenv("PUBLISH_SSH") or "server").strip()
+    script = (
+        os.getenv("PUBLISH_NOTIFY_SCRIPT")
+        or "~/work-reporter-notify/notify-telegram.sh"
+    ).strip()
+    if not script:
+        return
+    # Keep message single-line for simple remote argv passing.
+    clean = " ".join(str(text or "").split())
+    if len(clean) > 900:
+        clean = clean[:897] + "…"
+    remote = (
+        f"{script} {shlex.quote(status)} {shlex.quote(clean)}"
+    )
+    try:
+        subprocess.run(
+            ["ssh", ssh_host, f"bash -lc {shlex.quote(remote)}"],
+            check=False,
+            timeout=60,
+        )
+    except Exception as exc:  # noqa: BLE001 - notify must not break publish
+        print(f"  ! telegram notify failed: {exc}")
+
+
 def _run_publish(*, collected: bool) -> int:
     report_path = DATA_DIR / "report.json"
     try:
         report = validate_report(report_path)
     except PublishError as exc:
         print(f"Публикация отменена: {exc}")
+        _notify_remote("error", f"Публикация отменена: {exc}")
         return 1
 
     ssh_host, remote_dir = _publish_settings()
@@ -113,9 +144,11 @@ def _run_publish(*, collected: bool) -> int:
         )
     except PublishError as exc:
         print(f"Публикация отменена: {exc}")
+        _notify_remote("error", f"Публикация отменена: {exc}")
         return 1
     except subprocess.CalledProcessError as exc:
         print(f"Ошибка публикации: {exc}")
+        _notify_remote("error", f"Ошибка публикации на сервер: {exc}")
         return 1
 
     sprint = ((published.get("sprint_report") or {}).get("sprint") or {}).get("name")
@@ -124,6 +157,10 @@ def _run_publish(*, collected: bool) -> int:
     public_url = (os.getenv("PUBLISH_PUBLIC_URL") or "").strip()
     if public_url:
         print(f"URL: {public_url}")
+    _notify_remote(
+        "success",
+        f"Отчёт обновлён: {sprint or '—'} · fetched_at={fetched or '—'}",
+    )
     return 0
 
 
@@ -147,9 +184,14 @@ def main() -> None:
 
     if args.publish:
         state = AppState()
-        report = collect_and_build(
-            cfg, state, raw_path=raw_path, report_path=report_path
-        )
+        try:
+            report = collect_and_build(
+                cfg, state, raw_path=raw_path, report_path=report_path
+            )
+        except BaseException as exc:
+            print(f"Ошибка сбора: {exc}")
+            _notify_remote("error", f"Ошибка сбора отчёта: {exc}")
+            raise SystemExit(1) from exc
         print(f"Сохранено: {raw_path.relative_to(PROJECT_ROOT)}")
         print(f"Сохранено: {report_path.relative_to(PROJECT_ROOT)}")
         _print_summary(report)

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.work-reporter.publish</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT__/scripts/publish-if-vpn.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_ROOT__</string>
+
+  <!-- poll every 2 minutes; script enforces 30-minute publish cadence -->
+  <key>StartInterval</key>
+  <integer>120</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/work-reporter.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/work-reporter.launchd.err.log</string>
+</dict>
+</plist>

@@ -1431,14 +1431,17 @@ th.col-task {
 .float-tip {
   position: fixed;
   z-index: 80;
-  max-width: min(320px, calc(100vw - 16px));
+  max-width: min(420px, calc(100vw - 16px));
+  max-height: min(360px, calc(100vh - 16px));
+  overflow: auto;
   padding: 0.55rem 0.7rem;
   border-radius: 10px;
   background: #142018;
   color: #f4faf6;
   font-size: 0.78rem;
   font-weight: 500;
-  line-height: 1.35;
+  line-height: 1.4;
+  white-space: pre-line;
   pointer-events: none;
   box-shadow: 0 10px 24px rgba(20, 32, 24, 0.25);
 }

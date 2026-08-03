@@ -593,15 +593,37 @@ def _sprint_from_open_sprints_jql(
     return sprint, issues
 
 
+def _inclusive_sprint_end_date(end: datetime | None, start: datetime | None) -> date | None:
+    """
+    Jira Agile often stores endDate as midnight at the *start* of the day after
+    the last sprint day (exclusive boundary). Example: endDate 2026-08-15T00:00:00
+    → inclusive last day is 14.08. End-of-day timestamps (23:59) stay as that date.
+    """
+    if end is None:
+        return None
+    end_day = end.date()
+    if (
+        end.hour == 0
+        and end.minute == 0
+        and end.second == 0
+        and end.microsecond == 0
+    ):
+        end_day = end_day - timedelta(days=1)
+    if start is not None and end_day < start.date():
+        return start.date()
+    return end_day
+
+
 def _normalize_sprint(sprint: dict) -> dict:
     start = _parse_jira_dt(sprint.get("startDate"))
     end = _parse_jira_dt(sprint.get("endDate") or sprint.get("completeDate"))
+    end_day = _inclusive_sprint_end_date(end, start)
     return {
         "id": sprint.get("id"),
         "name": sprint.get("name") or "Sprint",
         "state": (sprint.get("state") or "unknown").lower(),
         "start_date": (start.date().isoformat() if start else None),
-        "end_date": (end.date().isoformat() if end else None),
+        "end_date": (end_day.isoformat() if end_day else None),
         "start_at": start.isoformat() if start else sprint.get("startDate"),
         "end_at": end.isoformat() if end else sprint.get("endDate"),
         "goal": sprint.get("goal"),

@@ -12,7 +12,7 @@ from .errors import CollectError
 from .fetch_cache import JsonFileCache
 from .parallel import map_parallel_with_client
 
-GITLAB_WORKERS = 6
+GITLAB_WORKERS = 2
 
 
 class GitLabClient:
@@ -160,13 +160,84 @@ def collect_raw(
         progress_every=1,
     )
 
+    roster_profiles = _fetch_roster_gitlab_profiles(cfg)
+
     return {
         "source": "gitlab",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "days": cfg.days,
         "since": since.isoformat(),
         "projects": projects_out,
+        "roster_profiles": roster_profiles,
     }
+
+
+def _fetch_roster_gitlab_profiles(cfg: Config) -> dict[str, dict]:
+    """
+    Resolve GitLab username/avatar for roster members with avatar_source=gitlab
+    (and any with gitlab_username), even if they authored no MRs in-window.
+    """
+    import re
+
+    from .team import TEAM_ROSTER
+    from .team_config import get_team_config
+
+    team_cfg = get_team_config()
+    client = GitLabClient(cfg)
+    out: dict[str, dict] = {}
+    hits = 0
+
+    for name in sorted(TEAM_ROSTER.keys(), key=lambda x: x.lower()):
+        source = team_cfg.avatar_source_for(name)
+        explicit = team_cfg.gitlab_username_for(name)
+        if source != "gitlab" and not explicit:
+            continue
+        candidates: list[str] = []
+        if explicit:
+            candidates.append(explicit)
+        for alias, target in team_cfg.aliases.items():
+            if target != name:
+                continue
+            token = str(alias).strip()
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]{1,64}", token) and token not in candidates:
+                candidates.append(token)
+        # Last resort: surname search (helps when alias ≠ GitLab username)
+        surname = name.split()[0] if name.split() else ""
+        if surname and surname not in candidates:
+            candidates.append(surname)
+
+        profile: dict[str, Any] = {}
+        for q in candidates:
+            try:
+                resp = client._get("/users", {"search": q, "per_page": 10})
+                users = resp.json() if resp is not None else []
+            except CollectError:
+                continue
+            if not isinstance(users, list):
+                continue
+            for user in users:
+                uname = (user.get("username") or "").strip()
+                display = (user.get("name") or "").strip()
+                # Prefer exact username / alias hit; else display-name match
+                q_l = q.lower()
+                if uname.lower() == q_l or q_l in uname.lower() or (
+                    display and name.split()[0].lower() in display.lower()
+                ):
+                    profile = {
+                        "username": uname,
+                        "name": display or name,
+                        "avatar_url": user.get("avatar_url"),
+                        "web_url": user.get("web_url"),
+                    }
+                    hits += 1
+                    break
+            if profile:
+                break
+        if profile:
+            out[name] = profile
+
+    print(f"  · roster gitlab profiles: {hits}/{sum(1 for n in TEAM_ROSTER if team_cfg.avatar_source_for(n)=='gitlab' or team_cfg.gitlab_username_for(n))}")
+    return out
 
 
 def _mr_text_keys(mr: dict) -> set[str]:

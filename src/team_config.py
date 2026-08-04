@@ -11,9 +11,49 @@ from .people import names_match
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = ROOT / "team.json"
 
+# Default workflow order for issue movement UI (forward vs rollback).
+# Can be overridden via team.json → "status_flow": [...].
+DEFAULT_STATUS_FLOW = [
+    "Сделать",
+    "To Do",
+    "Open",
+    "Backlog",
+    "Новая (оценено)",
+    "В работе",
+    "In Progress",
+    "Hold",
+    "Code Review",
+    "In Review",
+    "Review",
+    "Developed",
+    "Ready for testing",
+    "Ready For Testing",
+    "Testing",
+    "Тестирование",
+    "Тест",
+    "Tested",
+    "Verified",
+    "Готово",
+    "Done",
+    "Closed",
+    "Resolved",
+]
+
 
 def _norm_status(value: str | None) -> str:
     return " ".join((value or "").strip().lower().split())
+
+
+def _parse_gender(value: object) -> str | None:
+    """Normalize team.json gender to 'm' / 'f'."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {"f", "female", "ж", "жен", "женский", "woman", "w"}:
+        return "f"
+    if text in {"m", "male", "м", "муж", "мужской", "man"}:
+        return "m"
+    return None
 
 
 @dataclass
@@ -52,6 +92,11 @@ class MetricsSettings:
     risks_limit: int = 40
     person_tasks_limit: int = 40
     person_active_tasks_limit: int = 30
+    # Hybrid load: when Jira remaining is 0/missing on an active task
+    # (typical for QA after dev estimate was burned), assume at least this
+    # many hours, or estimate × ratio — whichever is larger.
+    load_fallback_hours: float = 2.0
+    load_fallback_estimate_ratio: float = 0.25
 
 
 @dataclass
@@ -75,6 +120,8 @@ class JiraBoardConfig:
     has_epics: bool = True
     # False for kanban / boards without Agile sprints API
     has_sprints: bool = True
+    # Optional extra board JQL (kanban). Empty → auto: open + updated since sprint start.
+    jql: str = ""
 
 
 @dataclass
@@ -87,6 +134,17 @@ class TeamConfig:
     roster_keys: dict[str, str] = field(default_factory=dict)
     # person display name -> direction display name (compat)
     roster: dict[str, str] = field(default_factory=dict)
+    # person display name -> "m" | "f"
+    genders: dict[str, str] = field(default_factory=dict)
+    # person display name -> preferred avatar URL (optional override in team.json)
+    avatars: dict[str, str] = field(default_factory=dict)
+    # person display name -> "jira" | "gitlab" (only pull avatar from that source)
+    avatar_sources: dict[str, str] = field(default_factory=dict)
+    # person display name -> jira username / profile url overrides
+    jira_usernames: dict[str, str] = field(default_factory=dict)
+    jira_profile_urls: dict[str, str] = field(default_factory=dict)
+    gitlab_usernames: dict[str, str] = field(default_factory=dict)
+    gitlab_profile_urls: dict[str, str] = field(default_factory=dict)
     direction_order: list[str] = field(default_factory=list)  # display names
     direction_keys_order: list[str] = field(default_factory=list)
     dev_directions: set[str] = field(default_factory=set)  # display names
@@ -101,6 +159,8 @@ class TeamConfig:
     jira_jql: str = ""
     display_task_filters: list[str] = field(default_factory=list)
     status_rules: dict[str, StatusRules] = field(default_factory=dict)  # by key + default
+    # Ordered workflow statuses for UI (forward / rollback detection)
+    status_flow: list[str] = field(default_factory=list)
     inactive_days: int = 3
     # alias (gitlab/jira nickname) -> canonical roster name
     aliases: dict[str, str] = field(default_factory=dict)
@@ -179,7 +239,71 @@ class TeamConfig:
             "ui": {
                 "task_table_preview": self.ui.task_table_preview,
             },
+            "status_flow": list(self.status_flow),
+            "avatars": dict(self.avatars),
         }
+
+    def avatar_for(self, name: str | None) -> str | None:
+        canonical = self.canonical_name(name)
+        if canonical and canonical in self.avatars:
+            return self.avatars[canonical]
+        needle = (name or "").strip()
+        return self.avatars.get(needle) or None
+
+    def avatar_source_for(self, name: str | None) -> str | None:
+        """Return 'jira' | 'gitlab' | None for avatar origin preference."""
+        canonical = self.canonical_name(name) or (name or "").strip()
+        if not canonical:
+            return None
+        return self.avatar_sources.get(canonical) or None
+
+    def jira_profile_for(self, name: str | None) -> str | None:
+        canonical = self.canonical_name(name) or (name or "").strip()
+        if not canonical:
+            return None
+        return self.jira_profile_urls.get(canonical) or None
+
+    def gitlab_profile_for(self, name: str | None) -> str | None:
+        canonical = self.canonical_name(name) or (name or "").strip()
+        if not canonical:
+            return None
+        return self.gitlab_profile_urls.get(canonical) or None
+
+    def jira_username_for(self, name: str | None) -> str | None:
+        canonical = self.canonical_name(name) or (name or "").strip()
+        if not canonical:
+            return None
+        return self.jira_usernames.get(canonical) or None
+
+    def jira_username_candidates(self, name: str | None) -> list[str]:
+        """
+        Possible Jira logins for a roster person: explicit jira_username, then
+        aliases that look like usernames (e.g. ivanovIi), not full English names.
+        """
+        import re
+
+        canonical = self.canonical_name(name) or (name or "").strip()
+        if not canonical:
+            return []
+        out: list[str] = []
+        explicit = self.jira_usernames.get(canonical)
+        if explicit:
+            out.append(explicit)
+        for alias, target in self.aliases.items():
+            if target != canonical:
+                continue
+            token = str(alias).strip()
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]{1,64}", token):
+                continue
+            if token not in out:
+                out.append(token)
+        return out
+
+    def gitlab_username_for(self, name: str | None) -> str | None:
+        canonical = self.canonical_name(name) or (name or "").strip()
+        if not canonical:
+            return None
+        return self.gitlab_usernames.get(canonical) or None
 
     def canonical_name(self, name: str | None) -> str | None:
         if not name:
@@ -244,6 +368,13 @@ class TeamConfig:
 
     def is_team_member(self, name: str | None) -> bool:
         return self.canonical_name(name) is not None
+
+    def gender_for(self, name: str | None) -> str | None:
+        """Return 'm' / 'f' for a roster person, or None if unknown."""
+        canonical = self.canonical_name(name)
+        if not canonical:
+            return None
+        return self.genders.get(canonical)
 
     def is_hidden_from_display(self, summary: str | None) -> bool:
         text = (summary or "").strip()
@@ -393,6 +524,12 @@ def _parse_metrics(raw: dict | None, *, inactive_days: int) -> MetricsSettings:
         person_active_tasks_limit=max(
             1, _as_int(raw.get("person_active_tasks_limit"), 30)
         ),
+        load_fallback_hours=max(
+            0.0, _as_float(raw.get("load_fallback_hours"), 2.0)
+        ),
+        load_fallback_estimate_ratio=min(
+            1.0, max(0.0, _as_float(raw.get("load_fallback_estimate_ratio"), 0.25))
+        ),
     )
 
 
@@ -445,7 +582,14 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
 
     roster_keys: dict[str, str] = {}
     roster: dict[str, str] = {}
+    genders: dict[str, str] = {}
     aliases: dict[str, str] = {}
+    avatars: dict[str, str] = {}
+    avatar_sources: dict[str, str] = {}
+    jira_usernames: dict[str, str] = {}
+    jira_profile_urls: dict[str, str] = {}
+    gitlab_usernames: dict[str, str] = {}
+    gitlab_profile_urls: dict[str, str] = {}
     for person in data.get("people") or []:
         name = (person.get("name") or "").strip()
         direction_raw = (person.get("direction") or "").strip()
@@ -459,6 +603,38 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
             )
         roster_keys[name] = dkey
         roster[name] = directions[dkey].name
+        gender = _parse_gender(person.get("gender"))
+        if gender:
+            genders[name] = gender
+        avatar = str(person.get("avatar_url") or person.get("avatar") or "").strip()
+        if avatar:
+            avatars[name] = avatar
+        # avatar_source | icon_source | ison_source → "jira" | "gitlab"
+        source_raw = str(
+            person.get("avatar_source")
+            or person.get("icon_source")
+            or person.get("ison_source")
+            or ""
+        ).strip().lower()
+        if source_raw in {"jira", "gitlab"}:
+            avatar_sources[name] = source_raw
+        elif source_raw:
+            raise CollectError(
+                f"avatar_source у «{name}»: ожидается jira или gitlab, "
+                f"получено «{source_raw}»."
+            )
+        jira_user = str(person.get("jira_username") or "").strip()
+        if jira_user:
+            jira_usernames[name] = jira_user
+        jira_url = str(person.get("jira_url") or person.get("jira_profile_url") or "").strip()
+        if jira_url:
+            jira_profile_urls[name] = jira_url
+        gitlab_user = str(person.get("gitlab_username") or "").strip()
+        if gitlab_user:
+            gitlab_usernames[name] = gitlab_user
+        gitlab_url = str(person.get("gitlab_url") or person.get("gitlab_profile_url") or "").strip()
+        if gitlab_url:
+            gitlab_profile_urls[name] = gitlab_url
         for alias in person.get("aliases") or []:
             alias_s = str(alias).strip()
             if alias_s:
@@ -510,6 +686,7 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
                     primary=bool(item.get("primary")) if "primary" in item else idx == 0,
                     has_epics=bool(item.get("has_epics", True)),
                     has_sprints=bool(item.get("has_sprints", True)),
+                    jql=str(item.get("jql") or "").strip(),
                 )
             )
     # Ensure exactly one primary when boards exist
@@ -551,6 +728,12 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
                 continue
             status_rules[dkey] = StatusRules.from_raw(value)
 
+    raw_flow = data.get("status_flow")
+    if isinstance(raw_flow, list) and raw_flow:
+        status_flow = [str(x).strip() for x in raw_flow if str(x).strip()]
+    else:
+        status_flow = list(DEFAULT_STATUS_FLOW)
+
     direction_order = [directions[k].name for k in keys_order]
     dev_direction_keys = {k for k, info in directions.items() if info.is_dev}
     dev_directions = {directions[k].name for k in dev_direction_keys}
@@ -570,6 +753,13 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
         name_to_key=name_to_key,
         roster_keys=roster_keys,
         roster=roster,
+        genders=genders,
+        avatars=avatars,
+        avatar_sources=avatar_sources,
+        jira_usernames=jira_usernames,
+        jira_profile_urls=jira_profile_urls,
+        gitlab_usernames=gitlab_usernames,
+        gitlab_profile_urls=gitlab_profile_urls,
         aliases=aliases,
         direction_order=direction_order,
         direction_keys_order=keys_order,
@@ -583,6 +773,7 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
         jira_jql=jira_jql,
         display_task_filters=filters,
         status_rules=status_rules,
+        status_flow=status_flow,
         inactive_days=inactive_days,
         metrics=metrics,
         ratings=ratings_settings,

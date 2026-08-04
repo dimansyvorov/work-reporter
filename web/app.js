@@ -76,11 +76,48 @@ function fmtDay(value) {
   return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")}.${d.getFullYear()}`;
 }
 
+function fmtTimePart(d) {
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+const MONTHS_RU_GENITIVE = [
+  "января",
+  "февраля",
+  "марта",
+  "апреля",
+  "мая",
+  "июня",
+  "июля",
+  "августа",
+  "сентября",
+  "октября",
+  "ноября",
+  "декабря",
+];
+
+function calendarDayKey(d) {
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+
+/** Today → «11:57»; yesterday → «вчера, 09:56»; else → «27 июля, 10:16» */
+function fmtRelativeDateTime(value) {
+  if (!value) return "—";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return fmtDay(value);
+  const now = new Date();
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  const time = fmtTimePart(d);
+  if (calendarDayKey(d) === calendarDayKey(now)) return time;
+  if (calendarDayKey(d) === calendarDayKey(yesterday)) return `вчера, ${time}`;
+  return `${d.getDate()} ${MONTHS_RU_GENITIVE[d.getMonth()]}, ${time}`;
+}
+
 function fmtDateTime(value) {
   if (!value) return "—";
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return fmtDay(value);
-  return `${fmtDay(value)} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  return `${fmtDay(value)} ${fmtTimePart(d)}`;
 }
 
 function escapeHtml(value) {
@@ -182,6 +219,17 @@ function shortName(name) {
   return `${parts[0]} ${parts[1].charAt(0)}. ${parts[2].charAt(0)}.`;
 }
 
+/** «Иван И.» from «Иванов Иван Иванович» */
+function shortGivenSurname(name) {
+  const parts = String(name || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!parts.length) return "—";
+  if (parts.length === 1) return parts[0];
+  return `${parts[1]} ${parts[0].charAt(0)}.`;
+}
+
 let currentSprintReport = null;
 let currentReportMeta = null;
 let freshnessTimer = null;
@@ -254,18 +302,79 @@ function startFreshnessClock() {
   freshnessTimer = setInterval(() => updateDataFreshness(), 30000);
 }
 
-function personCell(name, avatarUrl, { short = false, clickable = true, personKey = null } = {}) {
-  const label = short ? shortName(name) : name;
-  const initial = (name || "?").trim().charAt(0).toUpperCase();
-  const avatar = avatarUrl
-    ? `<img class="avatar" src="${escapeHtml(avatarUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
-    : `<span class="avatar placeholder">${escapeHtml(initial)}</span>`;
-  const inner = `${avatar}<span>${escapeHtml(label)}</span>`;
+function teamAvatarOverride(name) {
+  const map = currentSprintReport?.settings?.avatars || {};
+  if (!name || !map || typeof map !== "object") return null;
+  if (map[name]) return map[name];
+  const profile = findPersonByName(name);
+  if (profile?.name && map[profile.name]) return map[profile.name];
+  return null;
+}
+
+function personCell(
+  name,
+  avatarUrl,
+  {
+    short = false,
+    givenSurname = false,
+    clickable = true,
+    personKey = null,
+    load = null,
+    withLoad = true,
+  } = {}
+) {
   const key = personKey || name;
+  const profile = findPersonByName(key) || findPersonByName(name);
+  const label = givenSurname
+    ? shortGivenSurname(name)
+    : short
+      ? shortName(name)
+      : name;
+  const resolvedUrl =
+    teamAvatarOverride(profile?.name || key || name) || avatarUrl || profile?.avatar_url || null;
+  const resolvedLoad = withLoad ? load || profile?.load || null : null;
+  const avatar = avatarWithLoad(avatarImgHtml(name, resolvedUrl), resolvedLoad, { size: "sm" });
+  const inner = `${avatar}<span class="person-name">${escapeHtml(label)}</span>`;
   if (!clickable || !key || key === "—" || name === "Без исполнителя") {
     return `<div class="person" title="${escapeHtml(name || "")}">${inner}</div>`;
   }
-  return `<button type="button" class="person person-btn" data-person="${escapeHtml(key)}" title="${escapeHtml(name)}">${inner}</button>`;
+  return `<button type="button" class="person person-btn" data-person="${escapeHtml(profile?.name || key)}" title="${escapeHtml(name)}">${inner}</button>`;
+}
+
+function avatarInitial(name) {
+  const parts = String(name || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!parts.length) return "?";
+  // FIO «Фамилия Имя …» → letter of given name; otherwise first token
+  const token = parts.length >= 2 ? parts[1] : parts[0];
+  return (token.charAt(0) || "?").toUpperCase();
+}
+
+function avatarImgHtml(name, avatarUrl, { cls = "avatar" } = {}) {
+  const initial = avatarInitial(name);
+  const placeholderCls = cls.includes("act-chip-avatar")
+    ? `${cls} is-placeholder`
+    : `${cls} placeholder`;
+  if (!avatarUrl) {
+    return `<span class="${placeholderCls}">${escapeHtml(initial)}</span>`;
+  }
+  const safeInitial = escapeHtml(initial);
+  return `<img class="${cls}" src="${escapeHtml(avatarUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.outerHTML='<span class=\\'${placeholderCls}\\'>${safeInitial}</span>'" />`;
+}
+
+function avatarWithLoad(avatarHtml, load, { size = "sm" } = {}) {
+  // Always show a ring when we know the load state (including empty).
+  // Skip only when there is no person load data at all.
+  // No has-tip here: dashed underline + float tip break the circular ring visually.
+  if (!load || load.level === "unknown") {
+    return `<span class="avatar-wrap size-${size}">${avatarHtml}</span>`;
+  }
+  const pct = load.load_pct;
+  const level = load.level || "empty";
+  const fill = pct == null ? 0 : Math.max(0, Math.min(100, Number(pct) || 0));
+  return `<span class="avatar-wrap size-${size} has-ring load-${escapeHtml(level)}" style="--load:${fill}" aria-hidden="true">${avatarHtml}</span>`;
 }
 
 function hoursCell(hours, level) {
@@ -304,9 +413,7 @@ function issueLink(issue) {
   if (!issue?.key) return "—";
   const label = escapeHtml(issue.key);
   const epicCls = issue.is_epic ? " issue-key-epic" : "";
-  return issue.web_url
-    ? `<a class="issue-key${epicCls}" href="${escapeHtml(issue.web_url)}" target="_blank" rel="noreferrer">${label}</a>`
-    : `<span class="issue-key${epicCls}">${label}</span>`;
+  return `<button type="button" class="issue-key issue-key-btn${epicCls}" data-issue="${label}" title="Открыть карточку задачи">${label}</button>`;
 }
 
 function tagsHtml(tags) {
@@ -323,13 +430,10 @@ function tagsHtml(tags) {
 
 function fmtDuration(hours) {
   if (hours == null || Number.isNaN(Number(hours))) return "—";
-  const totalMin = Math.round(Number(hours) * 60);
-  if (totalMin <= 0) return "0ч";
+  const totalMin = Math.max(0, Math.round(Number(hours) * 60));
   const h = Math.floor(totalMin / 60);
   const m = totalMin % 60;
-  if (h > 0 && m > 0) return `${h}ч ${m}м`;
-  if (h > 0) return `${h}ч`;
-  return `${m}м`;
+  return `${h}ч ${m}м`;
 }
 
 function timeCell(spent, estimate, { warnZero = false } = {}) {
@@ -1175,6 +1279,19 @@ function renderDirections(directions) {
           : (d.tasks_progress_pct || 0) >= 40
             ? "metric-info"
             : "metric-warn";
+      const people = (d.members || [])
+        .map((m) => {
+          const profile = findPersonByName(m.name);
+          const load = profile?.load || m.load || null;
+          const avatarUrl =
+            teamAvatarOverride(profile?.name || m.name) || m.avatar_url || profile?.avatar_url || null;
+          return `
+          <button type="button" class="dir-person-mini person-btn" data-person="${escapeHtml(profile?.name || m.name)}" title="${escapeHtml(m.name)}">
+            ${avatarWithLoad(avatarImgHtml(m.name, avatarUrl), load, { size: "sm" })}
+            <span class="dir-person-mini-name">${escapeHtml(shortGivenSurname(m.name))}</span>
+          </button>`;
+        })
+        .join("");
       return `
       <article class="direction-card">
         <div class="direction-card-top">
@@ -1199,6 +1316,7 @@ function renderDirections(directions) {
             <span class="metric">${fmtNumber((d.epics || []).length)}</span>
           </div>
         </div>
+        <div class="dir-people-mini">${people || `<span class="muted">Нет сотрудников</span>`}</div>
       </article>`;
     })
     .join("");
@@ -1232,7 +1350,7 @@ function renderRatings(ratings) {
                 (p) => `
               <div class="rating-person">
                 ${medalHtml(p.place)}
-                ${personCell(p.name, p.avatar_url, { short: true })}
+                ${personCell(p.name, p.avatar_url, { short: true, load: p.load || findPersonByName(p.name)?.load })}
                 <div class="rating-score">
                   <div class="rating-score-main">${escapeHtml(p.value || "")}</div>
                   <div class="muted rating-score-detail">${escapeHtml(p.detail || p.direction || "")}</div>
@@ -1262,25 +1380,18 @@ function releaseRightPanel(r) {
   if (released) {
     const hasActive = Number(r.tasks_active) > 0;
     const leftover = hasActive
-      ? `<p class="release-status-note is-warn">Ещё ${fmtNumber(r.tasks_active)} active-задач на версии</p>`
-      : `<p class="release-status-note">Версия выпущена в Jira</p>`;
+      ? `<div class="release-risk-card severity-warn">
+          <div class="release-risk-card-title">Остались active-задачи</div>
+          <div class="release-risk-card-summary">Ещё ${fmtNumber(r.tasks_active)} на уже выпущенной версии</div>
+        </div>`
+      : `<div class="release-risk-card severity-ok">
+          <div class="release-risk-card-title">Выпущен</div>
+          <div class="release-risk-card-summary">Версия отмечена как released в Jira</div>
+        </div>`;
     return `
       <div class="release-side release-side-status">
-        <h4>Детали</h4>
-        <div class="release-status-block">
-          ${leftover}
-        </div>
-        <div class="release-kpi-grid compact">
-          <div class="release-kpi">
-            <span class="label">Задачи</span>
-            <strong>${fmtNumber(r.tasks_done)}/${fmtNumber(r.tasks_total)}</strong>
-          </div>
-          <div class="release-kpi">
-            <span class="label">Прогресс</span>
-            <strong>${fmtNumber(r.progress_pct)}%</strong>
-          </div>
-        </div>
-        <div class="muted release-more-hint">Нажмите для подробностей</div>
+        <h4>Риски</h4>
+        <div class="release-risk-cards">${leftover}</div>
       </div>`;
   }
 
@@ -1304,21 +1415,6 @@ function releaseRightPanel(r) {
     <div class="release-side release-side-status">
       <h4>Риски</h4>
       <div class="release-risk-cards">${riskCards}</div>
-      <div class="release-kpi-grid">
-        <div class="release-kpi">
-          <span class="label">Активные</span>
-          <strong>${fmtNumber(r.tasks_active)}</strong>
-        </div>
-        <div class="release-kpi">
-          <span class="label">С рисками</span>
-          <strong class="${r.tasks_tagged ? "is-warn" : ""}">${fmtNumber(r.tasks_tagged)}</strong>
-        </div>
-        <div class="release-kpi wide">
-          <span class="label">Ост. / ёмкость</span>
-          <strong>${fmtDuration(r.active_estimate_hours)} / ${fmtDuration(r.capacity_hours)}</strong>
-        </div>
-      </div>
-      <div class="muted release-more-hint">Нажмите для подробностей</div>
     </div>`;
 }
 
@@ -1345,15 +1441,6 @@ function renderReleases(releases) {
 
   root.innerHTML = items
     .map((r) => {
-      const daysLeft = Number(r.days_left);
-      const daysLabel =
-        Number.isFinite(daysLeft)
-          ? daysLeft < 0
-            ? `просрочен на ${fmtNumber(Math.abs(daysLeft))} дн.`
-            : daysLeft === 0
-              ? "сегодня"
-              : `через ${fmtNumber(daysLeft)} дн.`
-          : "—";
       const dirs = (r.sections || [])
         .map((s) => {
           const tipText = `${s.direction}: закрыто ${fmtNumber(s.done_tasks)} из ${fmtNumber(s.tasks)} (${fmtNumber(s.progress_pct)}%), активных ${fmtNumber(s.active_tasks)}`;
@@ -1368,19 +1455,20 @@ function renderReleases(releases) {
         .join("");
       const calendarTip =
         "Доля календарного времени от старта спринта до даты выпуска версии. 100% значит: дата релиза уже наступила. Это не прогресс задач.";
+      const desc = String(r.description || "").trim();
+      const descHtml = desc
+        ? `<p class="release-desc">${escapeHtml(desc)}</p>`
+        : "";
       return `
         <article class="release-card" data-risk="${escapeHtml(r.risk || "")}" data-released="${r.released ? "1" : "0"}" data-release-id="${escapeHtml(r.id)}" role="button" tabindex="0">
           <div class="release-grid">
             <div class="release-side">
               <div class="release-title-row">
+                <span class="release-date-badge">${fmtDay(r.release_date)}</span>
                 <h3 class="release-title">${escapeHtml(r.name)}</h3>
                 ${releaseStatusBadge(r)}
               </div>
-              <div class="release-meta">
-                <span class="release-date has-tip" tabindex="0" data-tip="Плановая дата выпуска версии в Jira">${fmtDay(r.release_date)}</span>
-                <span>${tip(daysLabel, "Сколько дней осталось до (или прошло после) даты выпуска")}</span>
-                <span>${escapeHtml(r.project || "")}</span>
-              </div>
+              ${descHtml}
               <div class="release-progress" style="margin-top:0.75rem">
                 <div class="progress has-tip" tabindex="0" data-tip="Заливка — прогресс задач по версии">
                   <div class="progress-bar" style="width:${Math.min(Number(r.progress_pct) || 0, 100)}%"></div>
@@ -1415,13 +1503,14 @@ function closeAppModal() {
   hideFloatTip();
 }
 
-function openAppModal(html, { wide = false, rating = false } = {}) {
+function openAppModal(html, { wide = false, rating = false, person = false } = {}) {
   const modal = document.getElementById("app-modal");
   const card = modal.querySelector(".modal-card");
   const body = document.getElementById("app-modal-body");
   body.innerHTML = html;
   if (card) {
-    card.classList.toggle("modal-card-wide", !!wide);
+    card.classList.toggle("modal-card-wide", !!wide || !!person);
+    card.classList.toggle("modal-card-person", !!person);
     card.classList.toggle("modal-card-rating", !!rating);
   }
   modal.classList.remove("hidden");
@@ -1445,29 +1534,58 @@ function openPersonModal(name) {
       const h = Number(d.hours) || 0;
       const wd = weekdayShort(d.date);
       const isWeekend = wd === "сб" || wd === "вс";
-      const remain = isWeekend ? 0 : Math.max(0, expected - h);
+      const isToday = !!d.is_today;
+      const isFuture = !!d.is_future;
+      const remain = isWeekend || isFuture ? 0 : Math.max(0, expected - h);
       const spentPx = Math.round((h / maxH) * chartH);
-      const remainPx = isWeekend ? 0 : Math.round((remain / maxH) * chartH);
-      const over = !isWeekend && h > expected + 0.05;
-      const barCls = h <= 0 ? "is-zero" : over ? "is-over" : h + 0.05 < expected && !isWeekend ? "is-low" : "is-ok";
+      const remainPx = isWeekend || isFuture ? 0 : Math.round((remain / maxH) * chartH);
+      const over = !isWeekend && !isFuture && h > expected + 0.05;
+      const barCls = isFuture
+        ? "is-future"
+        : h <= 0
+          ? "is-zero"
+          : over
+            ? "is-over"
+            : h + 0.05 < expected && !isWeekend
+              ? "is-low"
+              : "is-ok";
       const issueLines = (d.issues || [])
         .map((issue) => {
           const summary = String(issue.summary || "").trim();
           const label = summary ? `${issue.key}: ${summary}` : issue.key;
-          return `${label} — ${fmtNumber(issue.hours)} ч`;
+          return `${label} — ${fmtDuration(issue.hours)}`;
         })
         .join("\n");
-      const head = isWeekend
-        ? `${wd} ${fmtDay(d.date)}: списано ${fmtNumber(h)} ч (выходной)`
-        : `${wd} ${fmtDay(d.date)}: списано ${fmtNumber(h)} ч, до нормы ${fmtNumber(remain)} ч`;
+      let head;
+      if (isFuture) {
+        head = `${wd} ${fmtDay(d.date)}: ещё не наступил`;
+      } else if (isWeekend) {
+        head = `${wd} ${fmtDay(d.date)}: списано ${fmtDuration(h)} (выходной)`;
+      } else {
+        head = `${wd} ${fmtDay(d.date)}: списано ${fmtDuration(h)}, до нормы ${fmtDuration(remain)}`;
+      }
+      if (isToday) head += " · сегодня";
       const tipText = issueLines
         ? `${head}\n${issueLines}`
         : h > 0
           ? `${head}\nНет разбивки по задачам`
           : head;
       const tipAttr = escapeHtml(tipText).replaceAll("\n", "&#10;");
+      const colCls = [
+        "person-hours-col",
+        "has-tip",
+        isToday ? "is-today" : "",
+        isFuture ? "is-future-day" : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      const footer = isFuture
+        ? "—"
+        : isWeekend
+          ? "вых."
+          : `ост ${fmtDuration(remain)}`;
       return `
-        <div class="person-hours-col has-tip" tabindex="0" data-tip="${tipAttr}">
+        <div class="${colCls}" tabindex="0" data-tip="${tipAttr}">
           <div class="person-hours-bar-wrap" style="height:${chartH}px">
             <div class="person-hours-stack">
               ${remainPx > 0 ? `<div class="person-hours-remain" style="height:${remainPx}px"></div>` : ""}
@@ -1476,8 +1594,8 @@ function openPersonModal(name) {
           </div>
           <div class="person-hours-label">
             <strong>${escapeHtml(wd)}</strong>
-            <span class="person-hours-spent-val">${fmtNumber(h)}ч</span>
-            <span>${isWeekend ? "вых." : `ост ${fmtNumber(remain)}`}</span>
+            <span class="person-hours-spent-val">${isFuture ? "—" : fmtDuration(h)}</span>
+            <span>${footer}</span>
           </div>
         </div>`;
     })
@@ -1490,39 +1608,54 @@ function openPersonModal(name) {
     )
     .join("");
 
-  const activeTasks = (profile.tasks_active || profile.tasks || []).slice(0, 12);
-  const taskRows = activeTasks
-    .map(
-      (t) => `
-      <div class="person-task-row ${t.risk ? "task-row-risk" : ""}">
-        <div>${taskTitle(t, { showTags: true })}</div>
-        <div class="muted">${timeCell(t.hours, t.estimate_hours, { warnZero: true })}</div>
-      </div>`
-    )
+  const activeTasksHtml = renderPersonActiveTasks(
+    profile.tasks_active || profile.tasks || []
+  );
+
+  const activityHtml = renderPersonActivity(profile.activity);
+  const loadHtml = renderPersonLoad(profile.load);
+
+  const avatarImg = avatarImgHtml(
+    profile.name,
+    teamAvatarOverride(profile.name) || profile.avatar_url,
+    { cls: "person-modal-avatar" }
+  );
+  const avatar = avatarWithLoad(avatarImg, profile.load, { size: "lg" });
+  const profileLinks = [
+    profile.jira_url
+      ? `<a class="person-profile-btn" href="${escapeHtml(profile.jira_url)}" target="_blank" rel="noreferrer">Jira</a>`
+      : "",
+    profile.gitlab_url
+      ? `<a class="person-profile-btn" href="${escapeHtml(profile.gitlab_url)}" target="_blank" rel="noreferrer">GitLab</a>`
+      : "",
+  ]
+    .filter(Boolean)
     .join("");
+  const profileLinksHtml = profileLinks
+    ? `<div class="person-profile-links">${profileLinks}</div>`
+    : "";
 
-  const initial = (profile.name || "?").trim().charAt(0).toUpperCase();
-  const avatar = profile.avatar_url
-    ? `<img class="person-modal-avatar" src="${escapeHtml(profile.avatar_url)}" alt="" />`
-    : `<span class="person-modal-avatar placeholder">${escapeHtml(initial)}</span>`;
-
-  openAppModal(`
+  openAppModal(
+    `
     <div class="person-modal-head">
       ${avatar}
       <div>
         <h2 id="app-modal-title">${escapeHtml(profile.name)}</h2>
         <p class="muted">${escapeHtml(profile.direction || "")}</p>
+        ${profileLinksHtml}
       </div>
     </div>
     <div class="person-modal-stats">
       <div class="person-stat"><span class="label">${tip("Активные", "Задачи в active-статусе направления")}</span><span class="value">${fmtNumber(profile.tasks_open)}</span></div>
       <div class="person-stat"><span class="label">${tip("Закрыто / всего", "Закрытые по правилам направления / все задачи сотрудника в спринте")}</span><span class="value">${fmtNumber(profile.tasks_done)}/${fmtNumber(profile.tasks_total)}</span></div>
-      <div class="person-stat"><span class="label">${tip("Часы спринта", "Сумма worklog за дни спринта")}</span><span class="value">${fmtNumber(profile.hours_sprint)}</span></div>
+      <div class="person-stat"><span class="label">${tip("Часы спринта", "Сумма worklog за дни спринта")}</span><span class="value">${fmtDuration(profile.hours_sprint)}</span></div>
       <div class="person-stat"><span class="label">${tip("MR", "Merge request’ы, связанные с задачами сотрудника")}</span><span class="value">${fmtNumber(profile.mr_count)}</span></div>
     </div>
+    ${loadHtml}
+    ${activityHtml}
     <div class="person-modal-section">
       <h3>Списания по дням</h3>
-      <p class="muted person-hours-legend">Столбик: списано · сверху до нормы — остаток · норма ${fmtNumber(expected)} ч</p>
+      <p class="muted person-hours-legend">Столбик: списано · сверху до нормы — остаток · норма ${fmtDuration(expected)} · подсвечен сегодня</p>
       <div class="person-hours-chart">${chart || `<span class="muted">Нет списаний</span>`}</div>
     </div>
     <div class="person-modal-section">
@@ -1531,8 +1664,1076 @@ function openPersonModal(name) {
     </div>
     <div class="person-modal-section">
       <h3>Активные задачи</h3>
-      <div class="person-task-list">${taskRows || `<p class="muted">Нет активных задач направления</p>`}</div>
-    </div>`);
+      ${activeTasksHtml}
+    </div>`,
+    { person: true }
+  );
+}
+
+function findPersonByName(name) {
+  const people = currentSprintReport?.people || {};
+  if (!name) return null;
+  if (people[name]) return people[name];
+  const target = String(name).trim().toLowerCase();
+  for (const [key, profile] of Object.entries(people)) {
+    if (key.toLowerCase() === target) return profile;
+  }
+  return null;
+}
+
+function activityStatusLabel(status) {
+  const raw = String(status || "").trim();
+  const key = raw.toLowerCase();
+  if (!key) return "—";
+  // Backlog / To Do family (Jira often stores EN "To Do", board shows «Сделать»)
+  if (
+    key === "сделать" ||
+    key === "to do" ||
+    key === "todo" ||
+    key === "open" ||
+    key === "backlog" ||
+    key === "новая" ||
+    key === "новая (оценено)" ||
+    key === "ready for development" ||
+    key.startsWith("to do")
+  )
+    return "Сделать";
+  if (key.includes("ready for testing")) return "Тест";
+  if (key === "tested" || key.includes("tested")) return "Tested";
+  if (key.includes("тест") || key === "testing" || key === "тестирование") return "Тест";
+  if (key === "verify" || key === "verified") return "Verify";
+  if (key.includes("review") || key.includes("ревью")) return "Ревью";
+  if (key === "developed" || key === "разработка") return "Developed";
+  if (
+    key === "closed" ||
+    key === "done" ||
+    key === "готово" ||
+    key === "закрыт" ||
+    key === "закрыта" ||
+    key === "resolved" ||
+    key.startsWith("closed") ||
+    key.startsWith("done")
+  )
+    return "Закрыта";
+  if (key === "отменено" || key === "cancelled" || key === "canceled") return "Отменено";
+  if (key.includes("in progress") || key.includes("в работе")) return "В работе";
+  if (key.includes("hold")) return "Hold";
+  return raw;
+}
+
+function activityDestChip(ev) {
+  const type = ev.type || "";
+  const toAssignee = ev.to_assignee;
+  const fromAssignee = ev.from_assignee;
+  const reassigned =
+    toAssignee && fromAssignee && String(toAssignee) !== String(fromAssignee);
+
+  if (type === "progress") {
+    const verb = ev.action || "Списал";
+    const dur = ev.hours != null ? fmtDuration(ev.hours) : "";
+    return `<span class="act-chip act-chip-hours">${escapeHtml(dur ? `${verb} ${dur}` : verb)}</span>`;
+  }
+
+  if ((type === "handed_off" || type === "to_review") && reassigned) {
+    return activityPersonChip(toAssignee);
+  }
+  if (type === "handed_off") {
+    const label = activityStatusLabel(ev.to_status) || "Дальше";
+    return `<span class="act-chip act-chip-status tone-hand">${escapeHtml(label)}</span>`;
+  }
+  if (type === "to_review") {
+    return `<span class="act-chip act-chip-status tone-review">Ревью</span>`;
+  }
+  if (type === "closed") {
+    return `<span class="act-chip act-chip-status tone-done">Закрыта</span>`;
+  }
+  if (type === "started") {
+    return `<span class="act-chip act-chip-status tone-start">В работе</span>`;
+  }
+  if (type === "received") {
+    if (fromAssignee && String(fromAssignee) !== String(toAssignee || "")) {
+      return activityPersonChip(fromAssignee, { prefix: "от" });
+    }
+    return `<span class="act-chip act-chip-status tone-recv">На мне</span>`;
+  }
+  if (ev.to_status) {
+    return `<span class="act-chip act-chip-status">${escapeHtml(activityStatusLabel(ev.to_status))}</span>`;
+  }
+  return `<span class="act-chip act-chip-status">${escapeHtml(ev.text || "—")}</span>`;
+}
+
+function activityPersonChip(name, { prefix = "", withLoad = false } = {}) {
+  const profile = findPersonByName(name);
+  const label = shortGivenSurname(name);
+  const tipName = escapeHtml(name || label);
+  const key = profile?.name || name;
+  const canOpen = !!(key && currentSprintReport?.people?.[key]);
+  const cls = `act-chip act-chip-person has-tip${canOpen ? " person-btn" : ""}`;
+  const tag = canOpen ? "button" : "span";
+  const typeAttr = canOpen ? ` type="button"` : "";
+  const dataAttr = canOpen ? ` data-person="${escapeHtml(key)}"` : "";
+  const prefixHtml = prefix
+    ? `<span class="act-chip-prefix">${escapeHtml(prefix)}</span>`
+    : "";
+  const avatar = avatarWithLoad(
+    avatarImgHtml(name, teamAvatarOverride(key) || profile?.avatar_url, { cls: "act-chip-avatar" }),
+    withLoad ? profile?.load || null : null,
+    { size: "xs" }
+  );
+  return `<${tag}${typeAttr} class="${cls}"${dataAttr} tabindex="0" data-tip="${tipName}">${prefixHtml}${avatar}<span class="act-chip-name person-name">${escapeHtml(label)}</span></${tag}>`;
+}
+
+function activityTaskCard(ev) {
+  const issue = {
+    key: ev.issue_key || ev.key,
+    web_url: ev.web_url,
+    summary: ev.summary,
+  };
+  const summary = ev.summary
+    ? `<span class="act-task-summary">${escapeHtml(ev.summary)}</span>`
+    : "";
+  return `<div class="act-task">${issueLink(issue)}${summary}</div>`;
+}
+
+function renderActivityEvent(ev) {
+  if (!ev) return "";
+  if (ev.type === "more") {
+    return `<div class="person-activity-row is-more"><span class="muted">${escapeHtml(ev.text || "")}</span></div>`;
+  }
+
+  const type = ev.type || "other";
+  const task = activityTaskCard(ev);
+  const dest = activityDestChip(ev);
+
+  const action = ev.action
+    ? `<span class="act-verb">${escapeHtml(ev.action)}</span>`
+    : "";
+
+  // received: «Марк → задача» (кто передал → что пришло)
+  if (type === "received" && ev.from_assignee && ev.from_assignee !== ev.to_assignee) {
+    return `
+      <div class="person-activity-row type-${escapeHtml(type)}">
+        <div class="act-flow act-flow-incoming">
+          <div class="act-flow-end">
+            ${activityPersonChip(ev.from_assignee)}
+            <span class="act-arrow" aria-hidden="true">→</span>
+          </div>
+          ${task}
+        </div>
+      </div>`;
+  }
+
+  if (type === "progress") {
+    return `
+      <div class="person-activity-row type-${escapeHtml(type)}">
+        <div class="act-flow">
+          ${task}
+          <div class="act-flow-end">${dest}</div>
+        </div>
+      </div>`;
+  }
+
+  return `
+    <div class="person-activity-row type-${escapeHtml(type)}">
+      <div class="act-flow">
+        ${task}
+        <div class="act-flow-end">
+          <span class="act-arrow" aria-hidden="true">${action ? `${action} →` : "→"}</span>
+          ${dest}
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderActivityGroups(block) {
+  const order = ["movement", "incoming", "progress"];
+  const groups = [...(block.groups || [])].sort((a, b) => {
+    const ai = order.indexOf(a.id);
+    const bi = order.indexOf(b.id);
+    return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
+  });
+  if (groups.length) {
+    return groups
+      .map((group) => {
+        const rows = (group.events || []).map(renderActivityEvent).join("");
+        if (!rows) return "";
+        return `
+          <div class="person-activity-group">
+            <h4 class="person-activity-group-title">${escapeHtml(group.label || "")}</h4>
+            <div class="person-activity-list">${rows}</div>
+          </div>`;
+      })
+      .join("");
+  }
+  // Fallback for older reports without groups
+  const events = block.events || [];
+  return `<div class="person-activity-list">${events.map(renderActivityEvent).join("")}</div>`;
+}
+
+function renderPersonActiveTaskRow(t) {
+  const issue = { key: t.key, web_url: t.web_url, summary: t.summary };
+  const summary = t.summary
+    ? `<span class="person-task-summary">${escapeHtml(t.summary)}</span>`
+    : "";
+  const status = t.status
+    ? `<span class="person-task-status">${escapeHtml(t.status)}</span>`
+    : "";
+  const spent = Number(t.hours) || 0;
+  const estimate = Number(t.estimate_hours);
+  const hasEstimate = Number.isFinite(estimate) && estimate > 0;
+  const pct = hasEstimate
+    ? Math.min(100, Math.round((spent / estimate) * 100))
+    : null;
+  const tipText = hasEstimate
+    ? `Прогресс: списано ${fmtDuration(spent)} из оценки ${fmtDuration(estimate)}`
+    : spent > 0
+      ? `Списано ${fmtDuration(spent)} · оценки нет`
+      : "Нет списаний и оценки";
+  const side = `
+    <div class="person-task-side has-tip" tabindex="0" data-tip="${escapeHtml(tipText)}">
+      <span class="person-task-pct ${pct == null ? "is-muted" : ""}">${
+        pct != null ? `${pct}%` : "—"
+      }</span>
+      <span class="person-task-hours">${fmtDuration(spent)}${
+        hasEstimate ? ` / ${fmtDuration(estimate)}` : ""
+      }</span>
+    </div>`;
+  return `
+    <div class="person-task-row is-compact ${t.risk ? "task-row-risk" : ""}">
+      <div class="person-task-main">${issueLink(issue)}${summary}${status}</div>
+      ${side}
+    </div>`;
+}
+
+function groupPersonActiveTasksByRelease(tasks) {
+  const releasesById = Object.fromEntries(
+    (currentSprintReport?.releases || []).map((r) => [String(r.id), r])
+  );
+  const groups = new Map();
+  const without = [];
+
+  for (const t of tasks || []) {
+    const releaseTags = (t.tags || []).filter((tag) => tag.id === "release");
+    if (!releaseTags.length) {
+      without.push(t);
+      continue;
+    }
+    // One group per primary Fix Version (first release tag)
+    const tag = releaseTags[0];
+    const rid = tag.release_id != null ? String(tag.release_id) : "";
+    const release = rid
+      ? releasesById[rid]
+      : (currentSprintReport?.releases || []).find((r) => r.name === tag.label);
+    const key = rid || `name:${tag.label}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        label: tag.label,
+        release_id: release?.id != null ? String(release.id) : rid || null,
+        tasks: [],
+      });
+    }
+    groups.get(key).tasks.push(t);
+  }
+
+  return {
+    withRelease: [...groups.values()].sort((a, b) =>
+      String(a.label).localeCompare(String(b.label), "ru")
+    ),
+    withoutRelease: without,
+  };
+}
+
+function renderPersonActiveTasks(tasks) {
+  const list = tasks || [];
+  if (!list.length) {
+    return `<p class="muted">Нет активных задач направления</p>`;
+  }
+  const { withRelease, withoutRelease } = groupPersonActiveTasksByRelease(list);
+  const blocks = [];
+
+  for (const g of withRelease) {
+    const clickable = !!g.release_id;
+    const title = clickable
+      ? `<button type="button" class="person-task-group-release" data-release-id="${escapeHtml(
+          g.release_id
+        )}">${escapeHtml(g.label)}</button>`
+      : `<span class="person-task-group-release is-static">${escapeHtml(g.label)}</span>`;
+    blocks.push(`
+      <div class="person-task-group">
+        <h4 class="person-task-group-title">
+          <span class="person-task-group-kicker">Релиз</span>
+          ${title}
+          <span class="person-task-group-count">${fmtNumber(g.tasks.length)}</span>
+        </h4>
+        <div class="person-task-list">${g.tasks.map(renderPersonActiveTaskRow).join("")}</div>
+      </div>`);
+  }
+
+  if (withoutRelease.length) {
+    blocks.push(`
+      <div class="person-task-group">
+        <h4 class="person-task-group-title">
+          <span class="person-task-group-kicker">Без релиза</span>
+          <span class="person-task-group-count">${fmtNumber(withoutRelease.length)}</span>
+        </h4>
+        <div class="person-task-list">${withoutRelease.map(renderPersonActiveTaskRow).join("")}</div>
+      </div>`);
+  }
+
+  return `<div class="person-task-groups">${blocks.join("")}</div>`;
+}
+
+function renderPersonLoad(load) {
+  if (!load) return "";
+  const level = load.level || "unknown";
+  const pct = load.load_pct;
+  const value =
+    level === "empty"
+      ? "—"
+      : pct == null
+        ? "—"
+        : `${fmtNumber(pct)}%`;
+  const levelLabel =
+    {
+      empty: "нет active-задач",
+      unknown: "не хватает данных",
+      ok: "есть запас",
+      tight: "впритык",
+      over: "перегруз",
+    }[level] || "";
+  const days = Number(load.days_left) || 0;
+  const dayWord =
+    days === 1 ? "раб. день" : days >= 2 && days <= 4 ? "раб. дня" : "раб. дн.";
+  const detail = [
+    `осталось ${fmtDuration(load.remaining_hours)}`,
+    `ёмкость ${fmtDuration(load.capacity_hours)}`,
+    days ? `${fmtNumber(days)} ${dayWord}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const fallbackN = Number(load.tasks_with_fallback) || 0;
+  const missing = Math.min(
+    Number(load.tasks_without_estimate) || 0,
+    fallbackN
+  );
+  const withEstimateFallback = Math.max(0, fallbackN - missing);
+  const notes = [];
+
+  const hoursWord = (hours) => {
+    if (!Number.isFinite(hours)) return "2 часа";
+    const whole = Math.round(hours);
+    if (Math.abs(hours - whole) >= 1e-6) return fmtDuration(hours);
+    const mod10 = whole % 10;
+    const mod100 = whole % 100;
+    const word =
+      mod10 === 1 && mod100 !== 11
+        ? "час"
+        : mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)
+          ? "часа"
+          : "часов";
+    return `${fmtNumber(whole)} ${word}`;
+  };
+  const taskWord = (n) =>
+    n === 1 ? "задача" : n >= 2 && n <= 4 ? "задачи" : "задач";
+
+  const fixed = Number(load.fallback_hours);
+  const fixedTxt = hoursWord(fixed);
+  if (withEstimateFallback) {
+    const ratio = Number(load.fallback_estimate_ratio);
+    const ratioTxt = Number.isFinite(ratio)
+      ? `${fmtNumber(Math.round(ratio * 100))}% от оценки задачи`
+      : "доля от оценки задачи";
+    notes.push(
+      `<div class="person-load-note">${fmtNumber(withEstimateFallback)} ${taskWord(
+        withEstimateFallback
+      )} с нулевым remaining — учтены как ${ratioTxt}, либо ${fixedTxt}</div>`
+    );
+  }
+  if (missing) {
+    notes.push(
+      `<div class="person-load-note">${fmtNumber(missing)} ${
+        missing === 1
+          ? "задача без оценки в Jira"
+          : missing >= 2 && missing <= 4
+            ? "задачи без оценки в Jira"
+            : "задач без оценки в Jira"
+      } — для них взяли по ${fixedTxt}; реальная нагрузка может быть выше</div>`
+    );
+  }
+  const tipText =
+    "Оставшаяся оценка active-задач / (рабочие дни до конца спринта × норма в день). Если remaining в Jira = 0 (часто после разработки на QA), берём max(фикс. часы, доля Original Estimate).";
+  return `
+    <div class="person-load level-${escapeHtml(level)}">
+      <div class="person-load-head">
+        <span class="person-load-label">${tip("Нагрузка до конца спринта", tipText)}</span>
+        <span class="person-load-level">${escapeHtml(levelLabel)}</span>
+      </div>
+      <div class="person-load-row">
+        <div class="person-load-value">${escapeHtml(value)}</div>
+        <div class="person-load-bar" aria-hidden="true">
+          <div class="person-load-fill" style="width:${Math.min(100, Number(pct) || 0)}%"></div>
+        </div>
+      </div>
+      <div class="person-load-detail">${escapeHtml(detail)}</div>
+      ${notes.join("")}
+    </div>`;
+}
+
+function historyFieldConflict(a, b, fromKey, toKey) {
+  const aHas = a[fromKey] != null || a[toKey] != null;
+  const bHas = b[fromKey] != null || b[toKey] != null;
+  if (!(aHas && bHas)) return false;
+  return String(a[fromKey] || "") !== String(b[fromKey] || "") || String(a[toKey] || "") !== String(b[toKey] || "");
+}
+
+function canMergeIssueHistory(a, b, windowMs) {
+  if (!a || !b) return false;
+  if (String(a.author || "") !== String(b.author || "")) return false;
+  const ta = Date.parse(a.at || "");
+  const tb = Date.parse(b.at || "");
+  if (!Number.isFinite(ta) || !Number.isFinite(tb) || Math.abs(ta - tb) > windowMs) return false;
+  if (historyFieldConflict(a, b, "status_from", "status_to")) return false;
+  if (historyFieldConflict(a, b, "assignee_from", "assignee_to")) return false;
+  const aStatus = a.status_from != null || a.status_to != null;
+  const bStatus = b.status_from != null || b.status_to != null;
+  const aAssign = a.assignee_from != null || a.assignee_to != null;
+  const bAssign = b.assignee_from != null || b.assignee_to != null;
+  // Merge complementary status+assignee edits (or identical duplicates).
+  return (aStatus && bAssign) || (aAssign && bStatus) || (aStatus && bStatus) || (aAssign && bAssign);
+}
+
+function mergeIssueHistoryPair(a, b) {
+  const newer = Date.parse(a.at || "") >= Date.parse(b.at || "") ? a : b;
+  return {
+    at: newer.at,
+    author: a.author || b.author,
+    status_from: a.status_from ?? b.status_from,
+    status_to: a.status_to ?? b.status_to,
+    assignee_from: a.assignee_from ?? b.assignee_from,
+    assignee_to: a.assignee_to ?? b.assignee_to,
+  };
+}
+
+function mergeIssueHistory(items) {
+  const WINDOW_MS = 15 * 60 * 1000;
+  const sorted = [...(items || [])].sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")));
+  const out = [];
+  for (const row of sorted) {
+    const prev = out[out.length - 1];
+    if (prev && canMergeIssueHistory(prev, row, WINDOW_MS)) {
+      out[out.length - 1] = mergeIssueHistoryPair(prev, row);
+    } else {
+      out.push({ ...row });
+    }
+  }
+  return out;
+}
+
+const DEFAULT_STATUS_FLOW = [
+  "Сделать",
+  "To Do",
+  "Open",
+  "Backlog",
+  "Новая (оценено)",
+  "В работе",
+  "In Progress",
+  "Hold",
+  "Code Review",
+  "In Review",
+  "Review",
+  "Developed",
+  "Ready for testing",
+  "Ready For Testing",
+  "Testing",
+  "Тестирование",
+  "Тест",
+  "Tested",
+  "Verified",
+  "Готово",
+  "Done",
+  "Closed",
+  "Resolved",
+];
+
+function statusFlowRank(status) {
+  const flow = currentSprintReport?.settings?.status_flow?.length
+    ? currentSprintReport.settings.status_flow
+    : DEFAULT_STATUS_FLOW;
+  const key = String(status || "")
+    .trim()
+    .toLowerCase();
+  if (!key) return null;
+  const idx = flow.findIndex((s) => String(s).trim().toLowerCase() === key);
+  return idx >= 0 ? idx : null;
+}
+
+function isStatusRollback(fromStatus, toStatus) {
+  const a = statusFlowRank(fromStatus);
+  const b = statusFlowRank(toStatus);
+  if (a == null || b == null) return false;
+  return b < a;
+}
+
+function samePersonName(a, b) {
+  if (!a || !b) return false;
+  if (String(a) === String(b)) return true;
+  const pa = findPersonByName(a);
+  const pb = findPersonByName(b);
+  if (pa?.name && pb?.name) return pa.name === pb.name;
+  return String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+}
+
+/** Reconstruct chronological states with authors of each transition. */
+function buildIssueFlowStates(
+  rawHistory,
+  { fallbackAssignee = null, fallbackStatus = null } = {}
+) {
+  const events = mergeIssueHistory(rawHistory || [])
+    .slice()
+    .sort((a, b) => String(a.at || "").localeCompare(String(b.at || "")));
+  if (!events.length) {
+    // No changelog rows — still show current assignee/status when known
+    if (fallbackAssignee || fallbackStatus) {
+      return [
+        {
+          assignee: fallbackAssignee || null,
+          status: fallbackStatus || null,
+          at: null,
+          author: null,
+          assigneeChanged: false,
+          statusChanged: false,
+        },
+      ];
+    }
+    return [];
+  }
+
+  let assignee =
+    events.find((e) => e.assignee_from != null)?.assignee_from ??
+    events.find((e) => e.assignee_to != null)?.assignee_to ??
+    null;
+  let status =
+    events.find((e) => e.status_from != null)?.status_from ??
+    events.find((e) => e.status_to != null)?.status_to ??
+    null;
+  if (!assignee) assignee = fallbackAssignee || null;
+  if (!status) status = fallbackStatus || null;
+
+  const states = [];
+  const push = ({ at, author = null, assigneeChanged = false, statusChanged = false } = {}) => {
+    const effectiveAssignee = assignee || fallbackAssignee || null;
+    const effectiveStatus = status || fallbackStatus || null;
+    if (!effectiveAssignee && !effectiveStatus) return;
+    const last = states[states.length - 1];
+    if (
+      last &&
+      last.assignee === effectiveAssignee &&
+      last.status === effectiveStatus
+    )
+      return;
+    states.push({
+      assignee: effectiveAssignee,
+      status: effectiveStatus,
+      at: at || null,
+      author: author || null,
+      assigneeChanged: !!assigneeChanged,
+      statusChanged: !!statusChanged,
+    });
+  };
+
+  push({ at: events[0].at, author: null });
+
+  for (const h of events) {
+    let assigneeChanged = false;
+    let statusChanged = false;
+    if (h.assignee_from != null || h.assignee_to != null) {
+      // null/undefined toString = unassigned; keep null (do not use || — "" is valid edge)
+      const nextA = h.assignee_to != null ? h.assignee_to : null;
+      if (nextA !== assignee) {
+        assignee = nextA;
+        assigneeChanged = true;
+      }
+    }
+    if (h.status_from != null || h.status_to != null) {
+      // Only advance when toString is present — never wipe status to null
+      if (h.status_to != null && h.status_to !== status) {
+        status = h.status_to;
+        statusChanged = true;
+      }
+    }
+    if (assigneeChanged || statusChanged) {
+      push({
+        at: h.at,
+        author: h.author || null,
+        assigneeChanged,
+        statusChanged,
+      });
+    }
+  }
+
+  // Backfill empties from the issue's current fields
+  if (fallbackAssignee || fallbackStatus) {
+    for (const state of states) {
+      if (!state.assignee && fallbackAssignee) state.assignee = fallbackAssignee;
+      if (!state.status && fallbackStatus) state.status = fallbackStatus;
+    }
+  }
+  return states;
+}
+
+function flowInitiatorFor(state) {
+  if (!state?.author) return null;
+  if (state.assignee && samePersonName(state.author, state.assignee)) return null;
+  return state.author;
+}
+
+function statusEquals(a, b) {
+  const na = String(a || "")
+    .trim()
+    .toLowerCase();
+  const nb = String(b || "")
+    .trim()
+    .toLowerCase();
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  return activityStatusLabel(a) === activityStatusLabel(b);
+}
+
+/**
+ * Rows of forward progress. New row on status rollback.
+ * Initiator (who assigned / who returned the task) is shown before the first node.
+ */
+function buildIssueFlowRows(
+  rawHistory,
+  { fallbackAssignee = null, fallbackStatus = null, reporter = null } = {}
+) {
+  const states = buildIssueFlowStates(rawHistory, {
+    fallbackAssignee,
+    fallbackStatus,
+  });
+  if (!states.length) return [];
+
+  const rows = [];
+  let current = { initiator: null, nodes: [states[0]] };
+
+  for (let i = 1; i < states.length; i += 1) {
+    const prev = states[i - 1];
+    const node = states[i];
+    const rollback = isStatusRollback(prev.status, node.status);
+    const assignedByOther =
+      node.assigneeChanged &&
+      !!flowInitiatorFor(node) &&
+      String(prev.assignee || "") !== String(node.assignee || "");
+
+    if (rollback) {
+      if (current.nodes.length) rows.push(current);
+      current = { initiator: flowInitiatorFor(node), nodes: [node] };
+      continue;
+    }
+
+    // First hand-off: Александр → ((Дмитрий) To Do) — drop prior assignee node
+    if (i === 1 && assignedByOther && current.nodes.length === 1) {
+      current = { initiator: flowInitiatorFor(node), nodes: [node] };
+      continue;
+    }
+
+    current.nodes.push(node);
+  }
+
+  if (current.nodes.length) rows.push(current);
+
+  // Jira «Инициатор» (reporter) as fallback for the first segment
+  if (
+    rows.length &&
+    !rows[0].initiator &&
+    reporter &&
+    !samePersonName(reporter, rows[0].nodes[0]?.assignee)
+  ) {
+    rows[0].initiator = reporter;
+  }
+
+  return rows;
+}
+
+function issueFlowNodeHtml(node, { isCurrent = false, showPerson = true } = {}) {
+  const person = showPerson
+    ? node.assignee
+      ? activityPersonChip(node.assignee, { withLoad: false })
+      : `<span class="muted">—</span>`
+    : "";
+  const status = node.status
+    ? `<span class="issue-flow-status">${escapeHtml(activityStatusLabel(node.status))}</span>`
+    : `<span class="issue-flow-status is-empty">—</span>`;
+  const when = node.at
+    ? `<span class="muted issue-flow-when">${escapeHtml(fmtRelativeDateTime(node.at))}</span>`
+    : "";
+  const tip = node.at ? fmtDateTime(node.at) : "";
+  return `
+    <div class="issue-flow-node${isCurrent ? " is-current" : ""}${
+      showPerson ? "" : " is-status-only"
+    }" title="${escapeHtml(tip)}">
+      <div class="issue-flow-node-main">${person}${status}</div>
+      ${when}
+    </div>`;
+}
+
+function renderIssueMovementFlow(issue) {
+  const history = issue?.history || [];
+  const fallbackAssignee = issue?.assignee_canonical || issue?.assignee || null;
+  const fallbackStatus = issue?.status || null;
+  const reporter = issue?.reporter_canonical || issue?.reporter || null;
+  const rows = buildIssueFlowRows(history, {
+    fallbackAssignee,
+    fallbackStatus,
+    reporter,
+  });
+  if (!rows.length) {
+    return `<p class="muted">Нет смен статуса/исполнителя в данных спринта</p>`;
+  }
+
+  // Highlight the latest node that matches the issue's current status (fallback: last node).
+  let currentMarked = false;
+  const currentStatus = issue?.status || null;
+  for (let r = rows.length - 1; r >= 0 && !currentMarked; r -= 1) {
+    const nodes = rows[r].nodes || [];
+    for (let i = nodes.length - 1; i >= 0; i -= 1) {
+      if (!currentStatus || statusEquals(nodes[i].status, currentStatus)) {
+        nodes[i] = { ...nodes[i], isCurrent: true };
+        currentMarked = true;
+        break;
+      }
+    }
+  }
+  if (!currentMarked) {
+    const lastRow = rows[rows.length - 1];
+    const lastNodes = lastRow?.nodes || [];
+    if (lastNodes.length) lastNodes[lastNodes.length - 1].isCurrent = true;
+  }
+
+  return `
+    <div class="issue-flow">
+      ${rows
+        .map((row) => {
+          const parts = [];
+          if (row.initiator) {
+            parts.push(`
+              <div class="issue-flow-initiator">
+                ${activityPersonChip(row.initiator, { withLoad: false })}
+              </div>`);
+            parts.push(`<span class="issue-flow-arrow" aria-hidden="true">→</span>`);
+          }
+          (row.nodes || []).forEach((node, idx) => {
+            if (idx) parts.push(`<span class="issue-flow-arrow" aria-hidden="true">→</span>`);
+            const prev = idx > 0 ? row.nodes[idx - 1] : null;
+            // Same assignee streak: person chip only on the first node
+            const showPerson =
+              idx === 0 ||
+              !prev?.assignee ||
+              !node.assignee ||
+              !samePersonName(prev.assignee, node.assignee);
+            parts.push(
+              issueFlowNodeHtml(node, {
+                isCurrent: !!node.isCurrent,
+                showPerson,
+              })
+            );
+          });
+          return `<div class="issue-flow-row">${parts.join("")}</div>`;
+        })
+        .join("")}
+    </div>`;
+}
+
+function gitlabIconSvg() {
+  return `<svg class="gitlab-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M23.955 13.587l-1.342-4.135-2.664-8.189c-.135-.423-.73-.423-.867 0L16.418 9.45H7.582L4.919 1.263C4.783.84 4.185.84 4.05 1.263L1.386 9.452.044 13.587c-.121.375.014.789.331 1.023L12 23.054l11.625-8.443c.318-.235.453-.648.33-1.024z"/></svg>`;
+}
+
+function wikiLinkTokenToHtml(label, url) {
+  const safeLabel = escapeHtml(label);
+  if (/^https?:\/\//i.test(url)) {
+    return `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${safeLabel}</a>`;
+  }
+  return safeLabel;
+}
+
+function formatJiraWikiHtml(raw) {
+  const text = String(raw || "");
+  if (!text.trim()) return "";
+  const parts = [];
+  const re = /\[([^\]|\n]+)\|([^\]\n]+)\]|\{quote\}([\s\S]*?)\{quote\}/gi;
+  let last = 0;
+  let match;
+  while ((match = re.exec(text))) {
+    if (match.index > last) {
+      parts.push(escapeHtml(text.slice(last, match.index)));
+    }
+    if (match[1] != null && match[2] != null) {
+      parts.push(wikiLinkTokenToHtml(match[1], match[2]));
+    } else if (match[3] != null) {
+      parts.push(`<blockquote class="issue-comment-quote">${escapeHtml(match[3].trim())}</blockquote>`);
+    }
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) parts.push(escapeHtml(text.slice(last)));
+  return parts.join("").replace(/\n/g, "<br>");
+}
+
+function formatCommentHtml(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  if (/mentioned this issue in/i.test(text)) {
+    const authorMatch = text.match(/^\[([^\]|]+)\|([^\]]+)\]/);
+    const mrMatch = text.match(/\[a merge request\|([^\]]+)\]/i);
+    const projectMatch = text.match(/of \[([^\|]+)\|([^\]]+)\]/i);
+    const branchMatch = text.match(/on branch \[([^\|]+)\|([^\]]+)\]/i);
+    const quoteMatch = text.match(/\{quote\}([\s\S]*?)\{quote\}/i);
+    const authorName = authorMatch ? authorMatch[1].split("|")[0] : null;
+    // Author display from wiki is often "Surname Name Patronymic"
+    const authorLabel = authorName
+      ? shortGivenSurname(authorName) || authorName
+      : "GitLab";
+    const mrUrl = mrMatch?.[1] || "";
+    const projectLabel = projectMatch?.[1] || "проект";
+    const branchLabel = branchMatch?.[1] || "";
+    const quote = (quoteMatch?.[1] || "").trim();
+    return `
+      <div class="issue-gl-mention">
+        <div class="issue-gl-mention-title">${gitlabIconSvg()} ${escapeHtml(authorLabel)} упомянул задачу в merge request</div>
+        <div class="issue-gl-mention-meta">
+          ${
+            mrUrl
+              ? `<a href="${escapeHtml(mrUrl)}" target="_blank" rel="noreferrer">Открыть MR</a>`
+              : ""
+          }
+          <span class="muted">${escapeHtml(projectLabel)}${branchLabel ? ` · ${escapeHtml(branchLabel)}` : ""}</span>
+        </div>
+        ${quote ? `<blockquote class="issue-comment-quote">${escapeHtml(quote)}</blockquote>` : ""}
+      </div>`;
+  }
+  return formatJiraWikiHtml(text);
+}
+
+function openIssueModal(issueKey) {
+  const key = String(issueKey || "").trim().toUpperCase();
+  const issue = currentSprintReport?.issues?.[key];
+  if (!issue) {
+    openAppModal(
+      `<h2 id="app-modal-title">${escapeHtml(key || "Задача")}</h2>
+       <p class="muted">Нет данных по задаче в текущем отчёте спринта. Откройте её в Jira.</p>`
+    );
+    return;
+  }
+
+  const jiraBtn = issue.web_url
+    ? `<a class="jira-open-btn" href="${escapeHtml(issue.web_url)}" target="_blank" rel="noreferrer">Открыть в Jira</a>`
+    : "";
+  const assignee = issue.assignee_canonical || issue.assignee;
+  const assigneeProfile = findPersonByName(issue.assignee_canonical) || findPersonByName(issue.assignee);
+  const assigneeHtml = assignee
+    ? personCell(issue.assignee || assignee, issue.avatar_url || assigneeProfile?.avatar_url, {
+        givenSurname: true,
+        personKey: issue.assignee_canonical || issue.assignee,
+        withLoad: false,
+      })
+    : `<span class="muted">Без исполнителя</span>`;
+
+  const spent = Number(issue.hours) || 0;
+  const estimate = issue.estimate_hours;
+  const remaining = issue.remaining_hours;
+  const pct = issue.progress_pct;
+  const metrics = `
+    <div class="person-modal-stats issue-modal-stats">
+      <div class="person-stat"><span class="label">Статус</span><span class="value value-text">${statusChip(
+        issue.status,
+        issue.status_category
+      )}</span></div>
+      <div class="person-stat"><span class="label">${tip(
+        "Прогресс",
+        "Списано / Original Estimate"
+      )}</span><span class="value">${pct != null ? `${fmtNumber(pct)}%` : "—"}</span></div>
+      <div class="person-stat"><span class="label">Списано</span><span class="value">${fmtDuration(spent)}</span></div>
+      <div class="person-stat"><span class="label">Оценка / ост.</span><span class="value value-text">${
+        estimate != null ? fmtDuration(estimate) : "—"
+      } / ${remaining != null ? fmtDuration(remaining) : "—"}</span></div>
+    </div>`;
+
+  const allTags = issue.tags || [];
+  const releaseTags = allTags.filter((t) => t.id === "release");
+  const riskTags = allTags.filter((t) => t.id !== "release");
+  const releasesById = Object.fromEntries(
+    (currentSprintReport?.releases || []).map((r) => [String(r.id), r])
+  );
+  const releaseTiles = releaseTags
+    .map((tag) => {
+      const rid = tag.release_id != null ? String(tag.release_id) : "";
+      const release = rid ? releasesById[rid] : (currentSprintReport?.releases || []).find((r) => r.name === tag.label);
+      const releaseId = release?.id != null ? String(release.id) : rid;
+      const riskLabel = release?.risk_label || "";
+      const riskCls = release?.risk ? ` risk-${escapeHtml(release.risk)}` : "";
+      const clickable = !!releaseId;
+      const tagName = clickable ? "button" : "div";
+      const typeAttr = clickable ? ` type="button"` : "";
+      const dataAttr = clickable ? ` data-release-id="${escapeHtml(releaseId)}"` : "";
+      const cls = `issue-release-tile${clickable ? " is-clickable" : ""}${riskCls}`;
+      return `
+        <${tagName}${typeAttr} class="${cls}"${dataAttr}>
+          <span class="issue-release-kicker">Релиз</span>
+          <strong class="issue-release-name">${escapeHtml(tag.label)}</strong>
+          ${
+            riskLabel
+              ? `<span class="issue-release-risk">${escapeHtml(riskLabel)}</span>`
+              : `<span class="muted issue-release-risk">В отчёте нет карточки релиза</span>`
+          }
+        </${tagName}>`;
+    })
+    .join("");
+  const releaseHtml = releaseTiles
+    ? `<div class="person-modal-section"><h3>Релиз</h3><div class="issue-release-tiles">${releaseTiles}</div></div>`
+    : issue.hidden_from_display
+      ? ""
+      : `<div class="person-modal-section">
+          <h3>Релиз</h3>
+          <div class="issue-no-release">Нет в релизе</div>
+        </div>`;
+  const risksHtml = `
+    <div class="person-modal-section">
+      <h3>Риски</h3>
+      ${
+        riskTags.length
+          ? `<div class="task-tags">${tagsHtml(riskTags)}</div>`
+          : `<p class="muted">Явных рисков по задаче нет</p>`
+      }
+    </div>`;
+
+  const historyHtml = `
+    <div class="person-modal-section">
+      <h3>Движение</h3>
+      ${renderIssueMovementFlow(issue)}
+    </div>`;
+
+  const worklogs = (issue.worklogs || [])
+    .map((w) => {
+      const who = w.author_canonical || w.author;
+      const whoHtml = who
+        ? activityPersonChip(who, { withLoad: false })
+        : `<span class="muted">—</span>`;
+      const verb = "Списал";
+      const comment = w.comment
+        ? `<div class="issue-worklog-comment">${formatJiraWikiHtml(w.comment)}</div>`
+        : "";
+      return `
+        <div class="person-activity-row type-progress">
+          <div class="act-flow act-flow-worklog">
+            <div class="issue-worklog-top">
+              ${whoHtml}
+              <span class="muted act-when">${escapeHtml(w.at ? fmtRelativeDateTime(w.at) : "—")}</span>
+              <span class="act-chip act-chip-hours issue-worklog-hours">${escapeHtml(`${verb} ${fmtDuration(w.hours)}`)}</span>
+            </div>
+            ${comment}
+          </div>
+        </div>`;
+    })
+    .join("");
+  const worklogsHtml = `
+    <div class="person-modal-section">
+      <h3>Списания</h3>
+      <div class="person-activity-list issue-worklog-list">${
+        worklogs || `<p class="muted">Нет списаний в окне спринта</p>`
+      }</div>
+    </div>`;
+
+  const comments = (issue.comments || [])
+    .map((c) => {
+      const who = c.author_canonical || c.author;
+      const whoHtml = who ? activityPersonChip(who, { withLoad: false }) : `<span class="muted">—</span>`;
+      return `
+        <div class="issue-comment-row">
+          <div class="issue-comment-head">
+            ${whoHtml}
+            <span class="muted">${escapeHtml(c.at ? fmtRelativeDateTime(c.at) : "—")}</span>
+          </div>
+          <div class="issue-comment-body">${formatCommentHtml(c.body || "")}</div>
+        </div>`;
+    })
+    .join("");
+  const commentsHtml = `
+    <div class="person-modal-section">
+      <h3>Комментарии</h3>
+      <div class="issue-comment-list">${
+        comments || `<p class="muted">Нет комментариев</p>`
+      }</div>
+    </div>`;
+
+  const epicHtml = issue.epic_key
+    ? `<p class="muted issue-epic-line">Эпик: <button type="button" class="issue-key issue-key-btn" data-issue="${escapeHtml(
+        issue.epic_key
+      )}">${escapeHtml(issue.epic_key)}</button> ${escapeHtml(issue.epic_summary || "")}</p>`
+    : "";
+
+  const mrs = (issue.mrs || [])
+    .map((mr) => {
+      const title = escapeHtml(mr.title || `MR !${mr.iid || ""}`);
+      return mr.web_url
+        ? `<a class="issue-mr-link" href="${escapeHtml(mr.web_url)}" target="_blank" rel="noreferrer">${gitlabIconSvg()}<span>${title}</span></a>`
+        : `<span class="issue-mr-link is-static">${gitlabIconSvg()}<span>${title}</span></span>`;
+    })
+    .join("");
+  const mrsHtml = mrs
+    ? `<div class="person-modal-section"><h3>Merge requests</h3><div class="issue-mr-list">${mrs}</div></div>`
+    : "";
+
+  openAppModal(
+    `
+    <div class="issue-modal-head">
+      <div class="issue-modal-title-row">
+        <h2 id="app-modal-title" class="issue-modal-title">
+          <span class="issue-key issue-key-static">${escapeHtml(issue.key)}</span>
+          <span class="issue-modal-summary">${escapeHtml(issue.summary || issue.key)}</span>
+        </h2>
+        ${jiraBtn}
+      </div>
+      <div class="issue-modal-assignee">${assigneeHtml}</div>
+      ${epicHtml}
+    </div>
+    ${metrics}
+    ${releaseHtml}
+    ${risksHtml}
+    ${historyHtml}
+    ${worklogsHtml}
+    ${commentsHtml}
+    ${mrsHtml}
+  `,
+    { person: true }
+  );
+}
+
+function renderPersonActivity(activity) {
+  if (!activity) return "";
+  const blocks = [
+    ["yesterday", activity.yesterday],
+    ["today", activity.today],
+  ];
+  const sections = blocks
+    .map(([id, block]) => {
+      if (!block) return "";
+      const title = escapeHtml(block.label || (id === "yesterday" ? "Вчера" : "Сегодня"));
+      const dateLabel = block.date
+        ? `<span class="person-activity-date">${escapeHtml(fmtDay(block.date))}</span>`
+        : "";
+      const events = block.events || [];
+      const meaningful = events.filter((e) => e && e.type && e.type !== "more");
+      const body = meaningful.length
+        ? renderActivityGroups(block)
+        : `<p class="muted person-activity-empty">Нет заметных движений</p>`;
+      return `
+        <div class="person-modal-section person-activity-section">
+          <h3>${title} ${dateLabel}</h3>
+          ${body}
+        </div>`;
+    })
+    .join("");
+  return sections;
 }
 
 function openRatingModal(catId) {
@@ -1758,7 +2959,11 @@ function taskRow(t, { withCommits = true } = {}) {
     <tr data-status="${escapeHtml(t.status || "")}" data-assignee="${escapeHtml(t.assignee || "")}" data-hours="${t.hours || 0}" data-commits="${t.commit_count || 0}" data-key="${escapeHtml(t.key || "")}">
       <td class="task-cell">${taskTitle(t)}</td>
       <td class="col-status">${statusChip(t.status, t.status_category)}</td>
-      <td class="col-assignee">${personCell(t.assignee || "—", t.avatar_url, { short: true, personKey: t.assignee_canonical || t.assignee })}</td>
+      <td class="col-assignee">${personCell(t.assignee || "—", t.avatar_url, {
+        short: true,
+        personKey: t.assignee_canonical || t.assignee,
+        load: (currentSprintReport?.people || {})[t.assignee_canonical || t.assignee]?.load,
+      })}</td>
       <td class="col-hours">${timeCell(t.hours, t.estimate_hours, { warnZero: true })}</td>
       ${commitsCell}
     </tr>`;
@@ -1910,7 +3115,10 @@ function renderTeam(report) {
             const remain = Number(profile.remaining_hours) || 0;
             return `
               <tr data-name="${escapeHtml(person.name || "")}" data-tasks="${person.tasks_open || 0}" data-hours="${hours || 0}" data-sprint="${person.hours_sprint || 0}" data-risks="${riskCount}" data-remain="${remain}">
-                <td>${personCell(person.name, person.avatar_url, { short: true })}</td>
+                <td>${personCell(person.name, person.avatar_url, {
+                  short: true,
+                  load: profile.load || person.load || null,
+                })}</td>
                 <td>
                   <button type="button" class="tasks-cell-btn metric ${tasksTone}" data-person-tasks="${escapeHtml(person.name)}">
                     ${fmtNumber(person.tasks_done)}/${fmtNumber(person.tasks_total)}
@@ -1970,7 +3178,11 @@ function renderRisks(risks) {
         (item) => `
       <tr data-assignee="${escapeHtml(item.assignee || "")}" data-direction="${escapeHtml(item.direction || "")}" data-status="${escapeHtml(item.status || "")}" data-hours="${item.hours || 0}" data-key="${escapeHtml(item.key || "")}">
         <td class="task-cell">${taskTitle(item)}</td>
-        <td class="col-assignee">${personCell(item.assignee, item.avatar_url, { short: true, personKey: item.assignee_canonical || item.assignee })}</td>
+        <td class="col-assignee">${personCell(item.assignee, item.avatar_url, {
+          short: true,
+          personKey: item.assignee_canonical || item.assignee,
+          load: (currentSprintReport?.people || {})[item.assignee_canonical || item.assignee]?.load,
+        })}</td>
         <td class="col-direction">${escapeHtml(item.direction || "—")}</td>
         <td class="col-status">${statusChip(item.status, item.status_category)}</td>
         <td class="col-hours">${timeCell(item.hours, item.estimate_hours, { warnZero: true })}</td>
@@ -2143,15 +3355,38 @@ async function main() {
       openPersonModal(personBtn.getAttribute("data-person"));
       return;
     }
+    const issueBtn = event.target.closest(".issue-key-btn[data-issue]");
+    if (issueBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      openIssueModal(issueBtn.getAttribute("data-issue"));
+      return;
+    }
     const epicRow = event.target.closest(
       ".epic-row[data-epic-key], tr.epic-table-row[data-epic-key]"
     );
-    if (epicRow && !event.target.closest("a")) {
+    if (epicRow && !event.target.closest("a, button, .issue-key-btn, .person-btn")) {
       openEpicModal(epicRow.getAttribute("data-epic-key"));
       return;
     }
+    const releaseTile = event.target.closest(".issue-release-tile[data-release-id]");
+    if (releaseTile) {
+      event.preventDefault();
+      event.stopPropagation();
+      openReleaseModal(releaseTile.getAttribute("data-release-id"));
+      return;
+    }
+    const personRelease = event.target.closest(
+      ".person-task-group-release[data-release-id]"
+    );
+    if (personRelease) {
+      event.preventDefault();
+      event.stopPropagation();
+      openReleaseModal(personRelease.getAttribute("data-release-id"));
+      return;
+    }
     const releaseCard = event.target.closest(".release-card[data-release-id]");
-    if (releaseCard && !event.target.closest("a")) {
+    if (releaseCard && !event.target.closest("a, button, .issue-key-btn, .person-btn")) {
       openReleaseModal(releaseCard.getAttribute("data-release-id"));
       return;
     }

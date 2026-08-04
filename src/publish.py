@@ -83,6 +83,10 @@ def validate_web_dir(web_dir: Path) -> None:
         raise PublishError(f"В web/ не хватает файлов: {', '.join(missing)}")
 
 
+# Anonymous Jira silhouette responses are ~1KB; real photos with token are larger.
+_MIN_AVATAR_BYTES = 1500
+
+
 def _collect_avatar_urls(obj) -> set[str]:
     found: set[str] = set()
 
@@ -91,7 +95,7 @@ def _collect_avatar_urls(obj) -> set[str]:
             url = node.get("avatar_url")
             if isinstance(url, str):
                 text = url.strip()
-                if text.startswith(("http://", "https://")):
+                if text.startswith(("http://", "https://", "/avatars/")):
                     found.add(text)
             for value in node.values():
                 walk(value)
@@ -103,12 +107,12 @@ def _collect_avatar_urls(obj) -> set[str]:
     return found
 
 
-def _rewrite_avatar_urls(obj, mapping: dict[str, str]):
+def _rewrite_avatar_urls(obj, mapping: dict[str, str | None]):
     if isinstance(obj, dict):
         out = {}
         for key, value in obj.items():
             if key == "avatar_url" and isinstance(value, str) and value in mapping:
-                out[key] = mapping[value]
+                out[key] = mapping[value]  # may be None — drop placeholders
             else:
                 out[key] = _rewrite_avatar_urls(value, mapping)
         return out
@@ -128,8 +132,10 @@ def _guess_ext(url: str, content_type: str | None) -> str:
     return ".jpg" if guessed == ".jpe" else guessed
 
 
-def _avatar_request_headers(url: str) -> dict[str, str]:
+def _avatar_fetch_kwargs(url: str) -> dict:
+    """Build requests kwargs (headers / auth) for downloading an avatar URL."""
     headers = {"Accept": "image/*,*/*;q=0.8"}
+    auth = None
     host = (urlparse(url).hostname or "").lower()
     gitlab_url = (os.getenv("GITLAB_URL") or "").rstrip("/").lower()
     jira_url = (os.getenv("JIRA_URL") or "").rstrip("/").lower()
@@ -145,69 +151,219 @@ def _avatar_request_headers(url: str) -> dict[str, str]:
         email = (os.getenv("JIRA_EMAIL") or "").strip()
         user = (os.getenv("JIRA_USER") or "").strip()
         if token and email:
-            # Cloud basic auth style is rare for avatars; keep bearer primary
-            headers["Authorization"] = f"Bearer {token}"
+            auth = (email, token)
+        elif token and user:
+            auth = (user, token)
         elif token:
             headers["Authorization"] = f"Bearer {token}"
-        elif user and token:
-            headers["Authorization"] = f"Bearer {token}"
-    return headers
+    return {"headers": headers, "auth": auth}
 
 
-def localize_avatars(report: dict, avatars_dir: Path) -> tuple[dict, dict[str, str]]:
+def _avatar_request_headers(url: str) -> dict[str, str]:
+    """Backward-compatible helper used by tests / callers expecting headers only."""
+    return _avatar_fetch_kwargs(url)["headers"]
+
+
+def _enrich_download_url(url: str) -> str:
+    """Ask Jira/Gravatar for a larger raster when possible."""
+    from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+    lower = url.lower()
+    if "useravatar" in lower and "size=" not in lower:
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}size=xlarge"
+    if "gravatar.com/avatar" in lower:
+        parsed = urlparse(url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        try:
+            size = int(query.get("s") or "80")
+        except ValueError:
+            size = 80
+        query["s"] = str(max(size, 160))
+        # Keep unique geometric avatar; without d= Gravatar returns a shared mystery JPEG
+        query.setdefault("d", "identicon")
+        return urlunparse(parsed._replace(query=urlencode(query)))
+    return url
+
+
+def _is_usable_avatar_bytes(content: bytes, content_type: str | None) -> bool:
+    mime = (content_type or "").split(";")[0].strip().lower()
+    if mime and not mime.startswith("image/"):
+        return False
+    if not content:
+        return False
+    # Jira catalog avatars are often small SVG — allow them
+    if mime in {"image/svg+xml", "image/svg"} or content.lstrip().startswith(
+        (b"<svg", b"<?xml")
+    ):
+        return True
+    return len(content) >= _MIN_AVATAR_BYTES
+
+
+def _is_placeholder_avatar_url(url: str) -> bool:
+    """Mirror of metrics heuristic for remote placeholders (kept local to publish)."""
+    text = (url or "").strip().lower()
+    if not text.startswith(("http://", "https://")):
+        return False
+    markers = (
+        "avatar-default",
+        "default_avatar",
+        "default-avatar",
+        "/anonymous/",
+        "no_avatar",
+        "d=mp",
+        "d=retro",
+        "d=wavatar",
+        "d=monsterid",
+        "d=blank",
+    )
+    if any(m in text for m in markers):
+        return True
+    # Empty Jira silhouette only (ownerId, no avatarId). Catalog SVG avatars OK.
+    if "useravatar" in text and "ownerid=" in text and "avatarid=" not in text:
+        return True
+    return False
+
+
+def localize_avatars(
+    report: dict,
+    avatars_dir: Path,
+    *,
+    url_prefix: str = "/report/avatars",
+) -> tuple[dict, dict[str, str]]:
     """
-    Download remote avatar_url values into avatars_dir and rewrite report links
-    to /report/avatars/<file>.
+    Materialize avatar_url values into avatars_dir and rewrite links to
+    ``{url_prefix}/<file>``.
+
+    - Remote http(s) URLs are downloaded with Jira/GitLab auth and cached.
+    - Already-local ``/avatars/<file>`` paths are copied from data/avatars.
+    - Placeholder / failed remotes are cleared to null (no default silhouettes).
     """
     load_dotenv(ROOT / ".env")
     urls = sorted(_collect_avatar_urls(report))
     if not urls:
         return report, {}
 
+    prefix = url_prefix.rstrip("/") or "/avatars"
     avatars_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = DATA_DIR / "avatars_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
+    local_avatars = DATA_DIR / "avatars"
 
-    mapping: dict[str, str] = {}
+    mapping: dict[str, str | None] = {}
     ok = 0
     failed = 0
 
     for url in urls:
-        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
-        # Probe cache first (any extension)
-        cached = next(iter(sorted(cache_dir.glob(f"{digest}.*"))), None)
-        if cached and cached.is_file() and cached.stat().st_size > 0:
-            dest = avatars_dir / cached.name
-            shutil.copy2(cached, dest)
-            mapping[url] = f"/report/avatars/{dest.name}"
-            ok += 1
+        if url.startswith("/avatars/"):
+            try:
+                filename, source_path = _resolve_avatar_file(
+                    url,
+                    cache_dir=cache_dir,
+                    local_avatars=local_avatars,
+                )
+                dest = avatars_dir / filename
+                if source_path.resolve() != dest.resolve():
+                    shutil.copy2(source_path, dest)
+                mapping[url] = f"{prefix}/{filename}"
+                ok += 1
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                mapping[url] = None
+                print(f"  ! avatar skip: {url[:90]}… ({exc})")
+            continue
+
+        if _is_placeholder_avatar_url(url):
+            mapping[url] = None
+            failed += 1
+            print(f"  · avatar drop placeholder: {url[:90]}…")
             continue
 
         try:
-            resp = requests.get(
+            filename, source_path = _resolve_avatar_file(
                 url,
-                headers=_avatar_request_headers(url),
-                timeout=25,
-                allow_redirects=True,
+                cache_dir=cache_dir,
+                local_avatars=local_avatars,
             )
-            if resp.status_code >= 400 or not resp.content:
-                raise PublishError(f"HTTP {resp.status_code}")
-            ext = _guess_ext(url, resp.headers.get("Content-Type"))
-            filename = f"{digest}{ext}"
-            cached_path = cache_dir / filename
-            cached_path.write_bytes(resp.content)
             dest = avatars_dir / filename
-            shutil.copy2(cached_path, dest)
-            mapping[url] = f"/report/avatars/{filename}"
+            if source_path.resolve() != dest.resolve():
+                shutil.copy2(source_path, dest)
+            elif not dest.exists():
+                shutil.copy2(source_path, dest)
+            mapping[url] = f"{prefix}/{filename}"
             ok += 1
-        except Exception as exc:  # noqa: BLE001 - keep publish resilient
+        except Exception as exc:  # noqa: BLE001 - keep collect/publish resilient
             failed += 1
+            mapping[url] = None
             print(f"  ! avatar skip: {url[:90]}… ({exc})")
 
-    print(f"Аватары: скачано/из кэша {ok}, ошибок {failed}, уникальных URL {len(urls)}")
+    print(f"Аватары: готово {ok}, отброшено/ошибок {failed}, уникальных URL {len(urls)}")
     if not mapping:
         return report, mapping
     return _rewrite_avatar_urls(report, mapping), mapping
+
+
+def _resolve_avatar_file(
+    url: str,
+    *,
+    cache_dir: Path,
+    local_avatars: Path,
+) -> tuple[str, Path]:
+    """Return (filename, path_to_bytes) for a remote or already-local avatar URL."""
+    if url.startswith("/avatars/"):
+        name = Path(url).name
+        if not name or name.startswith("."):
+            raise PublishError("bad local avatar path")
+        # Prefer published working copy, then cache
+        for folder in (local_avatars, cache_dir):
+            candidate = folder / name
+            if candidate.is_file() and _is_usable_avatar_bytes(
+                candidate.read_bytes(), None
+            ):
+                return name, candidate
+        raise PublishError(f"local avatar missing: {name}")
+
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
+    cached = next(iter(sorted(cache_dir.glob(f"{digest}.*"))), None)
+    if cached and cached.is_file():
+        data = cached.read_bytes()
+        if _is_usable_avatar_bytes(data, None):
+            # Also keep a copy under data/avatars for local UI / publish reuse
+            local_avatars.mkdir(parents=True, exist_ok=True)
+            local_copy = local_avatars / cached.name
+            if not local_copy.exists() or local_copy.stat().st_size != cached.stat().st_size:
+                shutil.copy2(cached, local_copy)
+            return cached.name, cached
+        # Stale tiny/default cache — refetch
+        try:
+            cached.unlink()
+        except OSError:
+            pass
+
+    fetch_url = _enrich_download_url(url)
+    kwargs = _avatar_fetch_kwargs(fetch_url)
+    resp = requests.get(
+        fetch_url,
+        headers=kwargs["headers"],
+        auth=kwargs["auth"],
+        timeout=25,
+        allow_redirects=True,
+    )
+    if resp.status_code >= 400 or not resp.content:
+        raise PublishError(f"HTTP {resp.status_code}")
+    if not _is_usable_avatar_bytes(resp.content, resp.headers.get("Content-Type")):
+        raise PublishError(
+            f"avatar too small/non-image ({len(resp.content)} bytes, "
+            f"{resp.headers.get('Content-Type')})"
+        )
+    ext = _guess_ext(url, resp.headers.get("Content-Type"))
+    filename = f"{digest}{ext}"
+    cached_path = cache_dir / filename
+    cached_path.write_bytes(resp.content)
+    local_avatars.mkdir(parents=True, exist_ok=True)
+    local_copy = local_avatars / filename
+    local_copy.write_bytes(resp.content)
+    return filename, cached_path
 
 
 def _build_published_index(source_html: str) -> str:

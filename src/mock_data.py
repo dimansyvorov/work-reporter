@@ -228,6 +228,49 @@ def build_mock_raw(days: int = 30) -> dict:
                 }
             )
 
+    changelogs: list[dict] = []
+    if len(people) >= 2 and len(issues) >= 3:
+        p0, p1 = people[0]["displayName"], people[1]["displayName"]
+        yday = (now - timedelta(days=1)).replace(hour=16, minute=0, second=0, microsecond=0)
+        # skip weekend for "yesterday" demo
+        while yday.weekday() >= 5:
+            yday -= timedelta(days=1)
+        today_am = now.replace(hour=10, minute=30, second=0, microsecond=0)
+        changelogs.extend(
+            [
+                {
+                    "issue_key": issues[0]["key"],
+                    "issue_summary": issues[0]["fields"]["summary"],
+                    "at": iso(yday),
+                    "author": p0,
+                    "status_from": "В работе",
+                    "status_to": "In Review",
+                    "assignee_from": p0,
+                    "assignee_to": p0,
+                },
+                {
+                    "issue_key": issues[1]["key"],
+                    "issue_summary": issues[1]["fields"]["summary"],
+                    "at": iso(yday.replace(hour=17)),
+                    "author": p0,
+                    "status_from": "In Review",
+                    "status_to": "Ready for testing",
+                    "assignee_from": p0,
+                    "assignee_to": p1,
+                },
+                {
+                    "issue_key": issues[2]["key"],
+                    "issue_summary": issues[2]["fields"]["summary"],
+                    "at": iso(today_am),
+                    "author": p1,
+                    "status_from": "Сделать",
+                    "status_to": "В работе",
+                    "assignee_from": p1,
+                    "assignee_to": p1,
+                },
+            ]
+        )
+
     projects_out = []
     for idx, ref in enumerate(project_refs[:3]):
         chunk = merged[idx * 2 : (idx + 1) * 2] if idx < 2 else merged[4:]
@@ -272,6 +315,17 @@ def build_mock_raw(days: int = 30) -> dict:
             },
             "issues": issues,
             "worklogs": worklogs,
+            "changelogs": changelogs,
+            "comments": [
+                {
+                    "issue_key": issues[0]["key"],
+                    "at": iso(now - timedelta(hours=5)),
+                    "author": people[0]["displayName"],
+                    "body": "Демо-комментарий: проверил на стенде, ок.",
+                }
+            ]
+            if issues
+            else [],
             "epics": epics,
             "releases": [
                 {

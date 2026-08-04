@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import threading
 import webbrowser
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
+
+from .config import DATA_DIR
 
 if TYPE_CHECKING:
     from .state import AppState
@@ -43,6 +46,9 @@ class ReportHandler(SimpleHTTPRequestHandler):
                     status=202,
                 )
             return self._json(report)
+
+        if path.startswith("/avatars/"):
+            return self._serve_avatar(path)
 
         if path.endswith((".js", ".css", ".html", ".svg")) or path in {"/", "/index.html"}:
             if path in {"/", "/index.html"}:
@@ -104,6 +110,29 @@ class ReportHandler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
+
+    def _serve_avatar(self, path: str) -> None:
+        name = Path(path).name
+        if not name or name.startswith(".") or "/" in name or "\\" in name:
+            self.send_error(404, "Not found")
+            return
+        for folder in (DATA_DIR / "avatars", DATA_DIR / "avatars_cache"):
+            file_path = folder / name
+            if not file_path.is_file():
+                continue
+            try:
+                data = file_path.read_bytes()
+            except OSError:
+                continue
+            content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self.send_error(404, "Avatar not found")
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return

@@ -18,7 +18,7 @@ ProgressCb = Callable[..., None]
 # asking for more usually just returns the server max.
 JIRA_PAGE_SIZE = 100
 # Bounded concurrency for per-issue endpoints (worklogs / remotelinks / agile).
-JIRA_WORKERS = 6
+JIRA_WORKERS = 2
 # Chunk size for `key in (...)` JQL refreshes.
 JIRA_KEY_CHUNK = 50
 
@@ -95,6 +95,47 @@ class JiraClient:
             return resp.json()
 
         raise CollectError(f"Jira rate limit persists for {url}")
+
+    def discover_sprint_field(self) -> str | None:
+        """Find GreenHopper Sprint custom field id (REST search often needs it)."""
+        try:
+            fields = self._request("/rest/api/2/field")
+        except CollectError:
+            return None
+        if not isinstance(fields, list):
+            return None
+
+        scored: list[tuple[int, str]] = []
+        for field in fields:
+            field_id = field.get("id")
+            if not field_id:
+                continue
+            name = (field.get("name") or "").lower()
+            clause = " ".join(field.get("clauseNames") or []).lower()
+            schema = field.get("schema") or {}
+            custom = (schema.get("custom") or "").lower()
+            blob = f"{name} {clause} {custom}"
+
+            score = 0
+            if "gh-sprint" in custom or custom.endswith(":sprint"):
+                score = 100
+            elif name in {"sprint", "спринт"}:
+                score = 90
+            elif "sprint" in clause or "спринт" in clause:
+                score = 80
+            elif "sprint" in custom:
+                score = 70
+            elif ("sprint" in blob or "спринт" in blob) and field_id.startswith(
+                "customfield_"
+            ):
+                score = 50
+            if score:
+                scored.append((score, field_id))
+
+        if not scored:
+            return None
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return scored[0][1]
 
     def discover_epic_link_field(self) -> str | None:
         try:
@@ -275,6 +316,46 @@ class JiraClient:
             if not batch or start_at >= total:
                 break
         return logs
+
+    def fetch_issue_changelog(self, issue_key: str) -> list[dict]:
+        """
+        Status/assignee history for one issue.
+
+        This Jira Server build has no /changelog sub-resource (404); use
+        expand=changelog on the issue instead.
+        """
+        data = self._request(
+            f"/rest/api/2/issue/{issue_key}",
+            {
+                "fields": "summary,updated",
+                "expand": "changelog",
+            },
+        )
+        changelog = data.get("changelog") or {}
+        histories = changelog.get("histories") or []
+        total = int(changelog.get("total") or len(histories))
+        if total > len(histories):
+            print(
+                f"  ! changelog truncated for {issue_key}: "
+                f"got {len(histories)}/{total}"
+            )
+        return _normalize_changelog_histories(histories)
+
+    def fetch_issue_comments(self, issue_key: str) -> list[dict]:
+        comments: list[dict] = []
+        start_at = 0
+        while True:
+            data = self._request(
+                f"/rest/api/2/issue/{issue_key}/comment",
+                {"startAt": start_at, "maxResults": JIRA_PAGE_SIZE},
+            )
+            batch = data.get("comments") or []
+            comments.extend(batch)
+            total = int(data.get("total") or len(comments))
+            start_at += len(batch)
+            if not batch or start_at >= total:
+                break
+        return comments
 
     def fetch_remote_links(self, issue_key: str) -> list[dict]:
         try:
@@ -636,6 +717,256 @@ def _issue_reported_timespent(issue: dict) -> int:
     return int(fields.get("timespent") or 0)
 
 
+def _normalize_changelog_histories(histories: list[dict]) -> list[dict]:
+    """Keep only status/assignee transitions, one row per changelog group."""
+    out: list[dict] = []
+    for history in histories or []:
+        status_from = status_to = None
+        assignee_from = assignee_to = None
+        for item in history.get("items") or []:
+            field = (item.get("field") or "").strip().lower()
+            if field == "status":
+                status_from = item.get("fromString")
+                status_to = item.get("toString")
+            elif field == "assignee":
+                assignee_from = item.get("fromString")
+                assignee_to = item.get("toString")
+        if (
+            status_from is None
+            and status_to is None
+            and assignee_from is None
+            and assignee_to is None
+        ):
+            continue
+        author = history.get("author") or {}
+        out.append(
+            {
+                "at": history.get("created"),
+                "author": (author.get("displayName") or author.get("name") or "").strip()
+                or None,
+                "status_from": status_from,
+                "status_to": status_to,
+                "assignee_from": assignee_from,
+                "assignee_to": assignee_to,
+            }
+        )
+    return out
+
+
+def _collect_changelogs_for_issues(
+    client: JiraClient,
+    issues: list[dict],
+    *,
+    on_progress: ProgressCb | None = None,
+) -> list[dict]:
+    """
+    Load status/assignee changelog with disk cache keyed by issue key + updated.
+    Returns flat list of {issue_key, issue_summary, ...history fields}.
+    """
+    cache = JsonFileCache(DATA_DIR / "cache" / "changelogs.json")
+    cfg = client.cfg
+
+    to_fetch: list[dict] = []
+    cached_rows: list[dict] = []
+    cache_hits = 0
+
+    for issue in issues:
+        key = (issue.get("key") or "").upper()
+        if not key:
+            continue
+        fields = issue.get("fields") or {}
+        summary = fields.get("summary")
+        updated = str(fields.get("updated") or "")
+        cache_key = f"{key}|{updated}"
+        cached = cache.get(cache_key)
+        if isinstance(cached, list):
+            for row in cached:
+                if isinstance(row, dict):
+                    cached_rows.append(row)
+            cache_hits += 1
+            continue
+        to_fetch.append(
+            {
+                "key": key,
+                "summary": summary,
+                "updated": updated,
+                "cache_key": cache_key,
+            }
+        )
+
+    total = len(to_fetch)
+    print(f"  · changelogs: fetch={total}, cache={cache_hits}")
+
+    def progress(done: int, all_n: int) -> None:
+        if on_progress:
+            on_progress(
+                "jira_changelog",
+                f"Jira: changelog {done}/{all_n}",
+                current=done,
+                total=all_n,
+            )
+
+    def worker(c: JiraClient, item: dict) -> tuple[str, list[dict]]:
+        try:
+            histories = c.fetch_issue_changelog(item["key"])
+        except CollectError as exc:
+            print(f"  ! changelog {item['key']}: {exc}")
+            histories = []
+        rows = [
+            {
+                "issue_key": item["key"],
+                "issue_summary": item["summary"],
+                **hist,
+            }
+            for hist in histories
+        ]
+        return item["cache_key"], rows
+
+    fetched_rows: list[dict] = []
+    if to_fetch:
+        pairs = map_parallel_with_client(
+            to_fetch,
+            lambda: JiraClient(cfg),
+            worker,
+            max_workers=JIRA_WORKERS,
+            on_progress=progress if total else None,
+            progress_every=10,
+        )
+        updates = {cache_key: rows for cache_key, rows in pairs}
+        cache.set_many(updates)
+        for _, rows in pairs:
+            fetched_rows.extend(rows)
+
+    return cached_rows + fetched_rows
+
+
+def _comment_body_text(body: Any) -> str:
+    if body is None:
+        return ""
+    if isinstance(body, str):
+        return body.strip()
+    if isinstance(body, dict):
+        parts: list[str] = []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "text" and node.get("text"):
+                    parts.append(str(node.get("text")))
+                for child in node.get("content") or []:
+                    walk(child)
+            elif isinstance(node, list):
+                for child in node:
+                    walk(child)
+
+        walk(body)
+        return " ".join(parts).strip()
+    return str(body).strip()
+
+
+def _normalize_comments(raw_comments: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for comment in raw_comments or []:
+        author = comment.get("author") or {}
+        body = _comment_body_text(comment.get("body"))
+        if not body:
+            continue
+        out.append(
+            {
+                "id": comment.get("id"),
+                "at": comment.get("created") or comment.get("updated"),
+                "author": (author.get("displayName") or author.get("name") or "").strip()
+                or None,
+                "body": body[:2000],
+            }
+        )
+    # newest last chronologically for display oldest→newest; keep last 30
+    out.sort(key=lambda c: c.get("at") or "")
+    if len(out) > 30:
+        out = out[-30:]
+    return out
+
+
+def _collect_comments_for_issues(
+    client: JiraClient,
+    issues: list[dict],
+    *,
+    on_progress: ProgressCb | None = None,
+) -> list[dict]:
+    """Load issue comments with disk cache keyed by issue key + updated."""
+    cache = JsonFileCache(DATA_DIR / "cache" / "comments.json")
+    cfg = client.cfg
+
+    to_fetch: list[dict] = []
+    cached_rows: list[dict] = []
+    cache_hits = 0
+
+    for issue in issues:
+        key = (issue.get("key") or "").upper()
+        if not key:
+            continue
+        fields = issue.get("fields") or {}
+        updated = str(fields.get("updated") or "")
+        cache_key = f"{key}|{updated}"
+        cached = cache.get(cache_key)
+        if isinstance(cached, list):
+            for row in cached:
+                if isinstance(row, dict):
+                    cached_rows.append(row)
+            cache_hits += 1
+            continue
+        to_fetch.append(
+            {
+                "key": key,
+                "updated": updated,
+                "cache_key": cache_key,
+            }
+        )
+
+    total = len(to_fetch)
+    print(f"  · comments: fetch={total}, cache={cache_hits}")
+
+    def progress(done: int, all_n: int) -> None:
+        if on_progress:
+            on_progress(
+                "jira_comments",
+                f"Jira: комментарии {done}/{all_n}",
+                current=done,
+                total=all_n,
+            )
+
+    def worker(c: JiraClient, item: dict) -> tuple[str, list[dict]]:
+        try:
+            raw = c.fetch_issue_comments(item["key"])
+        except CollectError as exc:
+            print(f"  ! comments {item['key']}: {exc}")
+            raw = []
+        rows = [
+            {
+                "issue_key": item["key"],
+                **comment,
+            }
+            for comment in _normalize_comments(raw)
+        ]
+        return item["cache_key"], rows
+
+    fetched_rows: list[dict] = []
+    if to_fetch:
+        pairs = map_parallel_with_client(
+            to_fetch,
+            lambda: JiraClient(cfg),
+            worker,
+            max_workers=JIRA_WORKERS,
+            on_progress=progress if total else None,
+            progress_every=10,
+        )
+        updates = {cache_key: rows for cache_key, rows in pairs}
+        cache.set_many(updates)
+        for _, rows in pairs:
+            fetched_rows.extend(rows)
+
+    return cached_rows + fetched_rows
+
+
 def _filter_worklogs_for_window(
     logs: list[dict],
     *,
@@ -899,41 +1230,55 @@ def _enrich_gitlab_links_from_jira(
     Attach GitLab MR refs from description (local) + remote links (HTTP).
 
     Description is parsed locally for all issues; remotelink HTTP runs in
-    parallel (thread-local clients) so we do not miss links that are only
-    in Development panel.
+    parallel with disk cache keyed by issue key + updated (same as changelog).
     """
     from .linking import extract_mr_refs_from_text
 
     cfg = client.cfg
+    cache = JsonFileCache(DATA_DIR / "cache" / "remotelinks.json")
     targets: list[dict] = []
     desc_hits = 0
+    cache_hits = 0
+
+    def merge_refs(
+        refs: list[dict], seen: set[str], items: list[dict]
+    ) -> None:
+        for ref in items:
+            token = (ref.get("web_url") or "").lower()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            refs.append(ref)
 
     for issue in issues:
-        key = issue.get("key")
+        key = (issue.get("key") or "").upper()
         if not key:
             continue
         refs: list[dict] = []
         seen: set[str] = set()
 
-        def add_refs(items: list[dict]) -> None:
-            for ref in items:
-                token = (ref.get("web_url") or "").lower()
-                if not token or token in seen:
-                    continue
-                seen.add(token)
-                refs.append(ref)
-
         fields = issue.get("fields") or {}
         desc = fields.get("description")
         if isinstance(desc, str):
-            add_refs(extract_mr_refs_from_text(desc))
+            merge_refs(refs, seen, extract_mr_refs_from_text(desc))
         elif desc is not None:
-            add_refs(extract_mr_refs_from_text(str(desc)))
+            merge_refs(refs, seen, extract_mr_refs_from_text(str(desc)))
 
         if refs:
             desc_hits += 1
+
+        updated = str(fields.get("updated") or "")
+        cache_key = f"{key}|{updated}"
+        cached = cache.get(cache_key)
+        if isinstance(cached, list):
+            merge_refs(refs, seen, [r for r in cached if isinstance(r, dict)])
+            issue["_gitlab_mrs"] = refs
+            cache_hits += 1
+            continue
+
         issue["_gitlab_mrs"] = refs
         issue["_gitlab_mr_seen"] = seen
+        issue["_remotelink_cache_key"] = cache_key
         targets.append(issue)
 
     def progress(done: int, all_n: int) -> None:
@@ -945,7 +1290,7 @@ def _enrich_gitlab_links_from_jira(
                 total=max(all_n, 1),
             )
 
-    def worker(c: JiraClient, issue: dict) -> tuple[dict, list[dict]]:
+    def worker(c: JiraClient, issue: dict) -> tuple[str, dict, list[dict]]:
         key = issue.get("key")
         extra: list[dict] = []
         try:
@@ -956,13 +1301,22 @@ def _enrich_gitlab_links_from_jira(
                 extra.extend(extract_mr_refs_from_text(url, title))
         except CollectError:
             pass
-        return issue, extra
+        # Deduplicate payload stored in cache
+        seen_urls: set[str] = set()
+        unique: list[dict] = []
+        for ref in extra:
+            token = (ref.get("web_url") or "").lower()
+            if not token or token in seen_urls:
+                continue
+            seen_urls.add(token)
+            unique.append(ref)
+        return str(issue.get("_remotelink_cache_key") or ""), issue, unique
 
     print(
         f"  · gitlab links: remotelink_fetch={len(targets)}, "
-        f"from_description={desc_hits}"
+        f"cache={cache_hits}, from_description={desc_hits}"
     )
-    found = 0
+
     if targets:
         pairs = map_parallel_with_client(
             targets,
@@ -972,23 +1326,23 @@ def _enrich_gitlab_links_from_jira(
             on_progress=progress,
             progress_every=10,
         )
-        for issue, extra in pairs:
+        updates = {
+            cache_key: unique
+            for cache_key, _, unique in pairs
+            if cache_key
+        }
+        cache.set_many(updates)
+        for _, issue, extra in pairs:
             seen: set[str] = issue.get("_gitlab_mr_seen") or set()
             refs = list(issue.get("_gitlab_mrs") or [])
-            for ref in extra:
-                token = (ref.get("web_url") or "").lower()
-                if not token or token in seen:
-                    continue
-                seen.add(token)
-                refs.append(ref)
+            merge_refs(refs, seen, extra)
             issue["_gitlab_mrs"] = refs
-            if refs:
-                found += 1
 
     for issue in issues:
         issue.pop("_gitlab_mr_seen", None)
+        issue.pop("_remotelink_cache_key", None)
 
-    return found
+    return sum(1 for i in issues if i.get("_gitlab_mrs"))
 
 
 def _parse_version_date(value: str | None) -> date | None:
@@ -1252,6 +1606,105 @@ def _collect_epics(client: JiraClient, issues: list[dict], epic_field_id: str | 
     return epics
 
 
+def _jira_avatar_urls(person: dict | None) -> str | None:
+    if not person:
+        return None
+    urls = person.get("avatarUrls") or {}
+    return urls.get("48x48") or urls.get("32x32") or urls.get("24x24")
+
+
+def _fetch_roster_jira_profiles(client: JiraClient) -> dict[str, dict]:
+    """
+    Resolve Jira username + avatar for every roster member via user API.
+
+    Fills gaps for people who never appear as assignee/reporter/worklog author
+    in the current sprint payload (assignee without worklogs yet).
+    """
+    from .team import TEAM_ROSTER
+    from .team_config import get_team_config
+
+    team_cfg = get_team_config()
+    out: dict[str, dict] = {}
+    hits = 0
+    for name in sorted(TEAM_ROSTER.keys(), key=lambda x: x.lower()):
+        profile: dict[str, Any] = {}
+        for username in team_cfg.jira_username_candidates(name):
+            try:
+                data = client._request(
+                    "/rest/api/2/user",
+                    {"username": username},
+                )
+            except CollectError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            avatar = _jira_avatar_urls(data)
+            profile = {
+                "username": data.get("name") or username,
+                "display_name": data.get("displayName") or name,
+                "avatar_url": avatar,
+            }
+            hits += 1
+            break
+        if profile:
+            out[name] = profile
+    print(f"  · roster jira profiles: {hits}/{len(TEAM_ROSTER)}")
+    return out
+
+
+def _kanban_board_jql(
+    board: Any,
+    sprint_date_candidates: list[tuple[date | None, date | None]],
+) -> str:
+    """JQL for kanban boards: explicit board.jql or open + updated since sprint."""
+    custom = str(getattr(board, "jql", "") or "").strip()
+    if custom:
+        return custom
+    start: date | None = None
+    for s, _e in sprint_date_candidates:
+        if s and (start is None or s < start):
+            start = s
+    if start:
+        return f'resolution is EMPTY AND updated >= "{start.isoformat()}"'
+    return "resolution is EMPTY AND updated >= -21d"
+
+
+def _filter_kanban_only_to_roster(issues: list[dict]) -> list[dict]:
+    """
+    Drop kanban-only issues whose assignee is not on the team roster.
+
+    Scrum / primary-board issues are kept as-is (first board wins). This avoids
+    enriching hundreds of DEVOPS tickets that never appear in the report.
+    """
+    from .team import TEAM_ROSTER, canonical_team_name
+
+    kept: list[dict] = []
+    dropped = 0
+    for issue in issues:
+        if issue.get("_board_has_sprints", True):
+            kept.append(issue)
+            continue
+        fields = issue.get("fields") or {}
+        assignee = fields.get("assignee") or {}
+        name = ""
+        if isinstance(assignee, dict):
+            for key in ("displayName", "name", "emailAddress"):
+                name = (assignee.get(key) or "").strip()
+                if name:
+                    break
+        canonical = canonical_team_name(name) if name else None
+        if canonical and canonical in TEAM_ROSTER:
+            kept.append(issue)
+        else:
+            dropped += 1
+    if dropped:
+        print(
+            f"  · kanban: отброшено {dropped} задач вне roster "
+            f"(до enrichment осталось {len(kept)})"
+        )
+    return kept
+
+
 def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict:
     def progress(step: str, message: str, **kwargs) -> None:
         print(f"  · {message}")
@@ -1266,6 +1719,7 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
 
     progress("jira_sprint", "Jira: определяю поле Epic Link…")
     epic_field_id = client.discover_epic_link_field()
+    sprint_field_id = client.discover_sprint_field()
     issue_fields = list(BASE_ISSUE_FIELDS)
     if "parentEpic" not in issue_fields:
         issue_fields.append("parentEpic")
@@ -1274,6 +1728,11 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
         print(f"  · epic custom field: {epic_field_id}")
     else:
         print("  · epic custom field: not found yet (will probe sample / board epics)")
+    if sprint_field_id and sprint_field_id not in issue_fields:
+        issue_fields.append(sprint_field_id)
+        print(f"  · sprint custom field: {sprint_field_id}")
+    else:
+        print("  · sprint custom field: not found (will rely on fields.sprint / strings)")
 
     issues_by_key: dict[str, dict] = {}
     board_summaries: list[dict] = []
@@ -1313,7 +1772,9 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
                     sprint_raw["id"], fields=issue_fields
                 )
             else:
-                # Kanban / non-sprint board: take open issues from the board filter
+                # Kanban / non-sprint board: open issues, narrowed by board.jql
+                # or by primary sprint start (fallback: last 21 days).
+                kanban_jql = _kanban_board_jql(board, sprint_date_candidates)
                 progress(
                     "jira_issues",
                     f"Jira: канбан «{label}» (без спринтов)",
@@ -1321,11 +1782,11 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
                 board_issues = client.fetch_board_issues(
                     board.id,
                     fields=issue_fields,
-                    jql="resolution is EMPTY",
+                    jql=kanban_jql,
                 )
                 print(
                     f"  · board {board.id} (has_sprints=false): "
-                    f"{len(board_issues)} open issues"
+                    f"{len(board_issues)} issues · jql={kanban_jql}"
                 )
 
             for issue in board_issues:
@@ -1335,6 +1796,7 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
                 issue["_board_id"] = board.id
                 issue["_board_name"] = board.name
                 issue["_board_has_epics"] = board.has_epics
+                issue["_board_has_sprints"] = board.has_sprints
                 # First occurrence wins (primary board is first after sort)
                 if key not in issues_by_key:
                     issues_by_key[key] = issue
@@ -1381,6 +1843,7 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
                     "Для kanban укажите has_sprints: false; для scrum — numeric board id."
                 )
         issues = list(issues_by_key.values())
+        issues = _filter_kanban_only_to_roster(issues)
     else:
         progress("jira_sprint", "Jira: boards не заданы — openSprints()")
         primary_sprint_raw, issues = _sprint_from_open_sprints_jql(
@@ -1530,6 +1993,34 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
         print(f"  ! worklogs skipped: {exc}")
         worklogs = []
 
+    progress(
+        "jira_changelog",
+        f"Jira: загружаю историю статусов по {len(issues)} задачам…",
+    )
+    try:
+        changelogs = _collect_changelogs_for_issues(
+            client,
+            issues,
+            on_progress=on_progress,
+        )
+    except CollectError as exc:
+        print(f"  ! changelogs skipped: {exc}")
+        changelogs = []
+
+    progress(
+        "jira_comments",
+        f"Jira: загружаю комментарии по {len(issues)} задачам…",
+    )
+    try:
+        comments = _collect_comments_for_issues(
+            client,
+            issues,
+            on_progress=on_progress,
+        )
+    except CollectError as exc:
+        print(f"  ! comments skipped: {exc}")
+        comments = []
+
     progress("jira_epics", "Jira: собираю метаданные эпиков…")
     epics = _collect_epics(
         client,
@@ -1588,9 +2079,13 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
                     **{k: v for k, v in epic_obj.items() if k not in {"key", "summary", "name"}},
                 }
 
+    progress("jira_epics", "Jira: профили roster (аватары / username)…")
+    roster_profiles = _fetch_roster_jira_profiles(client)
+
     progress(
         "jira_epics",
         f"Jira: готово — {len(issues)} задач, {len(worklogs)} списаний, "
+        f"{len(changelogs)} changelog, {len(comments)} комментариев, "
         f"{len(epics)} эпиков, {len(releases)} релизов",
     )
 
@@ -1606,12 +2101,15 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
         "sprint": sprint,
         "issues": issues,
         "worklogs": worklogs,
+        "changelogs": changelogs,
+        "comments": comments,
         "epics": epics,
         "epic_field_id": epic_field_id,
         "releases": releases,
         "release_issues": release_issues,
         "release_epic_keys": release_epic_keys,
         "epic_scope_issues": epic_scope_issues,
+        "roster_profiles": roster_profiles,
         "since": sprint.get("start_at") or start_date.isoformat(),
         "days": max((end_date - start_date).days, 1),
     }

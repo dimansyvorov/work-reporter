@@ -58,7 +58,9 @@
     "epic_section_min_pct": 14,
     "risks_limit": 40,
     "person_tasks_limit": 40,
-    "person_active_tasks_limit": 30
+    "person_active_tasks_limit": 30,
+    "load_fallback_hours": 2,
+    "load_fallback_estimate_ratio": 0.25
   },
   "ratings": {
     "top_n": 3,
@@ -75,36 +77,48 @@
     {
       "name": "Иванов Иван Иванович",
       "direction": "mobile",
-      "aliases": ["Ivan Ivanov", "ivan.ivanov"]
+      "gender": "мужской",
+      "aliases": ["Ivan Ivanov", "ivan.ivanov"],
+      "avatar_url": "https://example.com/avatars/ivanov.png",
+      "jira_username": "ivan.ivanov",
+      "gitlab_username": "ivan.ivanov"
     },
     {
       "name": "Петрова Анна Сергеевна",
       "direction": "web",
-      "aliases": ["Anna Petrova", "anna.petrova"]
+      "gender": "женский",
+      "aliases": ["Anna Petrova", "anna.petrova"],
+      "avatar_source": "jira"
     },
     {
       "name": "Сидоров Алексей Петрович",
       "direction": "backend",
-      "aliases": ["Alexey Sidorov", "alexey.sidorov"]
+      "gender": "мужской",
+      "aliases": ["Alexey Sidorov", "alexey.sidorov"],
+      "avatar_source": "gitlab"
     },
     {
       "name": "Кузнецова Мария Андреевна",
       "direction": "qa",
+      "gender": "женский",
       "aliases": ["Maria Kuznetsova", "maria.kuznetsova"]
     },
     {
       "name": "Смирнов Павел Олегович",
       "direction": "design",
+      "gender": "мужской",
       "aliases": ["Pavel Smirnov", "pavel.smirnov"]
     },
     {
       "name": "Орлова Елена Викторовна",
       "direction": "analytics",
+      "gender": "женский",
       "aliases": ["Elena Orlova", "elena.orlova"]
     },
     {
       "name": "Морозов Дмитрий Николаевич",
       "direction": "devops",
+      "gender": "мужской",
       "aliases": ["Dmitriy Morozov", "dmitriy.morozov"]
     }
   ],
@@ -123,7 +137,8 @@
         "name": "Kanban Ops",
         "primary": false,
         "has_epics": true,
-        "has_sprints": false
+        "has_sprints": false,
+        "jql": "resolution is EMPTY AND updated >= -21d"
       }
     ]
   },

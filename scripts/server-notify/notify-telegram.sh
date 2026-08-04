@@ -3,13 +3,13 @@
 # Usage:
 #   ./notify-telegram.sh success "text…"
 #   ./notify-telegram.sh error "text…"
+# Message may contain newlines (pass as a single argv).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${ROOT}/.env"
 STATUS="${1:-}"
-shift || true
-TEXT="${*:-}"
+TEXT="${2:-}"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "notify-telegram: missing $ENV_FILE" >&2
@@ -36,8 +36,17 @@ case "$STATUS" in
 esac
 
 REPORT_URL="${REPORT_URL:-}"
-BODY="${prefix} ${TEXT}"
-if [[ -n "$REPORT_URL" && "$STATUS" =~ ^(success|ok)$ ]]; then
+# Prefix only the first line; keep the rest of a multiline body as-is.
+if [[ "$TEXT" == *$'\n'* ]]; then
+  first="${TEXT%%$'\n'*}"
+  rest="${TEXT#*$'\n'}"
+  BODY="${prefix} ${first}"$'\n'"${rest}"
+else
+  BODY="${prefix} ${TEXT}"
+fi
+
+# Append report URL only when success and URL not already in the message.
+if [[ -n "$REPORT_URL" && "$STATUS" =~ ^(success|ok)$ && "$BODY" != *"$REPORT_URL"* ]]; then
   BODY="${BODY}"$'\n'"${REPORT_URL}"
 fi
 

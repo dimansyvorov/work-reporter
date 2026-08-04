@@ -6,13 +6,14 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import Config
+from .config import DATA_DIR, Config
 from .errors import CollectError
 from .gitlab_client import collect_raw as collect_gitlab_raw
 from .gitlab_client import enrich_mr_commit_counts
 from .jira_client import collect_jira_raw
 from .metrics import compute_report
 from .mock_data import build_mock_raw
+from .publish import localize_avatars
 from .state import AppState
 from .team_config import load_team_config
 
@@ -46,7 +47,14 @@ def _friendly_error(exc: BaseException) -> str:
 
 
 def _skip_remaining_jira(state: AppState, reason: str) -> None:
-    for key in ("jira_sprint", "jira_issues", "jira_epics", "jira_worklogs"):
+    for key in (
+        "jira_sprint",
+        "jira_issues",
+        "jira_epics",
+        "jira_worklogs",
+        "jira_changelog",
+        "jira_comments",
+    ):
         snap = state.snapshot()
         current = next((s for s in snap["steps"] if s["key"] == key), None)
         if current and current["state"] == "pending":
@@ -124,6 +132,16 @@ def collect_and_build(
                 "done",
                 f"Демо: {len(jira.get('worklogs') or [])} списаний",
             )
+            state.update_step(
+                "jira_changelog",
+                "done",
+                f"Демо: {len(jira.get('changelogs') or [])} переходов",
+            )
+            state.update_step(
+                "jira_comments",
+                "done",
+                f"Демо: {len(jira.get('comments') or [])} комментариев",
+            )
             state.update_step("gitlab", "done", f"Демо: {mr_count} MR")
             state.update_step("commits", "done", "Демо: коммиты")
             time.sleep(0.3)
@@ -146,6 +164,8 @@ def collect_and_build(
                         "jira_issues",
                         "jira_epics",
                         "jira_worklogs",
+                        "jira_changelog",
+                        "jira_comments",
                     ]
                     if step in order:
                         idx = order.index(step)
@@ -178,6 +198,16 @@ def collect_and_build(
                     "jira_worklogs",
                     "done",
                     f"Jira: {len(jira.get('worklogs') or [])} списаний",
+                )
+                state.update_step(
+                    "jira_changelog",
+                    "done",
+                    f"Jira: {len(jira.get('changelogs') or [])} переходов",
+                )
+                state.update_step(
+                    "jira_comments",
+                    "done",
+                    f"Jira: {len(jira.get('comments') or [])} комментариев",
                 )
             else:
                 _skip_remaining_jira(state, "Jira отключена")
@@ -240,6 +270,14 @@ def collect_and_build(
 
         state.run_step("save", "Сохраняю отчёт…")
         state.set_status("collecting", "Сохраняю отчёт…")
+        # Download Jira/GitLab avatars with API auth so the UI does not hit
+        # unauthenticated /secure/useravatar (which returns the default silhouette).
+        if not cfg.mock:
+            report, _avatar_map = localize_avatars(
+                report,
+                DATA_DIR / "avatars",
+                url_prefix="/avatars",
+            )
         raw_path.write_text(
             json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
         )

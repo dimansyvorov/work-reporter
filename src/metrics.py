@@ -4,8 +4,9 @@ import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 
+from .activity import build_people_activity, report_today
 from .linking import link_sprint_issues
-from .people import best_gitlab_avatar, collect_gitlab_people
+from .people import best_gitlab_avatar, best_gitlab_person, collect_gitlab_people
 from .ratings import compute_ratings
 from .team import (
     DEV_DIRECTIONS,
@@ -48,6 +49,27 @@ def _jira_avatar(person: dict | None) -> str | None:
         return None
     urls = person.get("avatarUrls") or {}
     return urls.get("48x48") or urls.get("32x32") or urls.get("24x24")
+
+
+def _jira_username(person: dict | None) -> str | None:
+    if not person:
+        return None
+    for key in ("name", "key", "accountId"):
+        value = (person.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _jira_profile_url(browse_base: str | None, username: str | None) -> str | None:
+    base = (browse_base or "").rstrip("/")
+    user = (username or "").strip()
+    if not base or not user:
+        return None
+    # Jira Server/DC profile page
+    from urllib.parse import quote
+
+    return f"{base}/secure/ViewProfile.jspa?name={quote(user)}"
 
 
 def _is_done(fields: dict) -> bool:
@@ -103,9 +125,103 @@ def _hours_level(hours: float, expected: float, warn_ratio: float | None = None)
     return "bad"
 
 
+def _looks_like_default_avatar(url: str | None) -> bool:
+    """Heuristic: Jira/GitLab placeholder avatars that are not real photos."""
+    if not url:
+        return True
+    text = str(url).strip().lower()
+    if not text:
+        return True
+    # Local cached copies are already vetted at download time
+    if text.startswith("/avatars/") or text.startswith("/report/avatars/"):
+        return False
+    # Note: Gravatar `d=identicon` is a valid unique avatar used by GitLab — do not
+    # treat it as empty. Reject only clearly empty/mystery fallbacks.
+    markers = (
+        "avatar-default",
+        "default_avatar",
+        "default-avatar",
+        "/anonymous/",
+        "no_avatar",
+        "mystery",
+        "mp.png",  # gravatar mystery person
+        "d=mp",
+        "d=retro",
+        "d=wavatar",
+        "d=monsterid",
+        "d=blank",
+    )
+    if any(m in text for m in markers):
+        return True
+    # Classic empty Jira silhouette: ownerId present, but no avatarId
+    if "useravatar" in text and "ownerid=" in text and "avatarid=" not in text:
+        return True
+    return False
+
+
 def _avatar_for(name: str, jira_avatar: str | None, gitlab_people: list[dict]) -> str | None:
-    # Prefer GitLab: Jira avatar URLs often require auth and break in the browser
-    return best_gitlab_avatar(name, gitlab_people) or jira_avatar
+    team_cfg = get_team_config()
+    # 1) Explicit URL override from team.json
+    team_avatar = team_cfg.avatar_for(name)
+    if team_avatar:
+        return team_avatar
+
+    source = team_cfg.avatar_source_for(name)  # "jira" | "gitlab" | None
+    gitlab_avatar = (
+        best_gitlab_avatar(name, gitlab_people)
+        if source in (None, "gitlab")
+        else None
+    )
+    jira_only = jira_avatar if source in (None, "jira") else None
+
+    def _real(url: str | None) -> str | None:
+        if url and not _looks_like_default_avatar(url):
+            return url
+        return None
+
+    # Locked source: never fall back to the other platform or to placeholders
+    if source == "jira":
+        return _real(jira_only)
+    if source == "gitlab":
+        return _real(gitlab_avatar)
+
+    # Prefer real photos; if none — leave empty (UI shows initials)
+    return _real(gitlab_avatar) or _real(jira_only)
+
+
+def _profile_links_for(
+    name: str,
+    *,
+    browse_base: str | None,
+    jira_username: str | None,
+    gitlab_people: list[dict],
+) -> dict[str, str | None]:
+    team_cfg = get_team_config()
+    jira_url = team_cfg.jira_profile_for(name)
+    if not jira_url:
+        user = team_cfg.jira_username_for(name) or jira_username
+        jira_url = _jira_profile_url(browse_base, user)
+
+    gitlab_url = team_cfg.gitlab_profile_for(name)
+    if not gitlab_url:
+        gl_user = team_cfg.gitlab_username_for(name)
+        gl_person = best_gitlab_person(name, gitlab_people) or {}
+        gitlab_url = gl_person.get("web_url") or None
+        if not gitlab_url and gl_user:
+            # Fallback: construct from matched host if we ever only have username
+            host = None
+            for person in gitlab_people:
+                web = person.get("web_url") or ""
+                if web.startswith("http"):
+                    from urllib.parse import urlparse
+
+                    parsed = urlparse(web)
+                    if parsed.scheme and parsed.netloc:
+                        host = f"{parsed.scheme}://{parsed.netloc}"
+                        break
+            if host:
+                gitlab_url = f"{host.rstrip('/')}/{gl_user.lstrip('/')}"
+    return {"jira_url": jira_url, "gitlab_url": gitlab_url}
 
 
 def _estimate_hours(fields: dict) -> float | None:
@@ -127,16 +243,63 @@ def _remaining_estimate_hours(fields: dict) -> float | None:
     return float(seconds) / 3600.0
 
 
+def _parse_greenhopper_sprint(value: str) -> dict | None:
+    """Parse Jira Server GreenHopper Sprint.toString() values from custom fields."""
+    if "Sprint@" not in value and "greenhopper.service.sprint" not in value:
+        return None
+    sid = re.search(r"\bid=(\d+)", value)
+    if not sid:
+        return None
+    name_m = re.search(r"\bname=([^,\]]+)", value)
+    state_m = re.search(r"\bstate=([^,\]]+)", value)
+    out: dict = {"id": int(sid.group(1))}
+    if name_m:
+        out["name"] = name_m.group(1).strip()
+    if state_m:
+        out["state"] = state_m.group(1).strip().lower()
+    return out
+
+
+def _coerce_sprint_item(item) -> dict | None:
+    if isinstance(item, dict) and item.get("id") is not None:
+        return item
+    if isinstance(item, str):
+        return _parse_greenhopper_sprint(item)
+    return None
+
+
 def _iter_issue_sprints(fields: dict) -> list[dict]:
+    """Collect sprint links from Agile fields and GreenHopper custom fields."""
     found: list[dict] = []
+    seen: set[str] = set()
+
+    def add(item) -> None:
+        sprint = _coerce_sprint_item(item)
+        if not sprint:
+            return
+        sid = str(sprint.get("id"))
+        if sid in seen:
+            return
+        seen.add(sid)
+        found.append(sprint)
+
     for key in ("sprint", "closedSprints"):
         value = fields.get(key)
-        if isinstance(value, dict) and value.get("id") is not None:
-            found.append(value)
-        elif isinstance(value, list):
+        if isinstance(value, list):
             for item in value:
-                if isinstance(item, dict) and item.get("id") is not None:
-                    found.append(item)
+                add(item)
+        else:
+            add(value)
+
+    # REST search often omits fields.sprint and only returns gh-sprint customfield.
+    for key, value in fields.items():
+        if not str(key).startswith("customfield_"):
+            continue
+        if isinstance(value, list):
+            for item in value:
+                add(item)
+        else:
+            add(value)
     return found
 
 
@@ -186,6 +349,102 @@ def _working_days_between(start: date, end: date) -> int:
     return n
 
 
+def _effective_load_hours(
+    task: dict,
+    *,
+    fallback_hours: float,
+    fallback_ratio: float,
+) -> tuple[float, str]:
+    """
+    Hours counted toward person load for one active task.
+
+    - remaining > 0 → Jira remaining
+    - remaining 0/missing → hybrid fallback: max(fixed hours, estimate × ratio)
+      (covers QA plate where automation zeroed the leftover after development)
+    """
+    rem = task.get("remaining_hours")
+    if rem is not None and float(rem) > 0:
+        return float(rem), "jira"
+    est = task.get("estimate_hours")
+    assumed = max(float(fallback_hours or 0.0), 0.0)
+    if est is not None and float(est) > 0 and fallback_ratio > 0:
+        assumed = max(assumed, float(est) * float(fallback_ratio))
+    return assumed, "fallback"
+
+
+def _build_person_load(
+    *,
+    active_tasks: list[dict],
+    sprint: dict,
+    expected_hours: float,
+    today: date,
+) -> dict:
+    """
+    Forward-looking load: remaining active plate vs capacity to sprint end.
+    load_pct = remaining_hours / (workdays_left × expected_hours) × 100
+
+    Hybrid: active tasks with Jira remaining ≤ 0 still count via fallback
+    (fixed hours and/or share of original estimate).
+    """
+    m = get_team_config().metrics
+    fallback_hours = float(m.load_fallback_hours)
+    fallback_ratio = float(m.load_fallback_estimate_ratio)
+
+    remain = 0.0
+    with_remaining = 0
+    with_fallback = 0
+    without_estimate = 0
+    for task in active_tasks:
+        hours, source = _effective_load_hours(
+            task,
+            fallback_hours=fallback_hours,
+            fallback_ratio=fallback_ratio,
+        )
+        remain += max(hours, 0.0)
+        if source == "jira":
+            with_remaining += 1
+        else:
+            with_fallback += 1
+            est = task.get("estimate_hours")
+            if est is None or float(est or 0) <= 0:
+                without_estimate += 1
+
+    end_d = (
+        date.fromisoformat(sprint["end_date"]) if sprint.get("end_date") else None
+    )
+    days_left = _working_days_between(today, end_d) if end_d else 0
+    capacity = days_left * float(expected_hours or 8.0)
+    load_pct = None
+    if capacity > 0:
+        load_pct = _round((remain / capacity) * 100.0, 0)
+
+    if not active_tasks:
+        level = "empty"
+    elif load_pct is None:
+        level = "unknown"
+    elif load_pct < 80:
+        level = "ok"
+    elif load_pct <= 110:
+        level = "tight"
+    else:
+        level = "over"
+
+    return {
+        "remaining_hours": _round(remain, 1) or 0.0,
+        "capacity_hours": _round(capacity, 1) or 0.0,
+        "days_left": days_left,
+        "expected_hours_per_day": float(expected_hours or 8.0),
+        "load_pct": load_pct,
+        "level": level,
+        "active_tasks": len(active_tasks),
+        "tasks_with_remaining": with_remaining,
+        "tasks_with_fallback": with_fallback,
+        "tasks_without_estimate": without_estimate,
+        "fallback_hours": fallback_hours,
+        "fallback_estimate_ratio": fallback_ratio,
+    }
+
+
 def _release_version_tags(fields: dict) -> list[dict]:
     tags: list[dict] = []
     seen: set[str] = set()
@@ -197,11 +456,13 @@ def _release_version_tags(fields: dict) -> list[dict]:
             continue
         seen.add(name)
         released = bool(item.get("released"))
+        vid = str(item.get("id") or "").strip() or None
         tags.append(
             {
                 "id": "release",
                 "label": name,
                 "tone": "release",
+                "release_id": vid,
                 "hint": (
                     f"Fix Version «{name}»"
                     + (" · уже выпущена в Jira" if released else " · ещё не выпущена")
@@ -320,6 +581,7 @@ def _build_epic_timeline(
     expected_hours: float = 8.0,
     release_epic_keys: list[str] | None = None,
     epic_scope_issues: list[dict] | None = None,
+    sprint_issue_keys: set[str] | None = None,
 ) -> dict:
     """
     Epics as sausages split by all team directions.
@@ -423,7 +685,9 @@ def _build_epic_timeline(
             expected_hours=expected_hours,
             inactive_days=team_cfg.inactive_days,
         )
-        in_sprint = _issue_in_sprint(fields, sprint.get("id"))
+        in_sprint = _issue_in_sprint(fields, sprint.get("id")) or (
+            bool(sprint_issue_keys) and key in sprint_issue_keys
+        )
         if not in_sprint:
             tags = [
                 *tags,
@@ -1308,6 +1572,8 @@ def _build_people_profiles(
     sprint_days: list[str],
     sprint: dict,
     expected_hours: float,
+    changelogs: list[dict] | None = None,
+    all_issues: list[dict] | None = None,
 ) -> dict[str, dict]:
     """Compact per-person dossier for the UI modal."""
     team_cfg = get_team_config()
@@ -1316,13 +1582,22 @@ def _build_people_profiles(
     today = datetime.now(timezone.utc).date()
     end_d = date.fromisoformat(sprint["end_date"]) if sprint.get("end_date") else None
     sprint_id = sprint.get("id")
+    current_assignee_by_key: dict[str, str] = {}
+    for issue in all_issues or issues:
+        fields = issue.get("fields") or {}
+        key = (issue.get("key") or "").upper()
+        if not key:
+            continue
+        assignee_display = _jira_person_name(fields.get("assignee"))
+        if assignee_display and assignee_display != "Без исполнителя":
+            current_assignee_by_key[key] = assignee_display
 
     for issue in issues:
         name = issue.get("_canonical_assignee")
-        if not name or name not in by_name:
-            continue
         fields = issue.get("fields") or {}
         key = (issue.get("key") or "").upper()
+        if not name or name not in by_name:
+            continue
         status_name = ((fields.get("status") or {}).get("name"))
         direction = issue.get("_direction")
         kind = team_cfg.classify_status(
@@ -1363,6 +1638,15 @@ def _build_people_profiles(
             }
         )
 
+    activity_by_person = build_people_activity(
+        people_names=list(by_name.keys()),
+        changelogs=changelogs or [],
+        hours_by_person_day_issue=hours_by_person_day_issue,
+        issue_summary_by_key=issue_summary_by_key,
+        browse_base=browse_base,
+        current_assignee_by_key=current_assignee_by_key,
+    )
+
     rating_hits: dict[str, list[dict]] = defaultdict(list)
     for cat in ratings or []:
         if not cat.get("enabled"):
@@ -1391,8 +1675,20 @@ def _build_people_profiles(
                 t.get("key") or "",
             ),
         )
+        # Full sprint calendar for the hours chart (not truncated to "today").
+        if sprint.get("start_date") and sprint.get("end_date"):
+            chart_days = [
+                d.isoformat()
+                for d in _daterange(
+                    date.fromisoformat(sprint["start_date"]),
+                    date.fromisoformat(sprint["end_date"]),
+                )
+            ]
+        else:
+            chart_days = list(sprint_days)
+        today_s = report_today().isoformat()
         day_hours = []
-        for day in sprint_days:
+        for day in chart_days:
             day_total = _round(hours_by_person_day.get(name, {}).get(day, 0.0), 2) or 0.0
             by_issue = hours_by_person_day_issue.get(name, {}).get(day) or {}
             issues_day = [
@@ -1411,14 +1707,17 @@ def _build_people_profiles(
                     "date": day,
                     "hours": day_total,
                     "issues": issues_day,
+                    "is_today": day == today_s,
+                    "is_future": day > today_s,
                 }
             )
         active_tasks = [t for t in tasks if t.get("direction_state") == "active"]
         risk_tasks = [t for t in active_tasks if t.get("risk") or _has_risk_tags(t.get("tags"))]
-        remain_sum = sum(
-            float(t.get("remaining_hours") or 0)
-            for t in active_tasks
-            if t.get("remaining_hours") is not None
+        load = _build_person_load(
+            active_tasks=active_tasks,
+            sprint=sprint,
+            expected_hours=expected_hours,
+            today=report_today(),
         )
         m = team_cfg.metrics
         profiles[name] = {
@@ -1426,11 +1725,239 @@ def _build_people_profiles(
             "tasks": tasks[: m.person_tasks_limit],
             "tasks_active": active_tasks[: m.person_active_tasks_limit],
             "risk_count": len(risk_tasks),
-            "remaining_hours": _round(remain_sum, 1) or 0.0,
+            "remaining_hours": load.get("remaining_hours") or 0.0,
+            "load": load,
             "day_hours": day_hours,
             "ratings": rating_hits.get(name) or [],
+            "activity": activity_by_person.get(name)
+            or {
+                "yesterday": {
+                    "date": None,
+                    "label": "Вчера",
+                    "events": [],
+                    "groups": [],
+                    "empty": True,
+                },
+                "today": {
+                    "date": None,
+                    "label": "Сегодня",
+                    "events": [],
+                    "groups": [],
+                    "empty": True,
+                },
+            },
         }
     return profiles
+
+
+def _worklog_comment_text(comment: Any) -> str:
+    if comment is None:
+        return ""
+    if isinstance(comment, str):
+        return comment.strip()
+    if isinstance(comment, dict):
+        # Jira Server sometimes wraps worklog comment similarly to ADF
+        parts: list[str] = []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "text" and node.get("text"):
+                    parts.append(str(node.get("text")))
+                for child in node.get("content") or []:
+                    walk(child)
+                if node.get("body") and isinstance(node.get("body"), str):
+                    parts.append(node["body"])
+            elif isinstance(node, list):
+                for child in node:
+                    walk(child)
+
+        walk(comment)
+        return " ".join(parts).strip()
+    return str(comment).strip()
+
+
+def _build_issues_index(
+    *,
+    issues: list[dict],
+    all_issues: list[dict],
+    hours_by_issue: dict[str, float],
+    links: dict,
+    browse_base: str,
+    sprint: dict,
+    expected_hours: float,
+    changelogs: list[dict],
+    worklogs: list[dict],
+    comments: list[dict],
+    epics_meta: dict,
+    gitlab_people: dict,
+    jira_avatar_by_person: dict,
+) -> dict[str, dict]:
+    """Per-issue dossier for the task modal."""
+    team_cfg = get_team_config()
+    today = report_today()
+    end_d = date.fromisoformat(sprint["end_date"]) if sprint.get("end_date") else None
+    sprint_id = sprint.get("id")
+    browse_base = (browse_base or "").rstrip("/")
+
+    by_key: dict[str, dict] = {}
+    source = list(all_issues or []) + list(issues or [])
+    for issue in source:
+        key = (issue.get("key") or "").upper()
+        if not key or key in by_key:
+            continue
+        fields = issue.get("fields") or {}
+        status_obj = fields.get("status") or {}
+        status_name = status_obj.get("name")
+        direction = issue.get("_direction")
+        if not direction:
+            assignee_name = _jira_person_name(fields.get("assignee"))
+            canonical_tmp = canonical_team_name(assignee_name)
+            direction = TEAM_ROSTER.get(canonical_tmp) if canonical_tmp else None
+        jira_done = _is_done(fields)
+        kind = (
+            team_cfg.classify_status(direction, status_name, jira_done=jira_done)
+            if direction
+            else ("done" if jira_done else "other")
+        )
+        rem = _remaining_estimate_hours(fields)
+        est = _estimate_hours(fields)
+        spent = float(hours_by_issue.get(key, 0.0))
+        if spent <= 0:
+            spent = float(fields.get("timespent") or 0) / 3600.0
+        tags = _build_task_tags(
+            fields=fields,
+            direction=direction or "",
+            direction_state=kind,
+            sprint_id=sprint_id,
+            today=today,
+            end_d=end_d,
+            expected_hours=expected_hours,
+            inactive_days=team_cfg.inactive_days,
+        )
+        assignee_display = issue.get("_assignee_display") or _jira_person_name(
+            fields.get("assignee")
+        )
+        canonical = issue.get("_canonical_assignee") or canonical_team_name(
+            assignee_display
+        )
+        reporter_display = _jira_person_name(fields.get("reporter"))
+        if reporter_display == "Без исполнителя":
+            reporter_display = None
+        reporter_canonical = canonical_team_name(reporter_display) if reporter_display else None
+        linked = (links.get("issues_by_key") or {}).get(key) or {}
+        mrs = linked.get("mrs") or []
+        progress_pct = None
+        if est and est > 0:
+            progress_pct = _round(min(100.0, (spent / float(est)) * 100.0), 0)
+
+        by_key[key] = {
+            "key": key,
+            "summary": fields.get("summary") or key,
+            "status": status_name,
+            "status_category": (status_obj.get("statusCategory") or {}).get("key"),
+            "direction": direction,
+            "direction_state": kind,
+            "assignee": assignee_display,
+            "assignee_canonical": canonical,
+            "reporter": reporter_display,
+            "reporter_canonical": reporter_canonical,
+            "avatar_url": _avatar_for(
+                canonical,
+                jira_avatar_by_person.get(canonical or ""),
+                gitlab_people,
+            )
+            if canonical
+            else None,
+            "hours": _round(spent, 2) or 0.0,
+            "estimate_hours": _round(est, 2) if est is not None else None,
+            "remaining_hours": _round(rem, 2) if rem is not None else None,
+            "progress_pct": progress_pct,
+            "web_url": f"{browse_base}/browse/{key}" if browse_base else None,
+            "epic_key": issue.get("_epic_key"),
+            "epic_summary": issue.get("_epic_summary")
+            or ((epics_meta.get((issue.get("_epic_key") or "").upper()) or {}).get("summary")),
+            "tags": tags,
+            "risk": _has_risk_tags(tags),
+            "hidden_from_display": team_cfg.is_hidden_from_display(
+                fields.get("summary")
+            ),
+            "version_ids": [
+                str(tag.get("release_id"))
+                for tag in tags
+                if tag.get("id") == "release" and tag.get("release_id")
+            ],
+            "mr_count": len(mrs),
+            "mrs": [
+                {
+                    "title": mr.get("title"),
+                    "web_url": mr.get("web_url"),
+                    "state": mr.get("state"),
+                    "iid": mr.get("iid"),
+                }
+                for mr in mrs[:8]
+            ],
+            "history": [],
+            "worklogs": [],
+            "comments": [],
+        }
+
+    for hist in changelogs or []:
+        key = (hist.get("issue_key") or "").upper()
+        dossier = by_key.get(key)
+        if not dossier:
+            continue
+        dossier["history"].append(
+            {
+                "at": hist.get("at"),
+                "author": hist.get("author"),
+                "status_from": hist.get("status_from"),
+                "status_to": hist.get("status_to"),
+                "assignee_from": hist.get("assignee_from"),
+                "assignee_to": hist.get("assignee_to"),
+            }
+        )
+
+    for log in worklogs or []:
+        key = (log.get("issue_key") or "").upper()
+        dossier = by_key.get(key)
+        if not dossier:
+            continue
+        author = log.get("author") or {}
+        author_name = (
+            author.get("displayName") or author.get("name") or ""
+        ).strip() or None
+        seconds = float(log.get("time_spent_seconds") or 0)
+        dossier["worklogs"].append(
+            {
+                "at": log.get("started"),
+                "hours": _round(seconds / 3600.0, 2) or 0.0,
+                "author": author_name,
+                "author_canonical": canonical_team_name(author_name),
+                "comment": _worklog_comment_text(log.get("comment")) or None,
+            }
+        )
+
+    for comment in comments or []:
+        key = (comment.get("issue_key") or "").upper()
+        dossier = by_key.get(key)
+        if not dossier:
+            continue
+        dossier["comments"].append(
+            {
+                "at": comment.get("at"),
+                "author": comment.get("author"),
+                "author_canonical": canonical_team_name(comment.get("author")),
+                "body": comment.get("body"),
+            }
+        )
+
+    for dossier in by_key.values():
+        dossier["history"].sort(key=lambda x: x.get("at") or "", reverse=True)
+        dossier["history"] = dossier["history"][:40]
+        dossier["worklogs"].sort(key=lambda x: x.get("at") or "", reverse=True)
+        dossier["comments"].sort(key=lambda x: x.get("at") or "", reverse=True)
+
+    return by_key
 
 
 def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
@@ -1441,6 +1968,39 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
     epics_meta = jira_raw.get("epics") or {}
 
     gitlab_people = collect_gitlab_people(gitlab_raw)
+    # Roster GitLab profiles (avatar_source=gitlab) even without MRs in window.
+    # Upsert by roster name and prefer a real avatar_url over empty MR stubs.
+    for name, profile in (gitlab_raw.get("roster_profiles") or {}).items():
+        if not isinstance(profile, dict):
+            continue
+        roster_name = (name or "").strip()
+        if not roster_name:
+            continue
+        avatar = profile.get("avatar_url")
+        username = profile.get("username")
+        web_url = profile.get("web_url")
+        existing = best_gitlab_person(roster_name, gitlab_people)
+        if existing is not None:
+            if avatar and (
+                not existing.get("avatar_url")
+                or _looks_like_default_avatar(existing.get("avatar_url"))
+            ):
+                existing["avatar_url"] = avatar
+            if username and not existing.get("username"):
+                existing["username"] = username
+            if web_url and not existing.get("web_url"):
+                existing["web_url"] = web_url
+            continue
+        gitlab_people.append(
+            {
+                "name": roster_name,
+                "username": username,
+                "web_url": web_url,
+                "avatar_url": avatar,
+                "projects": [],
+                "mr_count": 0,
+            }
+        )
 
     # Keep only issues assigned to roster members
     issues = []
@@ -1533,6 +2093,7 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
     hours_by_person_issue: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     issue_summary_by_key: dict[str, str] = {}
     jira_avatar_by_person: dict[str, str | None] = {}
+    jira_username_by_person: dict[str, str | None] = {}
 
     for log in jira_raw.get("worklogs") or []:
         author_name = _jira_person_name(log.get("author"))
@@ -1554,16 +2115,40 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
             if summary:
                 issue_summary_by_key.setdefault(key, summary)
         jira_avatar_by_person.setdefault(canonical, _jira_avatar(log.get("author")))
+        jira_username_by_person.setdefault(canonical, _jira_username(log.get("author")))
 
     for issue in issues:
         fields = issue.get("fields") or {}
         canonical = issue["_canonical_assignee"]
         jira_avatar_by_person.setdefault(canonical, _jira_avatar(fields.get("assignee")))
+        jira_username_by_person.setdefault(canonical, _jira_username(fields.get("assignee")))
+        reporter_name = _jira_person_name(fields.get("reporter"))
+        reporter_canonical = canonical_team_name(reporter_name)
+        if reporter_canonical:
+            jira_avatar_by_person.setdefault(
+                reporter_canonical, _jira_avatar(fields.get("reporter"))
+            )
+            jira_username_by_person.setdefault(
+                reporter_canonical, _jira_username(fields.get("reporter"))
+            )
         key = (issue.get("key") or "").upper()
         if key:
             summary = (fields.get("summary") or "").strip()
             if summary:
                 issue_summary_by_key.setdefault(key, summary)
+
+    # Roster profiles from /user API (covers people absent from sprint issues)
+    for name, profile in (jira_raw.get("roster_profiles") or {}).items():
+        if not isinstance(profile, dict):
+            continue
+        canonical = canonical_team_name(name) or name
+        roster_avatar = profile.get("avatar_url")
+        if roster_avatar:
+            current = jira_avatar_by_person.get(canonical)
+            if not current or _looks_like_default_avatar(current):
+                jira_avatar_by_person[canonical] = roster_avatar
+        if profile.get("username"):
+            jira_username_by_person.setdefault(canonical, profile.get("username"))
 
     selected_day_date = today if today in sprint_day_dates else (
         sprint_day_dates[-1] if sprint_day_dates else today
@@ -1604,10 +2189,20 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         hours_today = _round(hours_by_person_day.get(name, {}).get(selected_day, 0.0), 2) or 0.0
         hours_sprint = _round(sum(hours_by_person_day.get(name, {}).values()), 2) or 0.0
         level = "skip" if selected_is_weekend else _hours_level(hours_today, expected)
+        gender = team_cfg.gender_for(name)
+        links_for = _profile_links_for(
+            name,
+            browse_base=browse_base,
+            jira_username=jira_username_by_person.get(name),
+            gitlab_people=gitlab_people,
+        )
         row = {
             "name": name,
             "avatar_url": _avatar_for(name, jira_avatar_by_person.get(name), gitlab_people),
             "direction": direction,
+            "jira_url": links_for.get("jira_url"),
+            "gitlab_url": links_for.get("gitlab_url"),
+            "gender": gender,
             "tasks_done": tasks["done"],
             "tasks_open": tasks["open"],
             "tasks_total": tasks["done"] + tasks["open"],
@@ -1973,6 +2568,11 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         browse_base=browse_base,
     )
 
+    sprint_issue_keys = {
+        (i.get("key") or "").upper()
+        for i in (jira_raw.get("issues") or [])
+        if i.get("key")
+    }
     epic_timeline = _build_epic_timeline(
         issues=issues,
         epics_meta=epics_meta,
@@ -1982,6 +2582,7 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         expected_hours=expected,
         release_epic_keys=jira_raw.get("release_epic_keys") or [],
         epic_scope_issues=jira_raw.get("epic_scope_issues") or [],
+        sprint_issue_keys=sprint_issue_keys,
     )
     _enrich_epics_with_releases(epic_timeline, releases)
 
@@ -1998,6 +2599,30 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         sprint_days=[d.isoformat() for d in sprint_day_dates],
         sprint=sprint,
         expected_hours=expected,
+        changelogs=jira_raw.get("changelogs") or [],
+        all_issues=all_issues,
+    )
+
+    for row in team_rows:
+        profile = people_profiles.get(row["name"]) or {}
+        row["risk_count"] = profile.get("risk_count") or 0
+        row["remaining_hours"] = profile.get("remaining_hours") or 0
+        row["load"] = profile.get("load")
+
+    issues_index = _build_issues_index(
+        issues=issues,
+        all_issues=all_issues,
+        hours_by_issue=hours_by_issue,
+        links=links,
+        browse_base=browse_base,
+        sprint=sprint,
+        expected_hours=expected,
+        changelogs=jira_raw.get("changelogs") or [],
+        worklogs=jira_raw.get("worklogs") or [],
+        comments=jira_raw.get("comments") or [],
+        epics_meta=epics_meta,
+        gitlab_people=gitlab_people,
+        jira_avatar_by_person=jira_avatar_by_person,
     )
 
     sprint_payload = {
@@ -2024,6 +2649,7 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         "directions": directions,
         "team": team_rows,
         "people": people_profiles,
+        "issues": issues_index,
         "ratings": ratings,
         "releases": releases,
         "epic_timeline": epic_timeline,

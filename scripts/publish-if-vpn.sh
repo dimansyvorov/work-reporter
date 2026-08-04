@@ -12,7 +12,7 @@ STATE_FILE="${LOG_DIR}/work-reporter.last-publish"
 LOCK_DIR="${TMPDIR:-/tmp}/work-reporter.publish.lock"
 
 # How often the report may be rebuilt/published.
-PUBLISH_EVERY_SEC="${PUBLISH_EVERY_SEC:-1800}"
+PUBLISH_EVERY_SEC="${PUBLISH_EVERY_SEC:-3600}"
 # Inclusive local hour window: [start, end). Default 09:00–19:00.
 ACTIVE_HOUR_START="${ACTIVE_HOUR_START:-9}"
 ACTIVE_HOUR_END="${ACTIVE_HOUR_END:-19}"
@@ -84,6 +84,8 @@ fi
 
 log "start: python run.py --publish (vpn ok → $JIRA_HOST)"
 set +e
+# Mark trigger for Telegram notify wording («Режим: Автоматически»).
+export WORK_REPORTER_PUBLISH_MODE=auto
 "$PYTHON" "$ROOT/run.py" --publish >>"$LOG_FILE" 2>&1
 rc=$?
 set -e

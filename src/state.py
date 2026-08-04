@@ -12,6 +12,8 @@ PIPELINE_STEPS = [
     ("jira_issues", "Jira: задачи"),
     ("jira_epics", "Jira: эпики"),
     ("jira_worklogs", "Jira: worklogs"),
+    ("jira_changelog", "Jira: история статусов"),
+    ("jira_comments", "Jira: комментарии"),
     ("gitlab", "GitLab: merge requests"),
     ("commits", "GitLab: коммиты по MR"),
     ("metrics", "Расчёт метрик и рейтингов"),

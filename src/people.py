@@ -171,20 +171,29 @@ def resolve_avatar(
     return None
 
 
-def best_gitlab_avatar(display_name: str, gitlab_people: list[dict]) -> str | None:
+def best_gitlab_person(display_name: str, gitlab_people: list[dict]) -> dict | None:
     from .team import canonical_team_name
 
     target = canonical_team_name(display_name) or display_name
-    # Prefer exact/alias canonical match, then fuzzy name match
+    matches: list[dict] = []
     for person in gitlab_people:
         gname = person.get("name") or ""
         if not gname:
             continue
         if canonical_team_name(gname) == target or names_match(display_name, gname):
-            avatar = person.get("avatar_url")
-            if avatar:
-                return avatar
-    return None
+            matches.append(person)
+    if not matches:
+        return None
+    # Prefer entries that already carry an avatar (roster profile / MR author)
+    with_avatar = [p for p in matches if p.get("avatar_url")]
+    return with_avatar[0] if with_avatar else matches[0]
+
+
+def best_gitlab_avatar(display_name: str, gitlab_people: list[dict]) -> str | None:
+    person = best_gitlab_person(display_name, gitlab_people)
+    if not person:
+        return None
+    return person.get("avatar_url") or None
 
 
 def collect_gitlab_people(gitlab_raw: dict | None) -> list[dict]:
@@ -206,6 +215,8 @@ def collect_gitlab_people(gitlab_raw: dict | None) -> list[dict]:
                     key,
                     {
                         "name": name,
+                        "username": author.get("username"),
+                        "web_url": author.get("web_url"),
                         "avatar_url": author.get("avatar_url"),
                         "projects": set(),
                         "mr_count": 0,
@@ -213,26 +224,47 @@ def collect_gitlab_people(gitlab_raw: dict | None) -> list[dict]:
                 )
                 if author.get("avatar_url") and not entry.get("avatar_url"):
                     entry["avatar_url"] = author.get("avatar_url")
+                if author.get("username") and not entry.get("username"):
+                    entry["username"] = author.get("username")
+                if author.get("web_url") and not entry.get("web_url"):
+                    entry["web_url"] = author.get("web_url")
                 entry["projects"].add(project.get("ref") or project.get("name"))
                 entry["mr_count"] += 1
-                # Also index commit authors for avatar matching
+                # Index commit authors only when we can attach a usable avatar.
+                # Bare name stubs without avatar_url used to "win" name matching and
+                # leave people with placeholders even when Jira had a photo.
+                mr_avatar = author.get("avatar_url")
                 for author_name in (mr.get("commits_by_author") or {}):
-                    ckey = normalize_name(author_name)
-                    people.setdefault(
-                        ckey,
-                        {
-                            "name": author_name,
-                            "avatar_url": None,
-                            "projects": set(),
-                            "mr_count": 0,
-                        },
-                    )
+                    if not author_name or not mr_avatar:
+                        continue
+                    if names_match(author_name, name):
+                        ckey = normalize_name(author_name)
+                        centry = people.setdefault(
+                            ckey,
+                            {
+                                "name": author_name,
+                                "username": author.get("username"),
+                                "web_url": author.get("web_url"),
+                                "avatar_url": mr_avatar,
+                                "projects": set(),
+                                "mr_count": 0,
+                            },
+                        )
+                        if not centry.get("avatar_url"):
+                            centry["avatar_url"] = mr_avatar
+                        if author.get("username") and not centry.get("username"):
+                            centry["username"] = author.get("username")
+                        if author.get("web_url") and not centry.get("web_url"):
+                            centry["web_url"] = author.get("web_url")
+                        centry["projects"].add(project.get("ref") or project.get("name"))
 
     result = []
     for entry in people.values():
         result.append(
             {
                 "name": entry["name"],
+                "username": entry.get("username"),
+                "web_url": entry.get("web_url"),
                 "avatar_url": entry.get("avatar_url"),
                 "projects": sorted(entry["projects"]),
                 "mr_count": entry["mr_count"],

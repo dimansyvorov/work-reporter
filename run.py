@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -32,6 +34,14 @@ def parse_args() -> argparse.Namespace:
         "--no-open",
         action="store_true",
         help="Не открывать браузер автоматически.",
+    )
+    parser.add_argument(
+        "--no-collect",
+        action="store_true",
+        help=(
+            "Открыть UI на существующем data/report.json без нового сбора "
+            "(кнопка «Обновить данные» по-прежнему запускает сбор)."
+        ),
     )
     parser.add_argument(
         "--dump-only",
@@ -91,6 +101,30 @@ def _publish_settings() -> tuple[str, str]:
     return ssh_host, remote_dir
 
 
+def _format_fetched_local(fetched: str | None) -> str:
+    """UTC/ISO fetched_at → local `DD.MM.YYYY HH:MM`."""
+    if not fetched:
+        return "—"
+    try:
+        raw = str(fetched).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.astimezone()  # treat naive as local
+        else:
+            dt = dt.astimezone()
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return str(fetched)
+
+
+def _publish_mode_label() -> str:
+    """Автоматически = LaunchAgent; Вручную = CLI --publish / --publish-only."""
+    mode = (os.getenv("WORK_REPORTER_PUBLISH_MODE") or "").strip().lower()
+    if mode in {"auto", "automatic", "launchd", "launchagent"}:
+        return "Автоматически"
+    return "Вручную"
+
+
 def _notify_remote(status: str, text: str) -> None:
     """
     Ask the home server to call Telegram API.
@@ -103,13 +137,11 @@ def _notify_remote(status: str, text: str) -> None:
     ).strip()
     if not script:
         return
-    # Keep message single-line for simple remote argv passing.
-    clean = " ".join(str(text or "").split())
+    # Preserve newlines; remote script takes status + one message argument.
+    clean = str(text or "").replace("\r\n", "\n").strip()
     if len(clean) > 900:
         clean = clean[:897] + "…"
-    remote = (
-        f"{script} {shlex.quote(status)} {shlex.quote(clean)}"
-    )
+    remote = f"{script} {shlex.quote(status)} {shlex.quote(clean)}"
     try:
         subprocess.run(
             ["ssh", ssh_host, f"bash -lc {shlex.quote(remote)}"],
@@ -118,6 +150,16 @@ def _notify_remote(status: str, text: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - notify must not break publish
         print(f"  ! telegram notify failed: {exc}")
+
+
+def _success_notify_text(*, fetched_at: str | None, public_url: str) -> str:
+    url = (public_url or "").strip() or "—"
+    lines = [
+        f"Отчёт обновлён: {url}",
+        f"Дата сборки: {_format_fetched_local(fetched_at)}",
+        f"Режим: {_publish_mode_label()}",
+    ]
+    return "\n".join(lines)
 
 
 def _run_publish(*, collected: bool) -> int:
@@ -159,7 +201,7 @@ def _run_publish(*, collected: bool) -> int:
         print(f"URL: {public_url}")
     _notify_remote(
         "success",
-        f"Отчёт обновлён: {sprint or '—'} · fetched_at={fetched or '—'}",
+        _success_notify_text(fetched_at=fetched, public_url=public_url),
     )
     return 0
 
@@ -171,6 +213,9 @@ def main() -> None:
         raise SystemExit(2)
     if args.dump_only and (args.publish or args.publish_only):
         print("--dump-only нельзя совмещать с publish")
+        raise SystemExit(2)
+    if args.no_collect and (args.dump_only or args.publish or args.publish_only):
+        print("--no-collect нельзя совмещать с --dump-only / --publish / --publish-only")
         raise SystemExit(2)
 
     cfg = load_config(mock=args.mock)
@@ -231,10 +276,36 @@ def main() -> None:
         threading.Thread(target=worker, name=label, daemon=True).start()
         return True
 
-    start_collection("collector")
-
     def on_refresh() -> bool:
         return start_collection("collector-refresh")
+
+    if args.no_collect:
+        if not report_path.is_file():
+            print(
+                f"Нет {report_path.relative_to(PROJECT_ROOT)} — "
+                "сначала соберите отчёт (python run.py --dump-only) "
+                "или уберите --no-collect."
+            )
+            raise SystemExit(1)
+        try:
+            existing = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Не удалось прочитать {report_path.name}: {exc}")
+            raise SystemExit(1) from exc
+        if not isinstance(existing, dict) or existing.get("error"):
+            print(
+                f"{report_path.name} повреждён или содержит ошибку — "
+                "уберите --no-collect и пересоберите."
+            )
+            raise SystemExit(1)
+        state.set_ready(existing, "Локальный отчёт (без нового сбора)")
+        state.add_step("init", "Подготовка", "done")
+        print(
+            f"UI без сбора: {report_path.relative_to(PROJECT_ROOT)} "
+            "(«Обновить данные» запустит полный collect)"
+        )
+    else:
+        start_collection("collector")
 
     serve_app(
         state,

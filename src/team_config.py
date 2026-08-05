@@ -44,6 +44,20 @@ def _norm_status(value: str | None) -> str:
     return " ".join((value or "").strip().lower().split())
 
 
+def _parse_lead(value: object) -> bool | None:
+    """Optional team.json lead flag → True / False / None (unset)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "да"}:
+        return True
+    if text in {"0", "false", "no", "n", "нет"}:
+        return False
+    return None
+
+
 def _parse_gender(value: object) -> str | None:
     """Normalize team.json gender to 'm' / 'f'."""
     text = str(value or "").strip().lower()
@@ -136,6 +150,8 @@ class TeamConfig:
     roster: dict[str, str] = field(default_factory=dict)
     # person display name -> "m" | "f"
     genders: dict[str, str] = field(default_factory=dict)
+    # person display names marked as direction leads (team.json lead: true)
+    leads: set[str] = field(default_factory=set)
     # person display name -> preferred avatar URL (optional override in team.json)
     avatars: dict[str, str] = field(default_factory=dict)
     # person display name -> "jira" | "gitlab" (only pull avatar from that source)
@@ -376,6 +392,13 @@ class TeamConfig:
             return None
         return self.genders.get(canonical)
 
+    def is_lead(self, name: str | None) -> bool:
+        """True if person is marked as direction lead in team.json."""
+        canonical = self.canonical_name(name)
+        if not canonical:
+            return False
+        return canonical in self.leads
+
     def is_hidden_from_display(self, summary: str | None) -> bool:
         text = (summary or "").strip()
         if not text or not self.display_task_filters:
@@ -583,6 +606,7 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
     roster_keys: dict[str, str] = {}
     roster: dict[str, str] = {}
     genders: dict[str, str] = {}
+    leads: set[str] = set()
     aliases: dict[str, str] = {}
     avatars: dict[str, str] = {}
     avatar_sources: dict[str, str] = {}
@@ -606,6 +630,11 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
         gender = _parse_gender(person.get("gender"))
         if gender:
             genders[name] = gender
+        lead_flag = _parse_lead(person.get("lead"))
+        if lead_flag is True:
+            leads.add(name)
+        elif lead_flag is False:
+            leads.discard(name)
         avatar = str(person.get("avatar_url") or person.get("avatar") or "").strip()
         if avatar:
             avatars[name] = avatar
@@ -754,6 +783,7 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
         roster_keys=roster_keys,
         roster=roster,
         genders=genders,
+        leads=leads,
         avatars=avatars,
         avatar_sources=avatar_sources,
         jira_usernames=jira_usernames,

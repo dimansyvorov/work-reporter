@@ -147,6 +147,7 @@ PUBLISH_NOTIFY_SCRIPT=~/work-reporter-notify/notify-telegram.sh
 |---|---|---|
 | `name` | `"Иванов Иван Иванович"` | Каноническое ФИО в UI |
 | `direction` | `"backend"` | Ключ из `directions` |
+| `lead` | `true` | Опционально: лид направления (для AI-рекомендаций) |
 | `aliases` | `["Ivan Ivanov", "ivan.ivanov"]` | Имена/логины из Jira и GitLab для сопоставления |
 
 #### `jira`

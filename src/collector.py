@@ -13,6 +13,7 @@ from .gitlab_client import enrich_mr_commit_counts
 from .jira_client import collect_jira_raw
 from .metrics import compute_report
 from .mock_data import build_mock_raw
+from .ai_brief import attach_ai_brief
 from .publish import localize_avatars
 from .state import AppState
 from .team_config import load_team_config
@@ -267,6 +268,42 @@ def collect_and_build(
             f"Метрики: {len(sr.get('directions') or [])} направлений, "
             f"{len(sr.get('ratings') or [])} рейтингов",
         )
+
+        previous_report = None
+        if report_path.is_file():
+            try:
+                previous_report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                previous_report = None
+
+        state.run_step("ai_brief", "AI-оценка спринта…")
+        state.set_status("collecting", "Генерирую AI-оценку спринта…")
+        report = attach_ai_brief(
+            report,
+            previous_report=previous_report if isinstance(previous_report, dict) else None,
+            mock=cfg.mock,
+        )
+        brief = ((report or {}).get("sprint_report") or {}).get("ai_brief") or {}
+        brief_status = brief.get("status") or "skipped"
+        if brief_status == "ok":
+            state.update_step(
+                "ai_brief",
+                "done",
+                f"AI-оценка: {brief.get('author') or 'corporate'}"
+                + (" (cache)" if brief.get("reason") == "cache" else ""),
+            )
+        elif brief_status == "error":
+            state.update_step(
+                "ai_brief",
+                "done",
+                f"AI-оценка недоступна: {str(brief.get('error') or 'error')[:80]}",
+            )
+        else:
+            state.update_step(
+                "ai_brief",
+                "done",
+                f"AI-оценка пропущена ({brief.get('reason') or 'skipped'})",
+            )
 
         state.run_step("save", "Сохраняю отчёт…")
         state.set_status("collecting", "Сохраняю отчёт…")

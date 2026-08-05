@@ -788,7 +788,241 @@ function updateDocumentTitle(sprint) {
       : `Отчет ${name} (${fmtNumber(pct)}%)`;
 }
 
-function renderSprintHeader(sprint, mood) {
+function corporateAuthorLabel(brief) {
+  if (!brief) return "corporate unknown";
+  if (brief.author) return String(brief.author);
+  const model = brief.model_label || String(brief.model || "").replace(/^\/?models\//i, "");
+  return `corporate ${model || "unknown"}`;
+}
+
+function humanizeAiText(text) {
+  let out = String(text || "");
+  const replacements = [
+    [/\btasks_pct\b/gi, "выполнение задач"],
+    [/\btime_pct\b/gi, "прохождение спринта"],
+    [/\bprogress_pct\b/gi, "прогресс"],
+    [/\bload_pct\b/gi, "нагрузка"],
+    [/\bdays_left\b/gi, "дней осталось"],
+    [/\bactive_tasks\b/gi, "активных задач"],
+    [/\bstale-задач/gi, "неактивных задач"],
+    [/\bstale\b/gi, "неактивные"],
+    [/`?at_risk`?/gi, "риск срыва"],
+    [/`?on_track`?/gi, "в графике"],
+    [/`?overdue`?/gi, "просрочен"],
+  ];
+  for (const [re, repl] of replacements) out = out.replace(re, repl);
+  out = out.replace(
+    /\(\s*выполнение задач\s+([0-9]+(?:[.,][0-9]+)?)\s*%\s*[<>]\s*прохождение спринта\s+([0-9]+(?:[.,][0-9]+)?)\s*%\s*\)/gi,
+    "(задачи закрыты на $1%, по календарю прошло $2%)"
+  );
+  return out;
+}
+
+function extractAiVerdict(markdown) {
+  const text = String(markdown || "").trim();
+  if (!text) return null;
+  const match = text.match(/##\s*Вердикт\s*\n+([\s\S]*?)(?=\n##\s|$)/i);
+  const chunk = (match ? match[1] : text).trim();
+  const lines = chunk
+    .split("\n")
+    .map((ln) => ln.replace(/^[-*]\s+/, "").trim())
+    .filter(Boolean);
+  if (!lines.length) return null;
+  let verdict = humanizeAiText(lines.slice(0, 3).join(" ").trim());
+  if (verdict.length > 220) verdict = `${verdict.slice(0, 217).trim()}…`;
+  return verdict || null;
+}
+
+function formatAiInlineMarkdown(text) {
+  // Escape first, then restore a small safe subset of markdown emphasis.
+  let html = escapeHtml(String(text || ""));
+  // Bold: **text** or __text__
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/__(.+?)__/g, "<strong>$1</strong>");
+  // Italic: *text* or _text_ (avoid matching inside words like snake_case)
+  html = html.replace(/(^|[\s(])\*(?!\s)(.+?)(?!\s)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>");
+  html = html.replace(/(^|[\s(])_(?!\s)(.+?)(?!\s)_(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>");
+  // Inline code: `code`
+  html = html.replace(/`([^`]+)`/g, '<code class="ai-brief-code">$1</code>');
+  // Person names → open profile modal
+  return linkifyAiPersonNames(html);
+}
+
+/** Approximate Russian surname genitive for short mentions in AI text. */
+function surnameGenitiveForms(surname) {
+  const s = String(surname || "").trim();
+  if (!s) return [];
+  const forms = new Set([s]);
+  const lower = s.toLowerCase();
+  if (lower.endsWith("ова") || lower.endsWith("ева") || lower.endsWith("ина")) {
+    forms.add(s.slice(0, -1) + "ой");
+  } else if (lower.endsWith("ая")) {
+    forms.add(s.slice(0, -2) + "ой");
+  } else if (lower.endsWith("я")) {
+    forms.add(s.slice(0, -1) + "и");
+  } else if (lower.endsWith("а")) {
+    forms.add(s.slice(0, -1) + "ы");
+  } else if (/[бвгджзклмнпрстфхцчшщ]$/i.test(s)) {
+    forms.add(s + "а");
+    forms.add(s + "у");
+  }
+  return [...forms];
+}
+
+function buildAiPersonLinkPatterns() {
+  const team = currentSprintReport?.team || [];
+  const people = currentSprintReport?.people || {};
+  const names = new Set([
+    ...team.map((p) => p?.name).filter(Boolean),
+    ...Object.keys(people),
+  ]);
+  const patterns = [];
+  const seen = new Set();
+  for (const full of names) {
+    const short = shortName(full);
+    const parts = String(full).trim().split(/\s+/).filter(Boolean);
+    const surname = parts[0] || "";
+    const initials =
+      parts.length >= 3
+        ? `${parts[1].charAt(0)}\\.?\\s*${parts[2].charAt(0)}\\.?`
+        : parts.length === 2
+          ? `${parts[1].charAt(0)}\\.?`
+          : "";
+    const variants = new Set([full, short]);
+    for (const sur of surnameGenitiveForms(surname)) {
+      variants.add(sur);
+      if (initials) {
+        variants.add(`${sur} ${parts.length >= 3 ? `${parts[1].charAt(0)}.${parts[2].charAt(0)}.` : `${parts[1].charAt(0)}.`}`);
+        variants.add(`${sur} ${parts.length >= 3 ? `${parts[1].charAt(0)}. ${parts[2].charAt(0)}.` : `${parts[1].charAt(0)}.`}`);
+      }
+    }
+    for (const text of variants) {
+      const key = text.toLowerCase();
+      if (!text || seen.has(key) || text.length < 3) continue;
+      seen.add(key);
+      const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+      patterns.push({
+        re: new RegExp(`(?<![\\wА-Яа-яЁё])${escaped}(?![\\wА-Яа-яЁё])`, "giu"),
+        name: full,
+        len: text.length,
+      });
+    }
+  }
+  patterns.sort((a, b) => b.len - a.len);
+  return patterns;
+}
+
+function linkifyAiPersonNames(html) {
+  const patterns = buildAiPersonLinkPatterns();
+  if (!patterns.length) return html;
+  return String(html || "").replace(/(<[^>]+>)|([^<]+)/g, (whole, tag, text) => {
+    if (tag || text == null) return whole;
+    let out = text;
+    const slots = [];
+    for (const { re, name } of patterns) {
+      out = out.replace(re, (match) => {
+        const token = `\u0000AI_PERSON_${slots.length}\u0000`;
+        slots.push(
+          `<button type="button" class="ai-person-link person-btn" data-person="${escapeHtml(name)}" title="Открыть профиль">${match}</button>`
+        );
+        return token;
+      });
+    }
+    return out.replace(/\u0000AI_PERSON_(\d+)\u0000/g, (_, idx) => slots[Number(idx)] || "");
+  });
+}
+
+function renderAiMarkdown(markdown) {
+  const lines = humanizeAiText(markdown || "")
+    .replace(/\r\n/g, "\n")
+    .split("\n");
+  const parts = [];
+  let listType = null; // "ul" | "ol"
+  let listItems = [];
+  const flushList = () => {
+    if (!listItems.length || !listType) return;
+    const tag = listType;
+    parts.push(
+      `<${tag} class="ai-brief-list">${listItems
+        .map((item) => `<li>${item}</li>`)
+        .join("")}</${tag}>`
+    );
+    listItems = [];
+    listType = null;
+  };
+  const pushListItem = (type, html) => {
+    if (listType && listType !== type) flushList();
+    listType = type;
+    listItems.push(html);
+  };
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushList();
+      continue;
+    }
+    const heading = trimmed.match(/^##\s+(.+)$/);
+    if (heading) {
+      flushList();
+      parts.push(
+        `<h3 class="ai-brief-h">${formatAiInlineMarkdown(heading[1].trim())}</h3>`
+      );
+      continue;
+    }
+    const ordered = trimmed.match(/^\d+\.\s+(.+)$/);
+    if (ordered) {
+      pushListItem("ol", formatAiInlineMarkdown(ordered[1].trim()));
+      continue;
+    }
+    const bullet = trimmed.match(/^[-*]\s+(.+)$/);
+    if (bullet) {
+      pushListItem("ul", formatAiInlineMarkdown(bullet[1].trim()));
+      continue;
+    }
+    flushList();
+    parts.push(`<p class="ai-brief-p">${formatAiInlineMarkdown(trimmed)}</p>`);
+  }
+  flushList();
+  return parts.join("") || `<p class="muted">Пустой ответ модели</p>`;
+}
+
+function openAiBriefModal(brief) {
+  if (!brief) return;
+  const author = corporateAuthorLabel(brief);
+  const when = brief.generated_at ? fmtDateTime(brief.generated_at) : "—";
+  if (brief.status === "ok" && brief.markdown) {
+    openAppModal(
+      `
+      <div class="release-modal-head">
+        <h2 id="app-modal-title">AI-оценка спринта</h2>
+        <p class="muted">Автор: ${escapeHtml(author)} · ${escapeHtml(when)}</p>
+      </div>
+      <div class="ai-brief-body">${renderAiMarkdown(brief.markdown)}</div>
+      `,
+      { wide: true }
+    );
+    return;
+  }
+  const detail =
+    brief.status === "error"
+      ? brief.error || "Ошибка генерации"
+      : brief.reason
+        ? `Пропущено: ${brief.reason}`
+        : "Оценка недоступна";
+  openAppModal(
+    `
+    <div class="release-modal-head">
+      <h2 id="app-modal-title">AI-оценка спринта</h2>
+      <p class="muted">Автор: ${escapeHtml(author)}</p>
+    </div>
+    <p class="muted">${escapeHtml(detail)}</p>
+    `,
+    { wide: true }
+  );
+}
+
+function renderSprintHeader(sprint, mood, aiBrief = null) {
   const root = document.getElementById("sprint-header");
   document.getElementById("sprint-title").textContent = sprint.name || "Спринт";
   updateDocumentTitle(sprint);
@@ -856,7 +1090,34 @@ function renderSprintHeader(sprint, mood) {
     </article>`
     : "";
 
-  root.innerHTML = cards + moodCard;
+  let aiCard = "";
+  if (aiBrief) {
+    const author = corporateAuthorLabel(aiBrief);
+    const tone =
+      aiBrief.status === "ok"
+        ? "tone-good"
+        : aiBrief.status === "error"
+          ? "tone-warn"
+          : "tone-ok";
+    const verdict =
+      humanizeAiText(aiBrief.verdict || "") ||
+      extractAiVerdict(aiBrief.markdown) ||
+      (aiBrief.status === "error"
+        ? "Оценка временно недоступна"
+        : aiBrief.status === "skipped"
+          ? "Оценка не сформирована"
+          : "Открыть полный анализ");
+    const when = aiBrief.generated_at ? fmtRelativeAgo(aiBrief.generated_at) : "—";
+    aiCard = `
+    <article class="card mood-card ai-brief-card ${tone}" data-ai-brief="1" role="button" tabindex="0" title="Открыть AI-оценку спринта">
+      <p class="label">AI-оценка спринта</p>
+      <p class="ai-brief-author">${escapeHtml(author)}</p>
+      <p class="mood-reco">${escapeHtml(verdict)}</p>
+      <p class="hint">${escapeHtml(when)}</p>
+    </article>`;
+  }
+
+  root.innerHTML = cards + moodCard + aiCard;
 }
 
 function shortDirection(name) {
@@ -1512,9 +1773,15 @@ function openAppModal(html, { wide = false, rating = false, person = false } = {
     card.classList.toggle("modal-card-wide", !!wide || !!person);
     card.classList.toggle("modal-card-person", !!person);
     card.classList.toggle("modal-card-rating", !!rating);
+    card.scrollTop = 0;
   }
   modal.classList.remove("hidden");
   modal.setAttribute("aria-hidden", "false");
+  // Reset after layout so reopen never keeps previous scroll.
+  requestAnimationFrame(() => {
+    if (card) card.scrollTop = 0;
+    if (body) body.scrollTop = 0;
+  });
 }
 
 function openPersonModal(name) {
@@ -3274,7 +3541,7 @@ function paintReport(report) {
     Number(sr.settings?.ui?.task_table_preview) || 5
   );
   showReport(true);
-  renderSprintHeader(sr.sprint, sr.team_mood);
+  renderSprintHeader(sr.sprint, sr.team_mood, sr.ai_brief);
   renderDirections(directions);
   renderReleases(sr.releases || []);
   renderEpicTimeline(sr.epic_timeline || {});
@@ -3403,6 +3670,11 @@ async function main() {
       openTeamMoodModal(currentSprintReport?.team_mood);
       return;
     }
+    const aiCard = event.target.closest(".ai-brief-card[data-ai-brief]");
+    if (aiCard) {
+      openAiBriefModal(currentSprintReport?.ai_brief);
+      return;
+    }
     const ratingCard = event.target.closest(".rating-card[data-rating-id]");
     if (ratingCard && !event.target.closest(".person-btn")) {
       openRatingModal(ratingCard.getAttribute("data-rating-id"));
@@ -3434,6 +3706,12 @@ async function main() {
       if (moodCard) {
         event.preventDefault();
         openTeamMoodModal(currentSprintReport?.team_mood);
+        return;
+      }
+      const aiCard = event.target.closest?.(".ai-brief-card[data-ai-brief]");
+      if (aiCard) {
+        event.preventDefault();
+        openAiBriefModal(currentSprintReport?.ai_brief);
         return;
       }
       const ratingCard = event.target.closest?.(".rating-card[data-rating-id]");

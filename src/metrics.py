@@ -2219,6 +2219,7 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
             "jira_url": links_for.get("jira_url"),
             "gitlab_url": links_for.get("gitlab_url"),
             "gender": gender,
+            "lead": team_cfg.is_lead(name),
             "tasks_done": tasks["done"],
             "tasks_open": tasks["open"],
             "tasks_total": tasks["done"] + tasks["open"],

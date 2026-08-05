@@ -348,6 +348,122 @@ h2 {
 .mood-card.tone-warn .mood-score { color: var(--warn); }
 .mood-card.tone-bad .mood-score { color: var(--danger); }
 
+.card.mood-card.ai-brief-card {
+  border-color: rgba(124, 92, 191, 0.28);
+  background:
+    linear-gradient(
+      125deg,
+      #f4effc 0%,
+      #ebe3ff 22%,
+      #f8f3ff 45%,
+      #e7ddfb 68%,
+      #f1ebfc 100%
+    );
+  background-size: 220% 220%;
+  animation:
+    fade-up 0.4s ease both,
+    ai-brief-shimmer 7.5s ease-in-out infinite;
+}
+
+.card.mood-card.ai-brief-card:hover,
+.card.mood-card.ai-brief-card:focus-visible {
+  border-color: rgba(124, 92, 191, 0.48);
+  box-shadow: 0 10px 22px rgba(90, 60, 150, 0.12);
+}
+
+@keyframes ai-brief-shimmer {
+  0%,
+  100% {
+    background-position: 0% 40%;
+  }
+  50% {
+    background-position: 100% 60%;
+  }
+}
+
+.ai-brief-card .ai-brief-author {
+  margin: 0.2rem 0 0.35rem;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #6b4aa8;
+}
+
+.ai-brief-card .hint {
+  margin-top: 0.45rem;
+}
+
+.ai-brief-body {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.85rem;
+}
+
+.ai-brief-h {
+  margin: 0.85rem 0 0.2rem;
+  font-size: 1.02rem;
+}
+
+.ai-brief-h:first-child {
+  margin-top: 0;
+}
+
+.ai-brief-p {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.ai-brief-list {
+  margin: 0.15rem 0 0.35rem;
+  padding-left: 1.15rem;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.ai-brief-list li {
+  line-height: 1.4;
+}
+
+.ai-brief-body strong {
+  font-weight: 750;
+  color: var(--ink);
+}
+
+.ai-brief-body em {
+  font-style: italic;
+  color: var(--ink);
+}
+
+.ai-brief-code {
+  font-family: var(--mono);
+  font-size: 0.86em;
+  font-weight: 650;
+  padding: 0.08em 0.35em;
+  border-radius: 6px;
+  background: rgba(20, 32, 24, 0.06);
+  border: 1px solid rgba(20, 32, 24, 0.08);
+  white-space: nowrap;
+}
+
+.ai-person-link.person-btn {
+  display: inline;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent, #1f6b4a);
+  font: inherit;
+  font-weight: 650;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.14em;
+  cursor: pointer;
+}
+
+.ai-person-link.person-btn:hover {
+  color: var(--ink);
+}
+
 .mood-modal-drivers {
   display: grid;
   gap: 0.55rem;

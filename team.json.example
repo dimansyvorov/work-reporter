@@ -77,6 +77,7 @@
     {
       "name": "Иванов Иван Иванович",
       "direction": "mobile",
+      "lead": true,
       "gender": "мужской",
       "aliases": ["Ivan Ivanov", "ivan.ivanov"],
       "avatar_url": "https://example.com/avatars/ivanov.png",
@@ -93,6 +94,7 @@
     {
       "name": "Сидоров Алексей Петрович",
       "direction": "backend",
+      "lead": true,
       "gender": "мужской",
       "aliases": ["Alexey Sidorov", "alexey.sidorov"],
       "avatar_source": "gitlab"
@@ -100,6 +102,7 @@
     {
       "name": "Кузнецова Мария Андреевна",
       "direction": "qa",
+      "lead": true,
       "gender": "женский",
       "aliases": ["Maria Kuznetsova", "maria.kuznetsova"]
     },
@@ -112,6 +115,7 @@
     {
       "name": "Орлова Елена Викторовна",
       "direction": "analytics",
+      "lead": true,
       "gender": "женский",
       "aliases": ["Elena Orlova", "elena.orlova"]
     },

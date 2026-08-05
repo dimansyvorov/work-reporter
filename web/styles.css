@@ -445,7 +445,8 @@ h2 {
   white-space: nowrap;
 }
 
-.ai-person-link.person-btn {
+.ai-person-link.person-btn,
+.ai-issue-link.issue-key-btn {
   display: inline;
   margin: 0;
   padding: 0;
@@ -460,7 +461,13 @@ h2 {
   cursor: pointer;
 }
 
-.ai-person-link.person-btn:hover {
+.ai-issue-link.issue-key-btn {
+  font-family: var(--mono);
+  font-size: 0.92em;
+}
+
+.ai-person-link.person-btn:hover,
+.ai-issue-link.issue-key-btn:hover {
   color: var(--ink);
 }
 
@@ -1623,6 +1630,10 @@ th.col-task {
   outline-offset: 2px;
 }
 
+.modals-root:empty {
+  display: none;
+}
+
 .modal {
   position: fixed;
   inset: 0;
@@ -1630,6 +1641,11 @@ th.col-task {
   display: grid;
   place-items: center;
   padding: 1.25rem;
+  pointer-events: none;
+}
+
+.modal.is-top-modal {
+  pointer-events: auto;
 }
 
 .modal.hidden {
@@ -1640,6 +1656,15 @@ th.col-task {
   position: absolute;
   inset: 0;
   background: rgba(20, 32, 24, 0.42);
+}
+
+.modal:not(.is-top-modal) .modal-backdrop {
+  background: rgba(20, 32, 24, 0.18);
+}
+
+.modal:not(.is-top-modal) .modal-card,
+.modal:not(.is-top-modal) .modal-backdrop {
+  pointer-events: none;
 }
 
 .modal-card {
@@ -3029,6 +3054,62 @@ th.col-task {
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0.55rem;
   margin-bottom: 1rem;
+}
+
+.person-ai-note {
+  margin: 0 0 1rem;
+  padding: 0.7rem 0.85rem;
+  border-radius: 12px;
+  border: 1px solid rgba(124, 92, 191, 0.28);
+  background:
+    linear-gradient(
+      125deg,
+      #f4effc 0%,
+      #ebe3ff 22%,
+      #f8f3ff 45%,
+      #e7ddfb 68%,
+      #f1ebfc 100%
+    );
+  background-size: 220% 220%;
+  animation: ai-brief-shimmer 7.5s ease-in-out infinite;
+}
+
+.person-ai-note.tone-attention {
+  border-color: rgba(124, 92, 191, 0.42);
+}
+
+.person-ai-note.tone-ok,
+.person-ai-note.tone-info {
+  border-color: rgba(124, 92, 191, 0.28);
+}
+
+.person-ai-note-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.3rem;
+}
+
+.person-ai-note-label {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: #6b4aa8;
+}
+
+.person-ai-note-meta {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.person-ai-note-text {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.4;
+  color: var(--ink);
 }
 
 .person-load {

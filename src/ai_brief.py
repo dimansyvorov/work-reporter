@@ -550,16 +550,21 @@ def _llm_settings() -> dict[str, Any]:
     }
 
 
-def _call_litellm(*, url: str, token: str, model: str, temperature: float, timeout: int, snapshot: dict) -> tuple[str, str]:
+def _call_litellm_chat(
+    *,
+    url: str,
+    token: str,
+    model: str,
+    temperature: float,
+    timeout: int,
+    system: str,
+    user: str,
+) -> tuple[str, str]:
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": USER_PROMPT_PREFIX
-                + json.dumps(snapshot, ensure_ascii=False, indent=2),
-            },
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         "temperature": temperature,
     }
@@ -582,6 +587,18 @@ def _call_litellm(*, url: str, token: str, model: str, temperature: float, timeo
         raise RuntimeError("empty model content")
     used_model = data.get("model") or model
     return str(content).strip(), str(used_model)
+
+
+def _call_litellm(*, url: str, token: str, model: str, temperature: float, timeout: int, snapshot: dict) -> tuple[str, str]:
+    return _call_litellm_chat(
+        url=url,
+        token=token,
+        model=model,
+        temperature=temperature,
+        timeout=timeout,
+        system=SYSTEM_PROMPT,
+        user=USER_PROMPT_PREFIX + json.dumps(snapshot, ensure_ascii=False, indent=2),
+    )
 
 
 def generate_ai_brief(

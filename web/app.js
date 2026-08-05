@@ -768,7 +768,7 @@ function openTeamMoodModal(mood) {
       <div class="mood-modal-drivers">${driversHtml}</div>
     </div>
   `,
-    { wide: true }
+    { wide: true, type: "mood" }
   );
 }
 
@@ -844,6 +844,8 @@ function formatAiInlineMarkdown(text) {
   html = html.replace(/(^|[\s(])_(?!\s)(.+?)(?!\s)_(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>");
   // Inline code: `code`
   html = html.replace(/`([^`]+)`/g, '<code class="ai-brief-code">$1</code>');
+  // Issue keys → open task modal (same mention→click idea as person names)
+  html = linkifyIssueKeysInHtml(html);
   // Person names → open profile modal
   return linkifyAiPersonNames(html);
 }
@@ -1000,7 +1002,7 @@ function openAiBriefModal(brief) {
       </div>
       <div class="ai-brief-body">${renderAiMarkdown(brief.markdown)}</div>
       `,
-      { wide: true }
+      { wide: true, type: "ai_brief" }
     );
     return;
   }
@@ -1018,7 +1020,7 @@ function openAiBriefModal(brief) {
     </div>
     <p class="muted">${escapeHtml(detail)}</p>
     `,
-    { wide: true }
+    { wide: true, type: "ai_brief" }
   );
 }
 
@@ -1516,7 +1518,7 @@ function openEpicModal(epicKey) {
     </div>
     ${dirBlocks || `<div class="person-modal-section"><p class="muted">Нет открытых задач</p></div>`}
   `,
-    { wide: true }
+    { wide: true, type: "epic" }
   );
 }
 
@@ -1754,41 +1756,129 @@ function renderReleases(releases) {
     .join("");
 }
 
+const MODAL_BASE_Z = 40;
+let modalLayerSeq = 0;
+
+function getModalsRoot() {
+  return document.getElementById("app-modals");
+}
+
+function reindexModalLayers(root) {
+  const layers = root ? root.querySelectorAll(".modal") : [];
+  layers.forEach((el, idx) => {
+    el.style.zIndex = String(MODAL_BASE_Z + idx);
+    el.classList.toggle("is-top-modal", idx === layers.length - 1);
+  });
+}
+
 function closeAppModal() {
-  const modal = document.getElementById("app-modal");
-  const card = modal.querySelector(".modal-card");
-  modal.classList.add("hidden");
-  modal.setAttribute("aria-hidden", "true");
-  if (card) card.classList.remove("modal-card-wide", "modal-card-rating");
-  document.getElementById("app-modal-body").innerHTML = "";
+  const root = getModalsRoot();
+  if (!root) return;
+  const layers = root.querySelectorAll(".modal");
+  if (!layers.length) return;
+  layers[layers.length - 1].remove();
+  reindexModalLayers(root);
   hideFloatTip();
 }
 
-function openAppModal(html, { wide = false, rating = false, person = false } = {}) {
-  const modal = document.getElementById("app-modal");
-  const card = modal.querySelector(".modal-card");
-  const body = document.getElementById("app-modal-body");
-  body.innerHTML = html;
+function openAppModal(
+  html,
+  { wide = false, rating = false, person = false, type = null } = {}
+) {
+  const root = getModalsRoot();
+  if (!root) return;
+  const modalType =
+    type || (person ? "person" : rating ? "rating" : "generic");
+
+  // Only one modal of each type at a time — replace existing of same type.
+  root.querySelectorAll(`.modal[data-modal-type="${modalType}"]`).forEach((el) => {
+    el.remove();
+  });
+
+  modalLayerSeq += 1;
+  const titleId = `app-modal-title-${modalLayerSeq}`;
+  const bodyHtml = String(html || "").replace(
+    /id="app-modal-title"/g,
+    `id="${titleId}"`
+  );
+
+  const layer = document.createElement("div");
+  layer.className = "modal";
+  layer.dataset.modalType = modalType;
+  layer.setAttribute("aria-hidden", "false");
+  // Build shell first, then inject body via DOM API so nested HTML can't break the card.
+  layer.innerHTML = `
+    <div class="modal-backdrop" data-modal-close></div>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="${titleId}">
+      <button type="button" class="modal-close" data-modal-close aria-label="Закрыть">×</button>
+      <div class="app-modal-body"></div>
+    </div>
+  `;
+
+  const card = layer.querySelector(".modal-card");
+  const body = layer.querySelector(".app-modal-body");
+  if (body) body.innerHTML = bodyHtml;
   if (card) {
     card.classList.toggle("modal-card-wide", !!wide || !!person);
     card.classList.toggle("modal-card-person", !!person);
     card.classList.toggle("modal-card-rating", !!rating);
     card.scrollTop = 0;
   }
-  modal.classList.remove("hidden");
-  modal.setAttribute("aria-hidden", "false");
-  // Reset after layout so reopen never keeps previous scroll.
+  root.appendChild(layer);
+  reindexModalLayers(root);
+
   requestAnimationFrame(() => {
     if (card) card.scrollTop = 0;
     if (body) body.scrollTop = 0;
   });
 }
 
+function personAiNoteFor(profile) {
+  if (!profile) return null;
+  if (profile.ai_note?.text) return profile.ai_note;
+  const bundle = currentSprintReport?.ai_person_notes;
+  const fromBundle = bundle?.notes?.[profile.name];
+  if (fromBundle?.text) return fromBundle;
+  return null;
+}
+
+/** Turn Jira keys in already-escaped HTML/text into issue modal buttons. */
+function linkifyIssueKeysInHtml(html) {
+  return String(html || "").replace(/(<[^>]+>)|([^<]+)/g, (whole, tag, text) => {
+    if (tag || text == null) return whole;
+    return text.replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g, (key) => {
+      const label = escapeHtml(key);
+      return `<button type="button" class="ai-issue-link issue-key-btn" data-issue="${label}" title="Открыть карточку задачи">${label}</button>`;
+    });
+  });
+}
+
+function renderPersonAiNote(profile) {
+  const note = personAiNoteFor(profile);
+  if (!note?.text) return "";
+  const bundle = currentSprintReport?.ai_person_notes || {};
+  const author = bundle.author || corporateAuthorLabel(bundle) || "corporate";
+  const when = bundle.generated_at ? fmtRelativeAgo(bundle.generated_at) : "";
+  const tone = ["attention", "ok", "info"].includes(note.tone) ? note.tone : "ok";
+  const meta = [author, when].filter(Boolean).join(" · ");
+  // Same idea as person-name links in AI brief: only keys the agent mentioned become clickable.
+  const textHtml = linkifyIssueKeysInHtml(escapeHtml(humanizeAiText(note.text)));
+  return `
+    <div class="person-ai-note tone-${escapeHtml(tone)}">
+      <div class="person-ai-note-head">
+        <span class="person-ai-note-label">AI-заметка</span>
+        ${meta ? `<span class="person-ai-note-meta">${escapeHtml(meta)}</span>` : ""}
+      </div>
+      <p class="person-ai-note-text">${textHtml}</p>
+    </div>`;
+}
+
 function openPersonModal(name) {
   const profile = currentSprintReport?.people?.[name];
   if (!profile) {
     openAppModal(
-      `<h2 id="app-modal-title">Сотрудник</h2><p class="muted">Нет данных по «${escapeHtml(name)}» в текущем спринте.</p>`
+      `<h2 id="app-modal-title">Сотрудник</h2><p class="muted">Нет данных по «${escapeHtml(name)}» в текущем спринте.</p>`,
+      { type: "person" }
     );
     return;
   }
@@ -1902,6 +1992,8 @@ function openPersonModal(name) {
     ? `<div class="person-profile-links">${profileLinks}</div>`
     : "";
 
+  const aiNoteHtml = renderPersonAiNote(profile);
+
   openAppModal(
     `
     <div class="person-modal-head">
@@ -1918,6 +2010,7 @@ function openPersonModal(name) {
       <div class="person-stat"><span class="label">${tip("Часы спринта", "Сумма worklog за дни спринта")}</span><span class="value">${fmtDuration(profile.hours_sprint)}</span></div>
       <div class="person-stat"><span class="label">${tip("MR", "Merge request’ы, связанные с задачами сотрудника")}</span><span class="value">${fmtNumber(profile.mr_count)}</span></div>
     </div>
+    ${aiNoteHtml}
     ${loadHtml}
     ${activityHtml}
     <div class="person-modal-section">
@@ -1933,7 +2026,7 @@ function openPersonModal(name) {
       <h3>Активные задачи</h3>
       ${activeTasksHtml}
     </div>`,
-    { person: true }
+    { person: true, type: "person" }
   );
 }
 
@@ -2220,11 +2313,12 @@ function renderPersonActiveTasks(tasks) {
   const blocks = [];
 
   for (const g of withRelease) {
-    const clickable = !!g.release_id;
+    // Clickable if we know id and/or label — openReleaseModal resolves both.
+    const clickable = !!(g.release_id || g.label);
     const title = clickable
       ? `<button type="button" class="person-task-group-release" data-release-id="${escapeHtml(
-          g.release_id
-        )}">${escapeHtml(g.label)}</button>`
+          g.release_id || ""
+        )}" data-release-name="${escapeHtml(g.label || "")}">${escapeHtml(g.label)}</button>`
       : `<span class="person-task-group-release is-static">${escapeHtml(g.label)}</span>`;
     blocks.push(`
       <div class="person-task-group">
@@ -2787,7 +2881,8 @@ function openIssueModal(issueKey) {
   if (!issue) {
     openAppModal(
       `<h2 id="app-modal-title">${escapeHtml(key || "Задача")}</h2>
-       <p class="muted">Нет данных по задаче в текущем отчёте спринта. Откройте её в Jira.</p>`
+       <p class="muted">Нет данных по задаче в текущем отчёте спринта. Откройте её в Jira.</p>`,
+      { type: "issue" }
     );
     return;
   }
@@ -2971,7 +3066,7 @@ function openIssueModal(issueKey) {
     ${commentsHtml}
     ${mrsHtml}
   `,
-    { person: true }
+    { person: true, type: "issue" }
   );
 }
 
@@ -3057,7 +3152,7 @@ function openRatingModal(catId) {
     ${podiumHtml}
     ${list}
   `,
-    { wide: true, rating: true }
+    { wide: true, rating: true, type: "rating" }
   );
 }
 
@@ -3080,7 +3175,7 @@ function openPersonTasksModal(name) {
     <p class="muted">${escapeHtml(profile.direction || "")} · активных ${fmtNumber(profile.tasks_open)} · с рисками ${fmtNumber(profile.risk_count)}</p>
     <div class="person-task-list" style="margin-top:0.85rem">${rows || `<p class="muted">Нет задач</p>`}</div>
   `,
-    { wide: true }
+    { wide: true, type: "person_tasks" }
   );
 }
 
@@ -3155,9 +3250,29 @@ function releaseRiskItemsHtml(release) {
     .join("");
 }
 
-function openReleaseModal(releaseId) {
-  const release = (currentSprintReport?.releases || []).find((r) => String(r.id) === String(releaseId));
-  if (!release) return;
+function findRelease(releaseId, releaseName) {
+  const releases = currentSprintReport?.releases || [];
+  const byId = releases.find((r) => String(r.id) === String(releaseId || ""));
+  if (byId) return byId;
+  const name = String(releaseName || "").trim();
+  if (!name) return null;
+  return releases.find((r) => String(r.name || "").trim() === name) || null;
+}
+
+function openReleaseModal(releaseId, releaseName) {
+  const release = findRelease(releaseId, releaseName);
+  if (!release) {
+    openAppModal(
+      `
+      <div class="release-modal-head">
+        <h2 id="app-modal-title">${escapeHtml(releaseName || "Релиз")}</h2>
+      </div>
+      <p class="muted">Этого релиза нет в текущем снимке спринта — карточка недоступна.</p>
+      `,
+      { wide: true, type: "release" }
+    );
+    return;
+  }
   const jiraBtn = release.web_url
     ? `<a class="jira-open-btn" href="${escapeHtml(release.web_url)}" target="_blank" rel="noreferrer">Открыть в Jira</a>`
     : "";
@@ -3214,7 +3329,7 @@ function openReleaseModal(releaseId) {
     ${release.description ? `<div class="person-modal-section"><h3>Описание</h3><p class="muted">${escapeHtml(release.description)}</p></div>` : ""}
     ${dirBlocks || `<p class="muted">Нет задач команды на версии</p>`}
   `,
-    { wide: true }
+    { wide: true, type: "release" }
   );
 }
 
@@ -3636,20 +3751,21 @@ async function main() {
       openEpicModal(epicRow.getAttribute("data-epic-key"));
       return;
     }
+    const personRelease = event.target.closest("button.person-task-group-release");
+    if (personRelease && !personRelease.classList.contains("is-static")) {
+      event.preventDefault();
+      event.stopPropagation();
+      openReleaseModal(
+        personRelease.getAttribute("data-release-id"),
+        personRelease.getAttribute("data-release-name") || personRelease.textContent
+      );
+      return;
+    }
     const releaseTile = event.target.closest(".issue-release-tile[data-release-id]");
     if (releaseTile) {
       event.preventDefault();
       event.stopPropagation();
       openReleaseModal(releaseTile.getAttribute("data-release-id"));
-      return;
-    }
-    const personRelease = event.target.closest(
-      ".person-task-group-release[data-release-id]"
-    );
-    if (personRelease) {
-      event.preventDefault();
-      event.stopPropagation();
-      openReleaseModal(personRelease.getAttribute("data-release-id"));
       return;
     }
     const releaseCard = event.target.closest(".release-card[data-release-id]");

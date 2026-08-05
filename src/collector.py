@@ -14,6 +14,7 @@ from .jira_client import collect_jira_raw
 from .metrics import compute_report
 from .mock_data import build_mock_raw
 from .ai_brief import attach_ai_brief
+from .ai_person_notes import attach_ai_person_notes
 from .publish import localize_avatars
 from .state import AppState
 from .team_config import load_team_config
@@ -303,6 +304,36 @@ def collect_and_build(
                 "ai_brief",
                 "done",
                 f"AI-оценка пропущена ({brief.get('reason') or 'skipped'})",
+            )
+
+        state.run_step("ai_person_notes", "AI-заметки по сотрудникам…")
+        state.set_status("collecting", "Генерирую AI-заметки по сотрудникам…")
+        report = attach_ai_person_notes(
+            report,
+            previous_report=previous_report if isinstance(previous_report, dict) else None,
+            mock=cfg.mock,
+        )
+        notes = ((report or {}).get("sprint_report") or {}).get("ai_person_notes") or {}
+        notes_status = notes.get("status") or "skipped"
+        if notes_status == "ok":
+            n_count = len(notes.get("notes") or {})
+            state.update_step(
+                "ai_person_notes",
+                "done",
+                f"AI-заметки: {n_count}"
+                + (" (cache)" if notes.get("reason") == "cache" else ""),
+            )
+        elif notes_status == "error":
+            state.update_step(
+                "ai_person_notes",
+                "done",
+                f"AI-заметки недоступны: {str(notes.get('error') or 'error')[:80]}",
+            )
+        else:
+            state.update_step(
+                "ai_person_notes",
+                "done",
+                f"AI-заметки пропущены ({notes.get('reason') or 'skipped'})",
             )
 
         state.run_step("save", "Сохраняю отчёт…")

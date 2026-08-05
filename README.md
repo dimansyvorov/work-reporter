@@ -183,7 +183,7 @@ PUBLISH_NOTIFY_SCRIPT=~/work-reporter-notify/notify-telegram.sh
 
 | Поле | По умолчанию | Зачем |
 |---|---|---|
-| `inactive_days` | `3` | Через сколько дней без updates ставить тег «Неактивная» |
+| `inactive_days` | `5` | Через сколько дней без updates ставить тег «Неактивная» |
 
 #### `metrics`
 
@@ -196,7 +196,7 @@ PUBLISH_NOTIFY_SCRIPT=~/work-reporter-notify/notify-telegram.sh
 | `hours_warn_ratio` | `0.5` | Доля от дневной нормы: ниже = «мало списано» |
 | `risk_sprint_time_pct` | `70` | После какого % спринта задачи попадают в «риск срыва» |
 | `risk_days_left` | `3` | Или если до конца спринта осталось ≤ N дней |
-| `stale_days` | `3` | Порог блока «застрявшие» |
+| `stale_days` | `5` | Порог блока «застрявшие» |
 | `epic_bar_min_pct` | `28` | Мин. ширина полосы эпика |
 | `epic_section_min_pct` | `14` | Мин. ширина секции направления в эпике |
 | `risks_limit` | `40` | Сколько рисков отдавать в API |

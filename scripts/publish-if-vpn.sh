@@ -52,6 +52,13 @@ set -a
 source "$ROOT/.env"
 set +a
 
+# PUBLISH_NOTIFY_SCRIPT runs via ssh ON THE SERVER. Bash `source .env` expands
+# ~/… to this Mac's $HOME, which then fails remotely. Put the tilde back.
+if [[ -n "${PUBLISH_NOTIFY_SCRIPT:-}" && "${PUBLISH_NOTIFY_SCRIPT}" == "$HOME"/* ]]; then
+  PUBLISH_NOTIFY_SCRIPT="~${PUBLISH_NOTIFY_SCRIPT#"$HOME"}"
+  export PUBLISH_NOTIFY_SCRIPT
+fi
+
 JIRA_URL="${JIRA_URL:-}"
 if [[ -z "$JIRA_URL" ]]; then
   log "skip: JIRA_URL empty"

@@ -125,16 +125,29 @@ def _publish_mode_label() -> str:
     return "Вручную"
 
 
+def _remote_notify_script(raw: str | None) -> str:
+    """
+    Normalize notify script path for execution on the publish SSH host.
+
+    LaunchAgent sources .env with bash, which expands ~/… to the Mac home.
+    The script must run on the server, so rewrite local $HOME prefixes back to ~/.
+    """
+    script = (raw or "~/work-reporter-notify/notify-telegram.sh").strip()
+    if not script:
+        return ""
+    home = str(Path.home())
+    if script == home or script.startswith(home + "/"):
+        script = "~" + script[len(home) :]
+    return script
+
+
 def _notify_remote(status: str, text: str) -> None:
     """
     Ask the home server to call Telegram API.
     Secrets and network access to Telegram live only on the server.
     """
     ssh_host = (os.getenv("PUBLISH_SSH") or "server").strip()
-    script = (
-        os.getenv("PUBLISH_NOTIFY_SCRIPT")
-        or "~/work-reporter-notify/notify-telegram.sh"
-    ).strip()
+    script = _remote_notify_script(os.getenv("PUBLISH_NOTIFY_SCRIPT"))
     if not script:
         return
     # Preserve newlines; remote script takes status + one message argument.
@@ -143,11 +156,19 @@ def _notify_remote(status: str, text: str) -> None:
         clean = clean[:897] + "…"
     remote = f"{script} {shlex.quote(status)} {shlex.quote(clean)}"
     try:
-        subprocess.run(
+        completed = subprocess.run(
             ["ssh", ssh_host, f"bash -lc {shlex.quote(remote)}"],
             check=False,
             timeout=60,
+            capture_output=True,
+            text=True,
         )
+        if completed.returncode != 0:
+            err = (completed.stderr or completed.stdout or "").strip()
+            print(
+                f"  ! telegram notify failed (exit {completed.returncode})"
+                + (f": {err}" if err else "")
+            )
     except Exception as exc:  # noqa: BLE001 - notify must not break publish
         print(f"  ! telegram notify failed: {exc}")
 

@@ -378,10 +378,13 @@ def _build_person_load(
     sprint: dict,
     expected_hours: float,
     today: date,
+    hours_sprint: float = 0.0,
 ) -> dict:
     """
-    Forward-looking load: remaining active plate vs capacity to sprint end.
-    load_pct = remaining_hours / (workdays_left × expected_hours) × 100
+    Forward-looking load: remaining active plate vs leftover personal sprint budget.
+
+    load_pct = remaining_hours / max(0, total_sprint_capacity − hours_sprint) × 100
+    where total_sprint_capacity = workdays(start, end) × expected_hours.
 
     Hybrid: active tasks with Jira remaining ≤ 0 still count via fallback
     (fixed hours and/or share of original estimate).
@@ -389,6 +392,8 @@ def _build_person_load(
     m = get_team_config().metrics
     fallback_hours = float(m.load_fallback_hours)
     fallback_ratio = float(m.load_fallback_estimate_ratio)
+    expected = float(expected_hours or 8.0)
+    logged = max(float(hours_sprint or 0.0), 0.0)
 
     remain = 0.0
     with_remaining = 0
@@ -409,11 +414,18 @@ def _build_person_load(
             if est is None or float(est or 0) <= 0:
                 without_estimate += 1
 
+    start_d = (
+        date.fromisoformat(sprint["start_date"]) if sprint.get("start_date") else None
+    )
     end_d = (
         date.fromisoformat(sprint["end_date"]) if sprint.get("end_date") else None
     )
     days_left = _working_days_between(today, end_d) if end_d else 0
-    capacity = days_left * float(expected_hours or 8.0)
+    sprint_workdays = (
+        _working_days_between(start_d, end_d) if start_d and end_d else 0
+    )
+    total_capacity = sprint_workdays * expected
+    capacity = max(0.0, total_capacity - logged)
     load_pct = None
     if capacity > 0:
         load_pct = _round((remain / capacity) * 100.0, 0)
@@ -432,8 +444,11 @@ def _build_person_load(
     return {
         "remaining_hours": _round(remain, 1) or 0.0,
         "capacity_hours": _round(capacity, 1) or 0.0,
+        "total_capacity_hours": _round(total_capacity, 1) or 0.0,
+        "hours_sprint": _round(logged, 1) or 0.0,
         "days_left": days_left,
-        "expected_hours_per_day": float(expected_hours or 8.0),
+        "sprint_workdays": sprint_workdays,
+        "expected_hours_per_day": expected,
         "load_pct": load_pct,
         "level": level,
         "active_tasks": len(active_tasks),
@@ -1718,6 +1733,7 @@ def _build_people_profiles(
             sprint=sprint,
             expected_hours=expected_hours,
             today=report_today(),
+            hours_sprint=float(base.get("hours_sprint") or 0.0),
         )
         m = team_cfg.metrics
         profiles[name] = {
@@ -2872,7 +2888,7 @@ def _compute_team_mood(
                 "title": "Много неактивных задач",
                 "summary": (
                     f"{stale_n} задач без обновлений "
-                    f"≥ {risks.get('stale_days') or 3} дн."
+                    f"≥ {risks.get('stale_days') or 5} дн."
                 ),
                 "severity": "warn" if (stale_n / denom) < 0.4 else "danger",
                 "impact": _round(min(22.0, stale_n * 1.6 * urgency), 1) or 0.0,

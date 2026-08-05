@@ -19,7 +19,7 @@ _EVENT_PRIORITY = {
     "progress": 40,
 }
 
-_MAX_EVENTS = 8
+_MAX_EVENTS = 20
 
 _REVIEW_STATUS_MARKERS = (
     "in review",

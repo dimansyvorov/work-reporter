@@ -2007,7 +2007,7 @@ function renderPersonLoad(load) {
     days === 1 ? "раб. день" : days >= 2 && days <= 4 ? "раб. дня" : "раб. дн.";
   const detail = [
     `осталось ${fmtDuration(load.remaining_hours)}`,
-    `ёмкость ${fmtDuration(load.capacity_hours)}`,
+    `ёмкость ${fmtDuration(load.capacity_hours)} (бюджет спринта − списано)`,
     days ? `${fmtNumber(days)} ${dayWord}` : null,
   ]
     .filter(Boolean)
@@ -2062,7 +2062,7 @@ function renderPersonLoad(load) {
     );
   }
   const tipText =
-    "Оставшаяся оценка active-задач / (рабочие дни до конца спринта × норма в день). Если remaining в Jira = 0 (часто после разработки на QA), берём max(фикс. часы, доля Original Estimate).";
+    "Оставшаяся оценка active-задач / (бюджет спринта − уже списанные часы). Бюджет = рабочие дни спринта × норма в день. Если remaining в Jira = 0 (часто после разработки на QA), берём max(фикс. часы, доля Original Estimate).";
   return `
     <div class="person-load level-${escapeHtml(level)}">
       <div class="person-load-head">
@@ -3222,7 +3222,7 @@ function renderRisks(risks) {
       "Критичных задач не видно"
     ),
     block(
-      `Застрявшие (нет обновлений ≥ ${fmtNumber(risks.stale_days ?? currentSprintReport?.settings?.metrics?.stale_days ?? 3)} дн.)`,
+      `Застрявшие (нет обновлений ≥ ${fmtNumber(risks.stale_days ?? currentSprintReport?.settings?.metrics?.stale_days ?? 5)} дн.)`,
       risks.stale,
       "Нет застрявших задач"
     ),

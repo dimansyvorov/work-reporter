@@ -86,7 +86,7 @@ class MetricsSettings:
     hours_warn_ratio: float = 0.5
     risk_sprint_time_pct: float = 70.0
     risk_days_left: int = 3
-    stale_days: int = 3
+    stale_days: int = 5
     epic_bar_min_pct: float = 28.0
     epic_section_min_pct: float = 14.0
     risks_limit: int = 40
@@ -161,7 +161,7 @@ class TeamConfig:
     status_rules: dict[str, StatusRules] = field(default_factory=dict)  # by key + default
     # Ordered workflow statuses for UI (forward / rollback detection)
     status_flow: list[str] = field(default_factory=list)
-    inactive_days: int = 3
+    inactive_days: int = 5
     # alias (gitlab/jira nickname) -> canonical roster name
     aliases: dict[str, str] = field(default_factory=dict)
     metrics: MetricsSettings = field(default_factory=MetricsSettings)
@@ -708,9 +708,9 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
 
     tag_cfg = data.get("task_tags") or {}
     try:
-        inactive_days = int(tag_cfg.get("inactive_days") or 3)
+        inactive_days = int(tag_cfg.get("inactive_days") or 5)
     except (TypeError, ValueError):
-        inactive_days = 3
+        inactive_days = 5
     inactive_days = max(1, inactive_days)
 
     status_rules: dict[str, StatusRules] = {}

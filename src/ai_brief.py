@@ -12,8 +12,9 @@ from typing import Any
 from dotenv import load_dotenv
 
 from .config import ROOT
+from .team_config import get_team_config
 
-PROMPT_VERSION = "sprint-brief-v3"
+PROMPT_VERSION = "sprint-brief-v6"
 
 SYSTEM_PROMPT = """Ты — аналитик спринтовой разработки. Тебе дают только JSON-снимок спринта (уже агрегированные метрики команды).
 
@@ -23,7 +24,7 @@ SYSTEM_PROMPT = """Ты — аналитик спринтовой разрабо
 1. Опирайся только на факты из JSON. Не выдумывай задачи, людей, релизы, проценты и причины, которых нет в данных.
 2. Если данных мало — так и скажи, не достраивай картину.
 3. Сравнивай прогресс задач с календарным прохождением спринта.
-4. Приоритет рисков: релизы at_risk/overdue → перегруз людей → отстающие направления → stale/no_estimate.
+4. Приоритет рисков: релизы at_risk/overdue → перегруз людей → отстающие направления → stale/no_estimate/no_release.
 5. Отдельно оцени достижимость цели спринта (goal.text) по связанным релизам из goal.releases.
 6. Если цель сформулирована как релиз — вердикт по цели важнее общего % задач спринта.
 7. Различай срочные и несрочные задачи в нагрузке человека:
@@ -42,9 +43,14 @@ SYSTEM_PROMPT = """Ты — аналитик спринтовой разрабо
     active_tasks, carryover_share, on_goal_release и т.п.).
     Пиши по-русски: «выполнение задач», «прохождение спринта», «прогресс релиза», «нагрузка»,
     «риск срыва», «в графике», «неактивные задачи», «активные задачи»,
-    «перенос из прошлых спринтов», «задачи цели/релиза».
+    «перенос из прошлых спринтов», «задачи цели/релиза», «задачи без релиза».
     Статусы риска переводи: at_risk → «риск срыва», on_track → «в графике», overdue → «просрочен».
-12. Имена людей пиши в короткой форме «Фамилия И.О.» (как в данных short), чтобы их было легко найти.
+    no_release → «задачи без релиза» (нет Fix Version).
+12. Имена людей — только короткая форма «Имя Ф.» как в данных short («Роман Щ.», «Наталья Ш.»).
+13. Задачу/эпик упоминай ТОЛЬКО ключом в бэктиках (`SPRINT-11708`).
+    UI сам подставит название и сделает ссылку.
+    ЗАПРЕЩЕНО писать название после ключа, в скобках или повторять summary.
+    НЕ выделяй ключи задач жирным (`**…**`).
 
 Формат ответа строго такой:
 
@@ -80,6 +86,7 @@ USER_PROMPT_PREFIX = """Проанализируй спринт по JSON-сни
 - цель спринта и связанные релизы;
 - релизы в зоне риска;
 - факторы настроения команды;
+- задачи без релиза (risk_counts.no_release) — если их много, это сигнал;
 - перегруз/недогруз людей с учётом срочных задач vs переноса из прошлых спринтов;
 - кого из лидов (leads) стоит адресовать в рекомендациях;
 - отстающие направления.
@@ -88,6 +95,7 @@ USER_PROMPT_PREFIX = """Проанализируй спринт по JSON-сни
 Если цель — релиз, сначала оцени готовность этих релизов, затем общий ход спринта.
 В тексте ответа не используй имена полей JSON — только понятный русский.
 Тон рекомендаций — мягкий и уважительный, без приказов.
+Ключи задач — только в бэктиках без названий рядом; люди — «Имя Ф.» («Роман Щ.»).
 
 JSON:
 """
@@ -147,6 +155,7 @@ def _release_row(rel: dict) -> dict:
 
 
 def _short_person_name(name: str | None) -> str | None:
+    """«Роман Щ.» from «Щукин Роман …» (given name + surname initial)."""
     if not name:
         return None
     parts = str(name).strip().split()
@@ -154,9 +163,7 @@ def _short_person_name(name: str | None) -> str | None:
         return None
     if len(parts) == 1:
         return parts[0]
-    if len(parts) == 2:
-        return f"{parts[0]} {parts[1][0]}."
-    return f"{parts[0]} {parts[1][0]}.{parts[2][0]}."
+    return f"{parts[1]} {parts[0][0]}."
 
 
 def _tag_ids(task: dict) -> set[str]:
@@ -175,6 +182,25 @@ def _release_labels(task: dict) -> list[str]:
             if label:
                 labels.append(label)
     return labels
+
+
+def _is_hidden_task(task: dict | None, issues: dict | None = None) -> bool:
+    """True for auxiliary tasks matching display_task_filters — skip in AI snapshots."""
+    if not isinstance(task, dict):
+        return False
+    if task.get("hidden_from_display"):
+        return True
+    summary = task.get("summary")
+    key = str(task.get("key") or "").strip().upper()
+    if issues and key:
+        dossier = issues.get(key)
+        if isinstance(dossier, dict):
+            if dossier.get("hidden_from_display"):
+                return True
+            summary = summary or dossier.get("summary")
+    return get_team_config().is_hidden_from_display(
+        str(summary) if summary is not None else None
+    )
 
 
 def _task_sample(task: dict, *, urgency: str) -> dict:
@@ -198,16 +224,24 @@ def _person_task_pressure(profile: dict | None, goal_token: str | None) -> dict 
     """Summarize urgent vs carryover pressure for one person."""
     if not isinstance(profile, dict):
         return None
-    active = list(profile.get("tasks_active") or [])
+    raw_active = [
+        t for t in (profile.get("tasks_active") or []) if isinstance(t, dict)
+    ]
+    active = [t for t in raw_active if not _is_hidden_task(t)]
     if not active:
         load = profile.get("load") or {}
+        # Only-auxiliary backlog must not inflate AI pressure via load counters.
+        only_hidden = bool(raw_active)
         return {
-            "active_tasks": int(load.get("active_tasks") or 0),
+            "active_tasks": 0 if only_hidden else int(load.get("active_tasks") or 0),
             "carryover_tasks": 0,
             "carryover_not_goal": 0,
             "urgent_tasks": 0,
             "on_goal_release": 0,
-            "with_remaining": int(load.get("tasks_with_remaining") or 0),
+            "no_release_tasks": 0,
+            "with_remaining": 0
+            if only_hidden
+            else int(load.get("tasks_with_remaining") or 0),
             "carryover_share": 0.0,
             "note": None,
             "urgent_samples": [],
@@ -219,6 +253,7 @@ def _person_task_pressure(profile: dict | None, goal_token: str | None) -> dict 
     urgent = 0
     on_goal = 0
     with_remaining = 0
+    no_release = 0
     urgent_samples: list[dict] = []
     carryover_samples: list[dict] = []
 
@@ -233,6 +268,8 @@ def _person_task_pressure(profile: dict | None, goal_token: str | None) -> dict 
             rem = 0.0
         if rem > 0:
             with_remaining += 1
+        if "no_release" in tags or not releases:
+            no_release += 1
         # Do NOT treat issue.risk as urgency: delay/carryover tasks are often risk=true.
         is_urgent = bool(is_goal or rem > 0)
         if is_carryover:
@@ -261,6 +298,11 @@ def _person_task_pressure(profile: dict | None, goal_token: str | None) -> dict 
         note = (
             "Часть нагрузки — хвост прошлых спринтов; задачи цели/ближайшего релиза — меньшая доля."
         )
+    elif no_release and no_release >= max(2, total // 2):
+        note = (
+            "Заметная доля активных задач без Fix Version (метка «Без релиза») — "
+            "сложнее связать работу с целью и релизами."
+        )
 
     return {
         "active_tasks": total,
@@ -268,6 +310,7 @@ def _person_task_pressure(profile: dict | None, goal_token: str | None) -> dict 
         "carryover_not_goal": carryover_not_goal,
         "urgent_tasks": urgent,
         "on_goal_release": on_goal,
+        "no_release_tasks": no_release,
         "with_remaining": with_remaining,
         "carryover_share": share,
         "note": note,
@@ -353,6 +396,7 @@ def build_ai_snapshot(sprint_report: dict) -> dict:
                 "carryover_not_goal": pressure["carryover_not_goal"],
                 "urgent_tasks": pressure["urgent_tasks"],
                 "on_goal_release": pressure["on_goal_release"],
+                "no_release_tasks": pressure["no_release_tasks"],
                 "with_remaining": pressure["with_remaining"],
                 "carryover_share": pressure["carryover_share"],
                 "note": pressure["note"],
@@ -456,11 +500,13 @@ def build_ai_snapshot(sprint_report: dict) -> dict:
             "stale": len(risks.get("stale") or []),
             "no_worklogs": len(risks.get("no_worklogs") or []),
             "no_estimate": len(risks.get("no_estimate") or []),
+            "no_release": len(risks.get("no_release") or []),
             "stale_days": risks.get("stale_days"),
         },
         "risk_examples": {
             "stale": _keys(risks.get("stale")),
             "no_estimate": _keys(risks.get("no_estimate")),
+            "no_release": _keys(risks.get("no_release")),
             "at_risk": _keys(risks.get("at_risk")),
         },
         "leads": leads,
@@ -472,6 +518,7 @@ def build_ai_snapshot(sprint_report: dict) -> dict:
                 "carryover_not_goal": "перенос, не привязанный к релизам текущей цели",
                 "urgent_tasks": "задачи цели/ближайшего релиза или с оставшимися часами",
                 "on_goal_release": "задачи, привязанные к релизам цели спринта",
+                "no_release_tasks": "активные задачи без Fix Version (метка «Без релиза»)",
             },
         },
     }
@@ -495,6 +542,17 @@ def humanize_ai_text(text: str | None) -> str:
         (r"`?on_track`?", "в графике"),
         (r"`?overdue`?", "просрочен"),
         (r"\brisky_releases\b", "релизы в зоне риска"),
+        (r"\bno_release\b", "задачи без релиза"),
+        (r"\bno_estimate\b", "задачи без оценки"),
+        # People are not "resources"
+        (r"\bчеловеческ(?:ие|их|ими)?\s+ресурсы?\b", "сотрудники"),
+        (r"\bресурсы\s+команды\b", "сотрудники команды"),
+        (r"\bнехватка\s+ресурсов\b", "нехватка людей"),
+        (r"\bнехватк[аиуеой]*\s+ресурса\b", "нехватка людей"),
+        (r"\bсвободн(?:ый|ые|ых|ого)\s+ресурсы?\b", "свободные сотрудники"),
+        (r"\bперегруз(?:ка|ке|ки)?\s+ресурсов\b", "перегруз сотрудников"),
+        (r"(?<![А-Яа-яA-Za-z])ресурсы(?![А-Яа-яA-Za-z])", "сотрудники"),
+        (r"(?<![А-Яа-яA-Za-z])ресурс(?![А-Яа-яA-Za-z])", "сотрудник"),
     )
     for pattern, repl in replacements:
         out = re.sub(pattern, repl, out, flags=re.I)

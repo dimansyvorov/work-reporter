@@ -411,19 +411,37 @@ function statusChip(status, category) {
 
 function issueLink(issue) {
   if (!issue?.key) return "—";
-  const label = escapeHtml(issue.key);
+  const key = String(issue.key).trim().toUpperCase();
+  const label = escapeHtml(key);
   const epicCls = issue.is_epic ? " issue-key-epic" : "";
-  return `<button type="button" class="issue-key issue-key-btn${epicCls}" data-issue="${label}" title="Открыть карточку задачи">${label}</button>`;
+  const jiraUrl =
+    issue.web_url ||
+    jiraBrowseUrlForKey(key) ||
+    "";
+  const jiraAttr = jiraUrl ? ` data-jira-url="${escapeHtml(jiraUrl)}"` : "";
+  const known = !!currentSprintReport?.issues?.[key];
+  const title = known
+    ? "Открыть карточку задачи"
+    : jiraUrl
+      ? "Открыть задачу в Jira"
+      : "Открыть карточку задачи";
+  return `<button type="button" class="issue-key issue-key-btn${epicCls}" data-issue="${label}"${jiraAttr} title="${title}">${label}</button>`;
 }
 
-function tagsHtml(tags) {
+function tagsHtml(tags, { clickableReleases = false } = {}) {
   if (!tags?.length) return "";
   return tags
     .map((t) => {
       const hint = t.hint ? escapeHtml(t.hint) : "";
       const tipCls = hint ? " has-tip" : "";
       const tipAttr = hint ? ` tabindex="0" data-tip="${hint}"` : "";
-      return `<span class="task-tag${tipCls} tag-${escapeHtml(t.tone || "muted")}"${tipAttr}>${escapeHtml(t.label)}</span>`;
+      const label = escapeHtml(t.label || "");
+      if (clickableReleases && t.id === "release") {
+        const rid = t.release_id != null ? String(t.release_id) : "";
+        const rname = t.label || "";
+        return `<button type="button" class="task-tag tag-release release-tag-btn${tipCls}" data-release-id="${escapeHtml(rid)}" data-release-name="${escapeHtml(rname)}"${tipAttr} title="Открыть релиз">${label}</button>`;
+      }
+      return `<span class="task-tag${tipCls} tag-${escapeHtml(t.tone || "muted")}"${tipAttr}>${label}</span>`;
     })
     .join("");
 }
@@ -720,21 +738,59 @@ async function waitForReport() {
 function openTeamMoodModal(mood) {
   if (!mood) return;
   const comps = mood.components || {};
-  const compLabels = {
-    schedule: "План vs факт",
-    completion: "Закрытие задач",
-    task_risks: "Риски задач",
-    releases: "Релизы",
-    epics_in_sprint: "Эпики (спринт)",
+  const meta = mood.components_meta || {};
+  const weights = mood.weights || {
+    schedule: 28,
+    completion: null,
+    task_risks: 24,
+    releases: 20,
+    epics_in_sprint: 10,
   };
-  const componentsHtml = Object.entries(compLabels)
-    .map(
-      ([key, label]) => `
-      <div class="mood-component">
+  const defaults = {
+    schedule: {
+      label: "Соблюдение плана",
+      hint: "Насколько % закрытых задач не отстаёт от % прошедшего времени спринта. 100 — идём в ногу или опережаем; ниже — отстаём.",
+    },
+    completion: {
+      label: "Темп закрытия",
+      hint: "Насколько фактическое закрытие задач соответствует ожидаемому к текущему моменту спринта. Не «сколько всего закрыли», а «успеваем ли по календарю».",
+    },
+    task_risks: {
+      label: "Здоровье задач",
+      hint: "Штраф за доли открытых задач с рисками: угроза срока, неактивность, без списаний, без оценки, без релиза. 100 — таких почти нет.",
+    },
+    releases: {
+      label: "Готовность релизов",
+      hint: "Доля активных релизов без риска срыва/просрочки минус среднее отставание прогресса. Это не «% выпущенных релизов».",
+    },
+    epics_in_sprint: {
+      label: "Эпики в спринте",
+      hint: "Средний прогресс эпиков с задачами текущего спринта с учётом доли рисковых задач в них.",
+    },
+  };
+  const order = ["schedule", "completion", "task_risks", "releases", "epics_in_sprint"];
+  const componentsHtml = order
+    .map((key) => {
+      const info = meta[key] || defaults[key] || {};
+      const label = info.label || key;
+      const hint = info.hint || "";
+      const w =
+        info.weight_pct != null
+          ? info.weight_pct
+          : weights[key] != null
+            ? weights[key]
+            : null;
+      const wHtml =
+        w != null
+          ? `<span class="mood-comp-weight">вес ${fmtNumber(w)}%</span>`
+          : "";
+      return `
+      <div class="mood-component has-tip" tabindex="0" data-tip="${escapeHtml(hint)}">
         <span class="label">${escapeHtml(label)}</span>
-        <strong>${fmtNumber(comps[key])}%</strong>
-      </div>`
-    )
+        <strong>${fmtNumber(comps[key])} <span class="mood-comp-unit">/ 100</span></strong>
+        ${wHtml}
+      </div>`;
+    })
     .join("");
   const drivers = mood.drivers || [];
   const driversHtml = drivers.length
@@ -744,27 +800,38 @@ function openTeamMoodModal(mood) {
         <div class="mood-driver severity-${escapeHtml(d.severity || "warn")}">
           <p class="mood-driver-title">${escapeHtml(d.title || "Фактор")}</p>
           <p class="mood-driver-summary">${escapeHtml(d.summary || "")}</p>
-          <p class="muted" style="margin:0.35rem 0 0">вклад −${fmtNumber(d.impact)} п.п.</p>
+          <p class="muted" style="margin:0.35rem 0 0">оценка влияния −${fmtNumber(d.impact)} п.п. к итогу</p>
         </div>`
         )
         .join("")
-    : `<p class="muted">Явных негативных факторов нет — настроение опирается на выполнение плана и отсутствие рисков.</p>`;
+    : `<p class="muted">Явных негативных факторов нет — итог опирается на взвешенные компоненты выше.</p>`;
   const ctx = mood.context || {};
+  const formula =
+    mood.formula_hint ||
+    "Итог = взвешенное среднее пяти оценок (каждая 0…100). Вес «Темпа закрытия» растёт к концу спринта. В начале спринта высокий балл слегка приглушается, чтобы отсутствие рисков не выглядело как победа.";
   openAppModal(
     `
     <div class="release-modal-head">
-      <h2 id="app-modal-title">${escapeHtml(mood.emoji || "")} Настроение команды · ${fmtNumber(mood.score)}%</h2>
+      <h2 id="app-modal-title">${escapeHtml(mood.emoji || "")} Настроение команды · ${fmtNumber(mood.score)}</h2>
       <p class="muted">${escapeHtml(mood.recommendation || "")}</p>
     </div>
-    <p class="muted" style="margin:0.75rem 0 0">
-      Спринт: закрыто ${fmtNumber(ctx.tasks_done)}/${fmtNumber(ctx.tasks_total)} ·
-      время ${fmtNumber(ctx.time_progress_pct)}% ·
+    <p class="mood-score-legend muted">
+      Итоговый балл <strong>${fmtNumber(mood.score)}</strong> из 100 — индекс здоровья спринта, не процент выпущенных релизов и не % закрытых задач.
+    </p>
+    <p class="muted" style="margin:0.55rem 0 0">
+      Контекст: закрыто ${fmtNumber(ctx.tasks_done)}/${fmtNumber(ctx.tasks_total)} задач ·
+      прошло ${fmtNumber(ctx.time_progress_pct)}% времени спринта ·
       активных релизов ${fmtNumber(ctx.active_releases)} ·
       эпиков в скоупе ${fmtNumber(ctx.epics_in_scope)}
     </p>
-    <div class="mood-components">${componentsHtml}</div>
     <div class="person-modal-section">
-      <h3>Что повлияло на расчёт</h3>
+      <h3>Из чего складывается балл</h3>
+      <p class="muted mood-formula-hint">${escapeHtml(formula)}</p>
+      <div class="mood-components">${componentsHtml}</div>
+      <p class="muted" style="margin:0.65rem 0 0;font-size:0.82rem">Наведите на карточку — короткое пояснение расчёта.</p>
+    </div>
+    <div class="person-modal-section">
+      <h3>Что сильнее всего тянет вниз</h3>
       <div class="mood-modal-drivers">${driversHtml}</div>
     </div>
   `,
@@ -833,20 +900,204 @@ function extractAiVerdict(markdown) {
   return verdict || null;
 }
 
+function isKnownEpicKey(key) {
+  const label = String(key || "").trim().toUpperCase();
+  if (!label) return false;
+  const epics = currentSprintReport?.epic_timeline?.epics || [];
+  if (epics.some((e) => String(e?.key || "").toUpperCase() === label)) return true;
+  const issue = currentSprintReport?.issues?.[label];
+  return !!(issue && (issue.is_epic || issue.issue_type === "Epic"));
+}
+
+function shortTaskLabel(summary, words = 3) {
+  let text = String(summary || "").trim();
+  if (!text) return "";
+  text = text.replace(/^\[[^\]]+\]\s*/g, "").trim();
+  const parts = text.split(/\s+/).filter(Boolean);
+  if (!parts.length) return "";
+  return parts.slice(0, words).join(" ");
+}
+
+function aiTaskTitle(summary, maxLen = 72) {
+  let text = String(summary || "").trim();
+  if (!text) return "";
+  text = text.replace(/^\[[^\]]+\]\s*/g, "").trim();
+  if (text.length <= maxLen) return text;
+  return `${text.slice(0, maxLen - 1).trim()}…`;
+}
+
+function lookupIssueSummary(key) {
+  const k = String(key || "").trim().toUpperCase();
+  if (!k) return null;
+  const issue = currentSprintReport?.issues?.[k];
+  if (issue?.summary) return issue.summary;
+  for (const rel of currentSprintReport?.releases || []) {
+    for (const t of rel?.tasks || []) {
+      if (String(t?.key || "").toUpperCase() === k && t?.summary) return t.summary;
+    }
+    for (const s of rel?.sections || []) {
+      for (const t of s?.tasks_detail || []) {
+        if (String(t?.key || "").toUpperCase() === k && t?.summary) return t.summary;
+      }
+    }
+  }
+  for (const epic of currentSprintReport?.epic_timeline?.epics || []) {
+    if (String(epic?.key || "").toUpperCase() === k && epic?.summary) return epic.summary;
+    for (const s of epic?.sections || []) {
+      for (const t of s?.tasks_detail || []) {
+        if (String(t?.key || "").toUpperCase() === k && t?.summary) return t.summary;
+      }
+    }
+  }
+  return null;
+}
+
+function stripRedundantIssueTitleParens(text) {
+  // Model often repeats titles: KEY (title) (title) — UI adds the title inside the link.
+  let out = String(text || "").replace(
+    /(`?[A-Z][A-Z0-9]+-\d+`?)(?:\s*\([^)]{1,120}\))+/g,
+    "$1"
+  );
+  // Also drop bold wrappers around bare/backticked keys: **`SPRINT-1`** / **SPRINT-1**
+  out = out.replace(
+    /\*\*\s*(`?[A-Z][A-Z0-9]+-\d+`?)\s*\*\*/gi,
+    "$1"
+  );
+  out = out.replace(
+    /__\s*(`?[A-Z][A-Z0-9]+-\d+`?)\s*__/gi,
+    "$1"
+  );
+  return out;
+}
+
+function issueTitleVariants(summary) {
+  const raw = String(summary || "").trim();
+  if (!raw) return [];
+  const noBracket = raw.replace(/^\[[^\]]+\]\s*/g, "").trim();
+  const clipped = aiTaskTitle(raw);
+  return [...new Set([clipped, noBracket, raw].filter((t) => t && t.length >= 4))];
+}
+
+/** Word-by-word title prefix match; returns chars consumed (0 if no match). */
+function matchAiTitlePrefix(text, title) {
+  const words = String(title || "")
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!words.length) return 0;
+  let i = 0;
+  const src = String(text || "");
+  while (i < src.length && /\s/.test(src[i])) i += 1;
+  if (i >= src.length) return 0;
+  // optional wrapping parens around the whole title
+  const openParen = src[i] === "(";
+  if (openParen) {
+    i += 1;
+    while (i < src.length && /\s/.test(src[i])) i += 1;
+  }
+  for (const word of words) {
+    while (i < src.length && /\s/.test(src[i])) i += 1;
+    const chunk = src.slice(i, i + word.length);
+    if (chunk.toLowerCase() !== word.toLowerCase()) return 0;
+    i += word.length;
+  }
+  if (openParen) {
+    while (i < src.length && /\s/.test(src[i])) i += 1;
+    if (src[i] === ")") i += 1;
+    else return 0;
+  }
+  return i;
+}
+
+function consumeDuplicateIssueTitles(after, summary) {
+  let rest = String(after || "");
+  if (!summary) {
+    return rest.replace(/^(?:\s*\([^)]{1,120}\))+/, "");
+  }
+  const titles = issueTitleVariants(summary);
+  for (let round = 0; round < 4; round += 1) {
+    let consumed = 0;
+    for (const title of titles) {
+      consumed = matchAiTitlePrefix(rest, title);
+      if (consumed > 0) break;
+    }
+    if (consumed <= 0) break;
+    rest = rest.slice(consumed);
+  }
+  return rest;
+}
+
+function stripIssueTitlesFromAiText(text) {
+  // Remove model-written titles after keys before UI injects its own title.
+  const src = String(text || "");
+  let out = "";
+  let last = 0;
+  const re = /`?([A-Z][A-Z0-9]+-\d+)`?/gi;
+  let m;
+  while ((m = re.exec(src))) {
+    out += src.slice(last, m.index);
+    out += m[0];
+    const summary = lookupIssueSummary(m[1]);
+    const rest = src.slice(m.index + m[0].length);
+    const kept = consumeDuplicateIssueTitles(rest, summary);
+    const consumed = rest.length - kept.length;
+    last = m.index + m[0].length + consumed;
+    re.lastIndex = last;
+  }
+  out += src.slice(last);
+  return out;
+}
+
+function stripDuplicateIssueTitlesAfterButtons(html) {
+  // Safety net if a title still follows the rendered issue link.
+  return String(html || "").replace(
+    /(<button\b[^>]*\b(?:data-issue|data-epic)="([^"]+)"[^>]*>[\s\S]*?<\/button>)([^<]*)/gi,
+    (whole, button, key, after) => {
+      if (!after || !after.trim()) return button;
+      return button + consumeDuplicateIssueTitles(after, lookupIssueSummary(key));
+    }
+  );
+}
+
+function issueKeyButtonHtml(key) {
+  const raw = String(key || "").trim().toUpperCase();
+  if (!raw) return "";
+  const keyHtml = `<span class="ai-issue-key">${escapeHtml(raw)}</span>`;
+  const title = aiTaskTitle(lookupIssueSummary(raw));
+  const titleHtml = title
+    ? `<span class="ai-issue-sep"> | </span><span class="ai-issue-title">${escapeHtml(title)}</span>`
+    : "";
+  const label = `${keyHtml}${titleHtml}`;
+  if (isKnownEpicKey(raw)) {
+    return `<button type="button" class="ai-issue-link issue-key-btn issue-key-epic" data-epic="${escapeHtml(raw)}" title="Открыть эпик">${label}</button>`;
+  }
+  const known = !!currentSprintReport?.issues?.[raw];
+  const jiraUrl = jiraBrowseUrlForKey(raw);
+  const jiraAttr = jiraUrl ? ` data-jira-url="${escapeHtml(jiraUrl)}"` : "";
+  const tip = known ? "Открыть карточку задачи" : "Открыть задачу в Jira";
+  return `<button type="button" class="ai-issue-link issue-key-btn" data-issue="${escapeHtml(raw)}"${jiraAttr} title="${tip}">${label}</button>`;
+}
+
 function formatAiInlineMarkdown(text) {
+  const cleaned = stripIssueTitlesFromAiText(stripRedundantIssueTitleParens(text));
   // Escape first, then restore a small safe subset of markdown emphasis.
-  let html = escapeHtml(String(text || ""));
+  let html = escapeHtml(cleaned);
   // Bold: **text** or __text__
   html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
   html = html.replace(/__(.+?)__/g, "<strong>$1</strong>");
   // Italic: *text* or _text_ (avoid matching inside words like snake_case)
   html = html.replace(/(^|[\s(])\*(?!\s)(.+?)(?!\s)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>");
   html = html.replace(/(^|[\s(])_(?!\s)(.+?)(?!\s)_(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>");
-  // Inline code: `code`
-  html = html.replace(/`([^`]+)`/g, '<code class="ai-brief-code">$1</code>');
-  // Issue keys → open task modal (same mention→click idea as person names)
+  // Inline code: `code` — issue keys become clickable, not dead <code>
+  html = html.replace(/`([^`]+)`/g, (_, code) => {
+    if (/^[A-Z][A-Z0-9]+-\d+$/i.test(code)) {
+      return issueKeyButtonHtml(code);
+    }
+    return `<code class="ai-brief-code">${code}</code>`;
+  });
+  // Bare issue keys → open task modal / Jira (skip text already inside issue buttons)
   html = linkifyIssueKeysInHtml(html);
-  // Person names → open profile modal
+  html = stripDuplicateIssueTitlesAfterButtons(html);
+  // Person names → open profile modal (skip names inside issue titles)
   return linkifyAiPersonNames(html);
 }
 
@@ -882,15 +1133,21 @@ function buildAiPersonLinkPatterns() {
   const seen = new Set();
   for (const full of names) {
     const short = shortName(full);
+    const givenShort = shortGivenSurname(full);
     const parts = String(full).trim().split(/\s+/).filter(Boolean);
     const surname = parts[0] || "";
+    const given = parts[1] || "";
     const initials =
       parts.length >= 3
         ? `${parts[1].charAt(0)}\\.?\\s*${parts[2].charAt(0)}\\.?`
         : parts.length === 2
           ? `${parts[1].charAt(0)}\\.?`
           : "";
-    const variants = new Set([full, short]);
+    const variants = new Set([full, short, givenShort]);
+    if (given && surname) {
+      variants.add(`${given} ${surname.charAt(0)}.`);
+      variants.add(`${given} ${surname.charAt(0)}`);
+    }
     for (const sur of surnameGenitiveForms(surname)) {
       variants.add(sur);
       if (initials) {
@@ -917,15 +1174,25 @@ function buildAiPersonLinkPatterns() {
 function linkifyAiPersonNames(html) {
   const patterns = buildAiPersonLinkPatterns();
   if (!patterns.length) return html;
+  let issueBtnDepth = 0;
   return String(html || "").replace(/(<[^>]+>)|([^<]+)/g, (whole, tag, text) => {
-    if (tag || text == null) return whole;
+    if (tag) {
+      if (/^<button\b/i.test(tag) && /\b(?:issue-key-btn|ai-issue-link)\b/i.test(tag)) {
+        issueBtnDepth += 1;
+      } else if (/^<\/button\s*>/i.test(tag) && issueBtnDepth > 0) {
+        issueBtnDepth -= 1;
+      }
+      return tag;
+    }
+    if (issueBtnDepth > 0 || text == null) return whole;
     let out = text;
     const slots = [];
     for (const { re, name } of patterns) {
-      out = out.replace(re, (match) => {
+      out = out.replace(re, () => {
         const token = `\u0000AI_PERSON_${slots.length}\u0000`;
+        const label = escapeHtml(shortGivenSurname(name));
         slots.push(
-          `<button type="button" class="ai-person-link person-btn" data-person="${escapeHtml(name)}" title="Открыть профиль">${match}</button>`
+          `<button type="button" class="ai-person-link person-btn" data-person="${escapeHtml(name)}" title="Открыть профиль">${label}</button>`
         );
         return token;
       });
@@ -935,7 +1202,7 @@ function linkifyAiPersonNames(html) {
 }
 
 function renderAiMarkdown(markdown) {
-  const lines = humanizeAiText(markdown || "")
+  const lines = stripRedundantIssueTitleParens(humanizeAiText(markdown || ""))
     .replace(/\r\n/g, "\n")
     .split("\n");
   const parts = [];
@@ -993,12 +1260,13 @@ function openAiBriefModal(brief) {
   if (!brief) return;
   const author = corporateAuthorLabel(brief);
   const when = brief.generated_at ? fmtDateTime(brief.generated_at) : "—";
+  const title = brief.reason === "reused" ? "Прошлая AI-оценка спринта" : "AI-оценка спринта";
   if (brief.status === "ok" && brief.markdown) {
     openAppModal(
       `
       <div class="release-modal-head">
-        <h2 id="app-modal-title">AI-оценка спринта</h2>
-        <p class="muted">Автор: ${escapeHtml(author)} · ${escapeHtml(when)}</p>
+        <h2 id="app-modal-title">${escapeHtml(title)}</h2>
+        <p class="muted">Автор: ${escapeHtml(author)} · ${escapeHtml(when)}${brief.reason === "reused" ? " · переиспользована" : ""}</p>
       </div>
       <div class="ai-brief-body">${renderAiMarkdown(brief.markdown)}</div>
       `,
@@ -1015,7 +1283,7 @@ function openAiBriefModal(brief) {
   openAppModal(
     `
     <div class="release-modal-head">
-      <h2 id="app-modal-title">AI-оценка спринта</h2>
+      <h2 id="app-modal-title">${escapeHtml(title)}</h2>
       <p class="muted">Автор: ${escapeHtml(author)}</p>
     </div>
     <p class="muted">${escapeHtml(detail)}</p>
@@ -1087,7 +1355,7 @@ function renderSprintHeader(sprint, mood, aiBrief = null) {
     <article class="card mood-card tone-${escapeHtml(mood.tone || "ok")}" data-team-mood="1" role="button" tabindex="0" title="Открыть факторы расчёта">
       <p class="label">Настроение команды</p>
       <div class="mood-emoji" aria-hidden="true">${escapeHtml(mood.emoji || "🙂")}</div>
-      <p class="mood-score">${fmtNumber(mood.score)}%</p>
+      <p class="mood-score">${fmtNumber(mood.score)}<span class="mood-score-unit">/100</span></p>
       <p class="mood-reco">${escapeHtml(mood.recommendation || "—")}</p>
     </article>`
     : "";
@@ -1110,12 +1378,13 @@ function renderSprintHeader(sprint, mood, aiBrief = null) {
           ? "Оценка не сформирована"
           : "Открыть полный анализ");
     const when = aiBrief.generated_at ? fmtRelativeAgo(aiBrief.generated_at) : "—";
+    const reused = aiBrief.reason === "reused";
     aiCard = `
     <article class="card mood-card ai-brief-card ${tone}" data-ai-brief="1" role="button" tabindex="0" title="Открыть AI-оценку спринта">
-      <p class="label">AI-оценка спринта</p>
+      <p class="label">${reused ? "Прошлая AI-оценка спринта" : "AI-оценка спринта"}</p>
       <p class="ai-brief-author">${escapeHtml(author)}</p>
-      <p class="mood-reco">${escapeHtml(verdict)}</p>
-      <p class="hint">${escapeHtml(when)}</p>
+      <p class="mood-reco ai-inline">${formatAiInlineMarkdown(verdict)}</p>
+      <p class="hint">${reused ? "переиспользована · " : ""}${escapeHtml(when)}</p>
     </article>`;
   }
 
@@ -1172,13 +1441,13 @@ function renderEpicTimeline(timeline) {
     const focus = timeline?.focus || "active_sprint";
     if (focus === "release_window") {
       note.innerHTML = tip(
-        "Эпики релизов отчёта · прогресс по полному объёму эпика",
-        "Показаны только эпики, связанные с версиями в окне релизов (спринт + 2 недели). Прогресс секций считается по всем задачам эпика, не только по спринту."
+        "Только эпики релизного окна · прогресс по полному объёму эпика",
+        "В блоке показаны эпики, связанные с версиями релизного окна (спринт + 2 недели). Остальные эпики спринта сюда не попадают. Прогресс секций — по всем задачам эпика, не только спринта."
       );
     } else if (focus === "release_window_sprint") {
       note.innerHTML = tip(
-        "Эпики релизов · по задачам текущего спринта",
-        "Полный объём эпиков временно недоступен — показываем эпики релизов по задачам спринта команды."
+        "Только эпики релизного окна · по задачам текущего спринта",
+        "В блоке — эпики релизного окна; полный объём временно недоступен, считаем по задачам спринта команды."
       );
     } else {
       note.innerHTML = omitted
@@ -1193,91 +1462,151 @@ function renderEpicTimeline(timeline) {
     }
   }
 
-  function epicCardHtml(epic) {
-    const sections = (epic.sections || [])
-      .map((s) => {
-        const fill = Math.min(Number(s.closed_pct ?? s.progress_pct) || 0, 100);
-        const grow = Math.max(Number(s.flex_grow) || Number(s.estimate_hours) || 1, 1);
-        const tipText = `${s.direction}: ${fmtNumber(s.done_tasks)}/${fmtNumber(s.tasks)} закрыто · открытых ${fmtNumber(s.open_tasks ?? s.active_tasks)} · оценка ${fmtDuration(s.estimate_hours)}`;
-        return `
-          <div class="epic-section" title="${escapeHtml(tipText)}" style="flex:${grow} 1 4.8rem;--section-color:${escapeHtml(s.color)}">
-            <div class="epic-section-fill" style="width:${fill}%"></div>
-          </div>`;
-      })
-      .join("");
-    const captions = (epic.sections || [])
-      .map((s) => {
-        const closed = Number(s.closed_pct ?? s.progress_pct) || 0;
-        const grow = Math.max(Number(s.flex_grow) || Number(s.estimate_hours) || 1, 1);
-        const short = shortDirection(s.direction);
-        const tipText = `${s.direction}: закрыто ${fmtNumber(closed)}% (${fmtNumber(s.done_tasks)}/${fmtNumber(s.tasks)}), открытых ${fmtNumber(s.open_tasks ?? s.active_tasks)}`;
-        return `
-          <div class="epic-caption" style="flex:${grow} 1 4.8rem;--section-color:${escapeHtml(s.color)}">
-            <span class="epic-caption-dot"></span>
-            <span class="epic-caption-dir">${tip(short, tipText)}</span>
-            <span class="epic-caption-pct">${tip(`${fmtNumber(closed)}%`, tipText)}</span>
-          </div>`;
-      })
-      .join("");
-    const scopeHint =
-      epic.scope === "full_epic"
-        ? tip(
-            `${fmtDuration(epic.estimate_hours)} · ${fmtNumber(epic.progress_pct)}% закрыто`,
-            "Оценка и % — по полному объёму эпика (все задачи эпика), не только спринт."
-          )
-        : `${fmtDuration(epic.estimate_hours)} · ${fmtNumber(epic.progress_pct)}% закрыто`;
-    const conflictN = (epic.conflicts || []).length;
-    const releaseChips = (epic.releases || [])
-      .map((r) => (r.name || "").trim())
-      .filter(Boolean)
-      .map((name) => `<span class="mini-chip">${escapeHtml(name)}</span>`)
-      .join("");
-    const epicTitle = epic.summary
-      ? `<div class="task-block"><div class="task-inline">${issueLink(epic)}<span class="task-summary epic-title-text">${escapeHtml(epic.summary)}</span></div></div>`
-      : taskTitle(epic, { showTags: false });
-    return `
-      <article class="epic-row" data-epic-key="${escapeHtml(epic.key)}" role="button" tabindex="0">
-        <div class="epic-row-meta">
-          ${epicTitle}
-          <div class="muted">${scopeHint}</div>
-          <div class="epic-row-chips">
-            ${
-              Number.isFinite(Number(epic.age_days))
-                ? `<span class="mini-chip">тянется ${fmtNumber(epic.age_days)} дн.</span>`
-                : ""
-            }
-            ${releaseChips || `<span class="mini-chip muted-chip">без релиза</span>`}
-            ${
-              conflictN
-                ? `<span class="mini-chip is-warn">риски ${fmtNumber(conflictN)}</span>`
-                : ""
-            }
-          </div>
-        </div>
-        <div class="epic-track-wrap" style="width:${epic.bar_width_pct || 100}%">
-          <div class="epic-sausage">${sections}</div>
-          <div class="epic-captions">${captions}</div>
-        </div>
-      </article>`;
-  }
-
-  const withRelease = epics.filter((e) => e.has_release || (e.releases || []).length);
-  const withoutRelease = epics.filter((e) => !(e.has_release || (e.releases || []).length));
+  const sorted = sortEpicsForDisplay(epics);
+  const withRelease = sorted.filter((e) => e.has_release || (e.releases || []).length);
+  const withoutRelease = sorted.filter((e) => !(e.has_release || (e.releases || []).length));
   const groups = [
     { title: "С релизом", items: withRelease },
     { title: "Без релиза", items: withoutRelease },
   ].filter((g) => g.items.length);
+  const sortNote =
+    "Сначала ближайшая дата релиза, затем сила связи по задачам, затем меньший прогресс";
 
   root.innerHTML = groups
     .map(
       (g) => `
       <div class="epic-group">
         <h3 class="epic-group-title">${escapeHtml(g.title)} · ${fmtNumber(g.items.length)}</h3>
-        <p class="muted epic-group-note">Внутри группы — по % завершения (сначала меньший прогресс)</p>
-        <div class="epic-rows">${g.items.map(epicCardHtml).join("")}</div>
+        <p class="muted epic-group-note">${escapeHtml(sortNote)}</p>
+        <div class="epic-rows">${g.items.map(epicTimelineCardHtml).join("")}</div>
       </div>`
     )
     .join("");
+}
+
+function epicNearestReleaseDate(epic) {
+  if (epic?.nearest_release_date) return String(epic.nearest_release_date).slice(0, 10);
+  const dates = [];
+  for (const r of epic?.releases || []) {
+    if (r?.released) continue;
+    const raw = String(r?.release_date || "").trim();
+    if (raw) dates.push(raw.slice(0, 10));
+  }
+  if (!dates.length) {
+    for (const r of epic?.releases || []) {
+      const raw = String(r?.release_date || "").trim();
+      if (raw) dates.push(raw.slice(0, 10));
+    }
+  }
+  return dates.length ? dates.sort()[0] : "9999-12-31";
+}
+
+function epicReleaseLinkStrength(epic) {
+  if (epic?.release_link_strength != null && epic.release_link_strength !== "") {
+    return Number(epic.release_link_strength) || 0;
+  }
+  // Fallback for older snapshots without the field.
+  const releases = epic?.releases || [];
+  if (!releases.length) return 0;
+  return Math.min(1, 0.35 + releases.length * 0.2);
+}
+
+function sortEpicsForDisplay(epics) {
+  return [...(epics || [])].sort((a, b) => {
+    const aRel = a.has_release || (a.releases || []).length ? 0 : 1;
+    const bRel = b.has_release || (b.releases || []).length ? 0 : 1;
+    if (aRel !== bRel) return aRel - bRel;
+    const aDate = epicNearestReleaseDate(a);
+    const bDate = epicNearestReleaseDate(b);
+    if (aDate !== bDate) return aDate.localeCompare(bDate);
+    const aStr = epicReleaseLinkStrength(a);
+    const bStr = epicReleaseLinkStrength(b);
+    if (aStr !== bStr) return bStr - aStr;
+    const aProg = Number(a.progress_pct) || 0;
+    const bProg = Number(b.progress_pct) || 0;
+    if (aProg !== bProg) return aProg - bProg;
+    return String(a.key || "").localeCompare(String(b.key || ""));
+  });
+}
+
+function epicTimelineCardHtml(epic) {
+  const sections = (epic.sections || [])
+    .map((s) => {
+      const fill = Math.min(Number(s.closed_pct ?? s.progress_pct) || 0, 100);
+      const grow = Math.max(Number(s.flex_grow) || Number(s.estimate_hours) || 1, 1);
+      const tipText = `${s.direction}: ${fmtNumber(s.done_tasks)}/${fmtNumber(s.tasks)} закрыто · открытых ${fmtNumber(s.open_tasks ?? s.active_tasks)} · оценка ${fmtDuration(s.estimate_hours)}`;
+      return `
+          <div class="epic-section" title="${escapeHtml(tipText)}" style="flex:${grow} 1 4.8rem;--section-color:${escapeHtml(s.color)}">
+            <div class="epic-section-fill" style="width:${fill}%"></div>
+          </div>`;
+    })
+    .join("");
+  const captions = (epic.sections || [])
+    .map((s) => {
+      const closed = Number(s.closed_pct ?? s.progress_pct) || 0;
+      const grow = Math.max(Number(s.flex_grow) || Number(s.estimate_hours) || 1, 1);
+      const short = shortDirection(s.direction);
+      const tipText = `${s.direction}: закрыто ${fmtNumber(closed)}% (${fmtNumber(s.done_tasks)}/${fmtNumber(s.tasks)}), открытых ${fmtNumber(s.open_tasks ?? s.active_tasks)}`;
+      return `
+          <div class="epic-caption" style="flex:${grow} 1 4.8rem;--section-color:${escapeHtml(s.color)}">
+            <span class="epic-caption-dot"></span>
+            <span class="epic-caption-dir">${tip(short, tipText)}</span>
+            <span class="epic-caption-pct">${tip(`${fmtNumber(closed)}%`, tipText)}</span>
+          </div>`;
+    })
+    .join("");
+  const releaseChips = (epic.releases || [])
+    .map((r) => {
+      const name = (r.name || "").trim();
+      if (!name) return "";
+      const rid = r.id != null && r.id !== "" ? String(r.id) : "";
+      if (rid) {
+        return `<button type="button" class="mini-chip epic-release-chip" data-release-id="${escapeHtml(rid)}" data-release-name="${escapeHtml(name)}" title="Открыть релиз">${escapeHtml(name)}</button>`;
+      }
+      return `<span class="mini-chip">${escapeHtml(name)}</span>`;
+    })
+    .filter(Boolean)
+    .join("");
+  const ageChip = Number.isFinite(Number(epic.age_days))
+    ? `<span class="mini-chip epic-age-chip">Тянется ${fmtNumber(epic.age_days)} дн.</span>`
+    : "";
+  const epicTitle = epic.summary
+    ? `<div class="task-block"><div class="task-inline">${issueLink(epic)}<span class="task-summary epic-title-text">${escapeHtml(epic.summary)}</span></div></div>`
+    : taskTitle(epic, { showTags: false });
+  return `
+      <article class="epic-row" data-epic-key="${escapeHtml(epic.key)}" role="button" tabindex="0">
+        <div class="epic-row-top">
+          <div class="epic-row-meta">${epicTitle}</div>
+          <div class="epic-row-top-right">
+            ${releaseChips}
+            ${ageChip}
+          </div>
+        </div>
+        <div class="epic-track-wrap" style="width:${Number(epic.bar_width_pct) || 64}%">
+          <div class="epic-sausage">${sections}</div>
+          <div class="epic-captions">${captions}</div>
+        </div>
+      </article>`;
+}
+
+function epicCardForDisplay(epic) {
+  if (!epic) return null;
+  if ((epic.sections || []).length) return epic;
+  const resolved = resolveEpicForModal(epic.key);
+  if (!resolved) return epic;
+  return {
+    ...epic,
+    ...resolved,
+    summary: epic.summary || resolved.summary,
+    bar_width_pct: epic.bar_width_pct || resolved.bar_width_pct || 64,
+  };
+}
+
+function directionColorForEpic(name) {
+  const legend = currentSprintReport?.epic_timeline?.legend || [];
+  const fromLegend = legend.find((item) => item?.name === name);
+  if (fromLegend?.color) return fromLegend.color;
+  return DIRECTION_ICONS[name]?.color || "#8a968c";
 }
 
 function resolveEpicForModal(epicKey) {
@@ -1295,6 +1624,24 @@ function resolveEpicForModal(epicKey) {
   const tasksByDir = new Map();
   const seenTaskKeys = new Set();
 
+  const pushTask = (t, dirName) => {
+    if (!t || typeof t !== "object") return;
+    const tKey = String(t.key || "").trim().toUpperCase();
+    if (!tKey) return;
+    const direction = dirName || t.direction || "—";
+    const dedupe = `${direction}:${tKey}`;
+    if (seenTaskKeys.has(dedupe)) return;
+    seenTaskKeys.add(dedupe);
+    if (!tasksByDir.has(direction)) tasksByDir.set(direction, []);
+    tasksByDir.get(direction).push({
+      ...t,
+      key: tKey,
+      direction,
+      // Keep hidden_from_display tasks — they still shape the epic sausage.
+      direction_state: t.direction_state || (t.done || t.jira_done ? "done" : "active"),
+    });
+  };
+
   for (const d of sr.directions || []) {
     const dirName = d.name || "—";
     const row = (d.epics || []).find((e) => String(e.key) === key);
@@ -1307,33 +1654,24 @@ function resolveEpicForModal(epicKey) {
     ];
     for (const t of pools) {
       if (String(t.epic_key || "") !== key) continue;
-      const tKey = String(t.key || "");
-      if (!tKey || seenTaskKeys.has(`${dirName}:${tKey}`)) continue;
-      seenTaskKeys.add(`${dirName}:${tKey}`);
-      if (!tasksByDir.has(dirName)) tasksByDir.set(dirName, []);
-      tasksByDir.get(dirName).push({
-        ...t,
-        direction: dirName,
-        direction_state: t.direction_state || (t.done || t.jira_done ? "done" : "active"),
-      });
+      pushTask(t, dirName);
     }
   }
 
   // People profiles may hold tasks missing from direction lists
+  // (including display_task_filters / hidden_from_display).
   for (const profile of Object.values(sr.people || {})) {
     const dirName = profile.direction || "—";
     for (const t of [...(profile.tasks_active || []), ...(profile.tasks || [])]) {
       if (String(t.epic_key || "") !== key) continue;
-      const tKey = String(t.key || "");
-      if (!tKey || seenTaskKeys.has(`${dirName}:${tKey}`)) continue;
-      seenTaskKeys.add(`${dirName}:${tKey}`);
-      if (!tasksByDir.has(dirName)) tasksByDir.set(dirName, []);
-      tasksByDir.get(dirName).push({
-        ...t,
-        direction: dirName,
-        direction_state: t.direction_state || (t.done || t.jira_done ? "done" : "active"),
-      });
+      pushTask(t, dirName);
     }
+  }
+
+  // Issues dossier is another source for hidden/auxiliary tasks.
+  for (const issue of Object.values(sr.issues || {})) {
+    if (String(issue?.epic_key || "") !== key) continue;
+    pushTask(issue, issue.direction || "—");
   }
 
   if (!dirRows.length && !tasksByDir.size) return null;
@@ -1357,17 +1695,28 @@ function resolveEpicForModal(epicKey) {
     const row = dirRows.find((r) => r.direction === direction) || {};
     const detail = tasksByDir.get(direction) || [];
     const openDetail = detail.filter((t) => t.direction_state !== "done");
+    const doneFromDetail = detail.filter((t) => t.direction_state === "done").length;
+    const total = Number(row.total);
+    const done = Number(row.done);
+    const tasksCount = Number.isFinite(total) && total > 0 ? total : detail.length || 1;
+    const doneCount = Number.isFinite(done) ? done : doneFromDetail;
+    const closed =
+      tasksCount > 0 ? Math.round((doneCount / tasksCount) * 100) : Number(row.progress_pct) || 0;
     return {
       direction,
-      color: row.color,
-      progress_pct: row.progress_pct ?? 0,
-      closed_pct: row.progress_pct ?? 0,
-      tasks: row.total ?? detail.length,
-      done_tasks: row.done ?? detail.filter((t) => t.direction_state === "done").length,
+      color: row.color || directionColorForEpic(direction),
+      progress_pct: closed,
+      closed_pct: closed,
+      tasks: tasksCount,
+      done_tasks: doneCount,
       active_tasks: row.open ?? openDetail.length,
       open_tasks: openDetail.length,
-      estimate_hours: row.estimate_hours,
-      spent_hours: row.hours,
+      estimate_hours:
+        row.estimate_hours ??
+        (detail.reduce((s, t) => s + (Number(t.estimate_hours) || 0), 0) || 1),
+      spent_hours:
+        row.hours ?? detail.reduce((s, t) => s + (Number(t.hours) || 0), 0),
+      flex_grow: row.estimate_hours || 1,
       tasks_detail: openDetail,
     };
   });
@@ -1460,19 +1809,18 @@ function openEpicModal(epicKey) {
       const openTasks = (s.tasks_detail || []).filter((t) => t.direction_state !== "done");
       if (!openTasks.length) return "";
       const tasks = openTasks
-        .map(
-          (t) => `
-          <div class="person-task-row ${t.risk ? "task-row-risk" : ""} ${t.in_sprint === false ? "task-row-out-of-sprint" : ""}">
-            <div>${taskTitle(t, { showTags: true })}</div>
-            <div class="muted">${escapeHtml(shortName(t.assignee || "—"))}</div>
-          </div>`
+        .map((t) =>
+          releaseTaskRowHtml(t, {
+            showReleaseTags: true,
+            outOfSprint: t.in_sprint === false,
+          })
         )
         .join("");
       return `
         <div class="person-modal-section">
           <h3>${escapeHtml(s.direction)} · ${fmtNumber(s.progress_pct)}% · открыто ${fmtNumber(s.open_tasks ?? openTasks.length)}</h3>
           <div class="progress" style="margin:0.35rem 0 0.55rem"><div class="progress-bar" style="width:${Math.min(s.progress_pct || 0, 100)}%"></div></div>
-          <div class="person-task-list">${tasks}</div>
+          <div class="person-task-list release-task-list">${tasks}</div>
         </div>`;
     })
     .filter(Boolean)
@@ -1518,7 +1866,7 @@ function openEpicModal(epicKey) {
     </div>
     ${dirBlocks || `<div class="person-modal-section"><p class="muted">Нет открытых задач</p></div>`}
   `,
-    { wide: true, type: "epic" }
+    { wide: true, release: true, type: "epic" }
   );
 }
 
@@ -1601,6 +1949,18 @@ function renderRatings(ratings) {
     ...items.filter((c) => c.id === "tops"),
   ];
 
+  const stabilityPct = (value) => {
+    if (value === null || value === undefined) return "—";
+    const number = Number(value);
+    return Number.isFinite(number) ? `${number.toFixed(1)}%` : "—";
+  };
+  const compactDetail = (category, person) => {
+    if (category.id !== "stability" || !person.stability) {
+      return person.detail || person.direction || "";
+    }
+    return `темп ${stabilityPct(person.stability.pace_pct)} · вовремя ${stabilityPct(person.stability.timely_pct)}`;
+  };
+
   root.innerHTML = ordered
     .map((cat) => {
       const people = cat.people || [];
@@ -1609,17 +1969,18 @@ function renderRatings(ratings) {
         people.length === 0
           ? `<p class="muted">Пока нет данных</p>`
           : `<div class="rating-list">${people
-              .map(
-                (p) => `
+              .map((p) => {
+                const detail = compactDetail(cat, p);
+                return `
               <div class="rating-person">
                 ${medalHtml(p.place)}
                 ${personCell(p.name, p.avatar_url, { short: true, load: p.load || findPersonByName(p.name)?.load })}
                 <div class="rating-score">
                   <div class="rating-score-main">${escapeHtml(p.value || "")}</div>
-                  <div class="muted rating-score-detail">${escapeHtml(p.detail || p.direction || "")}</div>
+                  <div class="muted rating-score-detail">${escapeHtml(detail)}</div>
                 </div>
-              </div>`
-              )
+              </div>`;
+              })
               .join("")}</div>`;
       return `
         <article class="rating-card ${cat.id === "tops" ? "tops" : ""}" data-rating-id="${escapeHtml(cat.id)}" role="button" tabindex="0">
@@ -1638,47 +1999,52 @@ function releaseStatusBadge(r) {
   return `<span class="release-status risk-${escapeHtml(risk)}">${escapeHtml(label)}</span>`;
 }
 
-function releaseRightPanel(r) {
-  const released = !!r.released || r.risk === "done";
-  if (released) {
-    const hasActive = Number(r.tasks_active) > 0;
-    const leftover = hasActive
-      ? `<div class="release-risk-card severity-warn">
-          <div class="release-risk-card-title">Остались active-задачи</div>
-          <div class="release-risk-card-summary">Ещё ${fmtNumber(r.tasks_active)} на уже выпущенной версии</div>
-        </div>`
-      : `<div class="release-risk-card severity-ok">
-          <div class="release-risk-card-title">Выпущен</div>
-          <div class="release-risk-card-summary">Версия отмечена как released в Jira</div>
-        </div>`;
-    return `
-      <div class="release-side release-side-status">
-        <h4>Риски</h4>
-        <div class="release-risk-cards">${leftover}</div>
-      </div>`;
-  }
-
-  const items = r.risk_items || [];
-  const riskCards = items.length
-    ? items
-        .map(
-          (item) => `
-        <div class="release-risk-card severity-${escapeHtml(item.severity || "warn")}">
-          <div class="release-risk-card-title">${escapeHtml(item.title || "Риск")}</div>
-          <div class="release-risk-card-summary">${escapeHtml(item.summary || "")}</div>
-        </div>`
-        )
-        .join("")
-    : `<div class="release-risk-card severity-ok">
-        <div class="release-risk-card-title">Без явных рисков</div>
-        <div class="release-risk-card-summary">Прогресс и ёмкость в допустимых пределах</div>
-      </div>`;
-
+function releaseCardHtml(r, { showDate = false } = {}) {
+  const desc = String(r.description || "").trim();
+  const descHtml = desc ? `<p class="release-desc">${escapeHtml(desc)}</p>` : "";
+  const dateBadge = showDate
+    ? `<span class="release-date-badge">${fmtDay(r.release_date)}</span>`
+    : "";
   return `
-    <div class="release-side release-side-status">
-      <h4>Риски</h4>
-      <div class="release-risk-cards">${riskCards}</div>
-    </div>`;
+        <article class="release-card release-card-compact" data-risk="${escapeHtml(r.risk || "")}" data-released="${r.released ? "1" : "0"}" data-release-id="${escapeHtml(r.id)}" role="button" tabindex="0">
+          <div class="release-title-row">
+            ${dateBadge}
+            <h3 class="release-title">${escapeHtml(r.name)}</h3>
+            ${releaseStatusBadge(r)}
+          </div>
+          ${descHtml}
+          <div class="release-progress">
+            <div class="progress">
+              <div class="progress-bar" style="width:${Math.min(Number(r.progress_pct) || 0, 100)}%"></div>
+            </div>
+          </div>
+        </article>`;
+}
+
+function releaseDateGroupKey(release) {
+  const raw = String(release?.release_date || "").trim();
+  if (!raw) return "undated";
+  return raw.slice(0, 10);
+}
+
+function groupReleasesByDate(releases) {
+  const map = new Map();
+  for (const r of releases || []) {
+    const key = releaseDateGroupKey(r);
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(r);
+  }
+  const keys = [...map.keys()].sort((a, b) => {
+    if (a === "undated") return 1;
+    if (b === "undated") return -1;
+    return a.localeCompare(b);
+  });
+  return keys.map((key) => ({
+    key,
+    date: key === "undated" ? null : key,
+    label: key === "undated" ? "Без даты" : fmtDay(key),
+    releases: map.get(key) || [],
+  }));
 }
 
 function renderReleases(releases) {
@@ -1693,65 +2059,27 @@ function renderReleases(releases) {
     return;
   }
   section.classList.remove("hidden");
+  const groups = groupReleasesByDate(items);
   if (mini) {
-    mini.innerHTML = items
+    mini.innerHTML = groups
       .map(
-        (r) =>
-          `<span class="mini-chip"><strong>${escapeHtml(r.name)}</strong> · ${fmtDay(r.release_date)} · ${escapeHtml(r.risk_label || "")} · ${fmtNumber(r.progress_pct)}%</span>`
+        (g) =>
+          `<span class="mini-chip"><strong>${escapeHtml(g.label)}</strong> · ${fmtNumber(g.releases.length)} рел.</span>`
       )
       .join("");
   }
 
-  root.innerHTML = items
-    .map((r) => {
-      const dirs = (r.sections || [])
-        .map((s) => {
-          const tipText = `${s.direction}: закрыто ${fmtNumber(s.done_tasks)} из ${fmtNumber(s.tasks)} (${fmtNumber(s.progress_pct)}%), активных ${fmtNumber(s.active_tasks)}`;
-          const lagCls = s.is_lagging ? " is-lagging" : "";
-          return `
-          <span class="release-dir-chip${lagCls} has-tip" tabindex="0" data-tip="${escapeHtml(tipText)}" style="--chip-color:${escapeHtml(s.color)}">
-            ${escapeHtml(s.direction)}
-            <strong>${fmtNumber(s.progress_pct)}%</strong>
-            <span class="muted">${fmtNumber(s.active_tasks)} активных</span>
-          </span>`;
-        })
-        .join("");
-      const calendarTip =
-        "Доля календарного времени от старта спринта до даты выпуска версии. 100% значит: дата релиза уже наступила. Это не прогресс задач.";
-      const desc = String(r.description || "").trim();
-      const descHtml = desc
-        ? `<p class="release-desc">${escapeHtml(desc)}</p>`
-        : "";
+  root.innerHTML = groups
+    .map((g) => {
+      const cards = g.releases.map((r) => releaseCardHtml(r)).join("");
       return `
-        <article class="release-card" data-risk="${escapeHtml(r.risk || "")}" data-released="${r.released ? "1" : "0"}" data-release-id="${escapeHtml(r.id)}" role="button" tabindex="0">
-          <div class="release-grid">
-            <div class="release-side">
-              <div class="release-title-row">
-                <span class="release-date-badge">${fmtDay(r.release_date)}</span>
-                <h3 class="release-title">${escapeHtml(r.name)}</h3>
-                ${releaseStatusBadge(r)}
-              </div>
-              ${descHtml}
-              <div class="release-progress" style="margin-top:0.75rem">
-                <div class="progress has-tip" tabindex="0" data-tip="Заливка — прогресс задач по версии">
-                  <div class="progress-bar" style="width:${Math.min(Number(r.progress_pct) || 0, 100)}%"></div>
-                </div>
-                <div class="muted">
-                  ${tip(`задачи ${fmtNumber(r.progress_pct)}%`, "Доля закрытых задач команды на версии")}
-                  ·
-                  ${tip(`времени до релиза прошло ${fmtNumber(r.time_pct)}%`, calendarTip)}
-                  ${
-                    Number(r.slip_gap_pp) > 0 && !r.released
-                      ? ` · <span class="metric metric-warn">отставание ${fmtNumber(r.slip_gap_pp)} п.п.</span>`
-                      : ""
-                  }
-                </div>
-              </div>
-              <div class="release-dirs" style="margin-top:0.65rem">${dirs || `<span class="muted">Нет задач команды</span>`}</div>
-            </div>
-            ${releaseRightPanel(r)}
-          </div>
-        </article>`;
+      <div class="release-date-group" data-release-date="${escapeHtml(g.key)}">
+        <div class="release-date-group-head">
+          <h3 class="release-date-group-title">${escapeHtml(g.label)}</h3>
+          <span class="release-date-group-count">${fmtNumber(g.releases.length)}</span>
+        </div>
+        <div class="release-date-group-cards">${cards}</div>
+      </div>`;
     })
     .join("");
 }
@@ -1771,24 +2099,34 @@ function reindexModalLayers(root) {
   });
 }
 
+function syncBodyScrollLock() {
+  const root = getModalsRoot();
+  const open = !!(root && root.querySelector(".modal"));
+  document.body.classList.toggle("modal-open", open);
+}
+
 function closeAppModal() {
   const root = getModalsRoot();
   if (!root) return;
   const layers = root.querySelectorAll(".modal");
   if (!layers.length) return;
-  layers[layers.length - 1].remove();
+  const top = layers[layers.length - 1];
+  if (top.dataset.modalType === "search") clearReportSearchState();
+  top.remove();
   reindexModalLayers(root);
+  syncBodyScrollLock();
   hideFloatTip();
 }
 
 function openAppModal(
   html,
-  { wide = false, rating = false, person = false, type = null } = {}
+  { wide = false, rating = false, person = false, release = false, type = null } = {}
 ) {
   const root = getModalsRoot();
   if (!root) return;
   const modalType =
-    type || (person ? "person" : rating ? "rating" : "generic");
+    type ||
+    (person ? "person" : release ? "release" : rating ? "rating" : "generic");
 
   // Only one modal of each type at a time — replace existing of same type.
   root.querySelectorAll(`.modal[data-modal-type="${modalType}"]`).forEach((el) => {
@@ -1819,13 +2157,16 @@ function openAppModal(
   const body = layer.querySelector(".app-modal-body");
   if (body) body.innerHTML = bodyHtml;
   if (card) {
-    card.classList.toggle("modal-card-wide", !!wide || !!person);
+    card.classList.toggle("modal-card-wide", !!wide || !!person || !!release || modalType === "search");
     card.classList.toggle("modal-card-person", !!person);
+    card.classList.toggle("modal-card-release", !!release);
     card.classList.toggle("modal-card-rating", !!rating);
+    card.classList.toggle("modal-card-search", modalType === "search");
     card.scrollTop = 0;
   }
   root.appendChild(layer);
   reindexModalLayers(root);
+  syncBodyScrollLock();
 
   requestAnimationFrame(() => {
     if (card) card.scrollTop = 0;
@@ -1842,15 +2183,89 @@ function personAiNoteFor(profile) {
   return null;
 }
 
+function jiraBrowseBase() {
+  const explicit =
+    currentSprintReport?.jira_browse_base ||
+    currentSprintReport?.settings?.jira_browse_base ||
+    null;
+  if (explicit) return String(explicit).replace(/\/+$/, "");
+
+  const collect = [];
+  const push = (url) => {
+    if (url) collect.push(String(url));
+  };
+  const issues = currentSprintReport?.issues || {};
+  for (const issue of Object.values(issues)) push(issue?.web_url);
+  for (const rel of currentSprintReport?.releases || []) {
+    push(rel?.web_url);
+    for (const t of rel?.tasks || []) push(t?.web_url);
+    for (const s of rel?.sections || []) {
+      for (const t of s?.tasks_detail || []) push(t?.web_url);
+    }
+  }
+  const risks = currentSprintReport?.risks || {};
+  for (const list of Object.values(risks)) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) push(item?.web_url);
+  }
+  for (const person of currentSprintReport?.team || []) {
+    push(person?.jira_url);
+  }
+  for (const url of collect) {
+    const browse = String(url).match(/^(https?:\/\/[^/?#]+)\/browse\//i);
+    if (browse) return browse[1];
+    const host = String(url).match(/^(https?:\/\/[^/?#]+)/i);
+    if (host && /jira|atlassian/i.test(host[1])) return host[1];
+  }
+  return null;
+}
+
+function jiraBrowseUrlForKey(issueKey, fallbackUrl = null) {
+  const key = String(issueKey || "").trim().toUpperCase();
+  if (!key && !fallbackUrl) return null;
+  if (fallbackUrl) return String(fallbackUrl);
+  const known = key ? currentSprintReport?.issues?.[key] : null;
+  if (known?.web_url) return known.web_url;
+  // Release-only tasks often aren't in issues{} — still have web_url on the row.
+  for (const rel of currentSprintReport?.releases || []) {
+    for (const t of rel?.tasks || []) {
+      if (String(t?.key || "").toUpperCase() === key && t?.web_url) return t.web_url;
+    }
+    for (const s of rel?.sections || []) {
+      for (const t of s?.tasks_detail || []) {
+        if (String(t?.key || "").toUpperCase() === key && t?.web_url) return t.web_url;
+      }
+    }
+  }
+  const base = jiraBrowseBase();
+  return key && base ? `${base}/browse/${encodeURIComponent(key)}` : null;
+}
+
 /** Turn Jira keys in already-escaped HTML/text into issue modal buttons. */
 function linkifyIssueKeysInHtml(html) {
+  let issueBtnDepth = 0;
   return String(html || "").replace(/(<[^>]+>)|([^<]+)/g, (whole, tag, text) => {
-    if (tag || text == null) return whole;
-    return text.replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g, (key) => {
-      const label = escapeHtml(key);
-      return `<button type="button" class="ai-issue-link issue-key-btn" data-issue="${label}" title="Открыть карточку задачи">${label}</button>`;
-    });
+    if (tag) {
+      if (/^<button\b/i.test(tag) && /\b(?:issue-key-btn|ai-issue-link)\b/i.test(tag)) {
+        issueBtnDepth += 1;
+      } else if (/^<\/button\s*>/i.test(tag) && issueBtnDepth > 0) {
+        issueBtnDepth -= 1;
+      }
+      return tag;
+    }
+    if (issueBtnDepth > 0 || text == null) return whole;
+    return text.replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g, (key) => issueKeyButtonHtml(key));
   });
+}
+
+function renderPersonAiNoteBody(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return "";
+  // Multi-line / lists → same renderer as AI brief; otherwise inline markdown.
+  if (/\n/.test(raw) || /^\s*[-*]\s|\d+\.\s|##\s/m.test(raw)) {
+    return `<div class="person-ai-note-body">${renderAiMarkdown(raw)}</div>`;
+  }
+  return `<p class="person-ai-note-text">${formatAiInlineMarkdown(raw)}</p>`;
 }
 
 function renderPersonAiNote(profile) {
@@ -1860,16 +2275,15 @@ function renderPersonAiNote(profile) {
   const author = bundle.author || corporateAuthorLabel(bundle) || "corporate";
   const when = bundle.generated_at ? fmtRelativeAgo(bundle.generated_at) : "";
   const tone = ["attention", "ok", "info"].includes(note.tone) ? note.tone : "ok";
-  const meta = [author, when].filter(Boolean).join(" · ");
-  // Same idea as person-name links in AI brief: only keys the agent mentioned become clickable.
-  const textHtml = linkifyIssueKeysInHtml(escapeHtml(humanizeAiText(note.text)));
+  const reused = bundle.reason === "reused";
+  const meta = [reused ? "переиспользована" : "", author, when].filter(Boolean).join(" · ");
   return `
     <div class="person-ai-note tone-${escapeHtml(tone)}">
       <div class="person-ai-note-head">
-        <span class="person-ai-note-label">AI-заметка</span>
+        <span class="person-ai-note-label">${reused ? "Прошлая AI-заметка" : "AI-заметка"}</span>
         ${meta ? `<span class="person-ai-note-meta">${escapeHtml(meta)}</span>` : ""}
       </div>
-      <p class="person-ai-note-text">${textHtml}</p>
+      ${renderPersonAiNoteBody(note.text)}
     </div>`;
 }
 
@@ -2231,38 +2645,7 @@ function renderActivityGroups(block) {
 }
 
 function renderPersonActiveTaskRow(t) {
-  const issue = { key: t.key, web_url: t.web_url, summary: t.summary };
-  const summary = t.summary
-    ? `<span class="person-task-summary">${escapeHtml(t.summary)}</span>`
-    : "";
-  const status = t.status
-    ? `<span class="person-task-status">${escapeHtml(t.status)}</span>`
-    : "";
-  const spent = Number(t.hours) || 0;
-  const estimate = Number(t.estimate_hours);
-  const hasEstimate = Number.isFinite(estimate) && estimate > 0;
-  const pct = hasEstimate
-    ? Math.min(100, Math.round((spent / estimate) * 100))
-    : null;
-  const tipText = hasEstimate
-    ? `Прогресс: списано ${fmtDuration(spent)} из оценки ${fmtDuration(estimate)}`
-    : spent > 0
-      ? `Списано ${fmtDuration(spent)} · оценки нет`
-      : "Нет списаний и оценки";
-  const side = `
-    <div class="person-task-side has-tip" tabindex="0" data-tip="${escapeHtml(tipText)}">
-      <span class="person-task-pct ${pct == null ? "is-muted" : ""}">${
-        pct != null ? `${pct}%` : "—"
-      }</span>
-      <span class="person-task-hours">${fmtDuration(spent)}${
-        hasEstimate ? ` / ${fmtDuration(estimate)}` : ""
-      }</span>
-    </div>`;
-  return `
-    <div class="person-task-row is-compact ${t.risk ? "task-row-risk" : ""}">
-      <div class="person-task-main">${issueLink(issue)}${summary}${status}</div>
-      ${side}
-    </div>`;
+  return releaseTaskRowHtml(t, { showAssignee: false, showReleaseTags: false });
 }
 
 function groupPersonActiveTasksByRelease(tasks) {
@@ -2327,7 +2710,7 @@ function renderPersonActiveTasks(tasks) {
           ${title}
           <span class="person-task-group-count">${fmtNumber(g.tasks.length)}</span>
         </h4>
-        <div class="person-task-list">${g.tasks.map(renderPersonActiveTaskRow).join("")}</div>
+        <div class="person-task-list release-task-list">${g.tasks.map(renderPersonActiveTaskRow).join("")}</div>
       </div>`);
   }
 
@@ -2338,7 +2721,7 @@ function renderPersonActiveTasks(tasks) {
           <span class="person-task-group-kicker">Без релиза</span>
           <span class="person-task-group-count">${fmtNumber(withoutRelease.length)}</span>
         </h4>
-        <div class="person-task-list">${withoutRelease.map(renderPersonActiveTaskRow).join("")}</div>
+        <div class="person-task-list release-task-list">${withoutRelease.map(renderPersonActiveTaskRow).join("")}</div>
       </div>`);
   }
 
@@ -2373,57 +2756,31 @@ function renderPersonLoad(load) {
   ]
     .filter(Boolean)
     .join(" · ");
-  const fallbackN = Number(load.tasks_with_fallback) || 0;
-  const missing = Math.min(
-    Number(load.tasks_without_estimate) || 0,
-    fallbackN
-  );
-  const withEstimateFallback = Math.max(0, fallbackN - missing);
+  const zeroRemaining = Number(load.tasks_with_zero_remaining) || 0;
+  const missingRemaining = Number(load.tasks_without_remaining) || 0;
   const notes = [];
-
-  const hoursWord = (hours) => {
-    if (!Number.isFinite(hours)) return "2 часа";
-    const whole = Math.round(hours);
-    if (Math.abs(hours - whole) >= 1e-6) return fmtDuration(hours);
-    const mod10 = whole % 10;
-    const mod100 = whole % 100;
-    const word =
-      mod10 === 1 && mod100 !== 11
-        ? "час"
-        : mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)
-          ? "часа"
-          : "часов";
-    return `${fmtNumber(whole)} ${word}`;
-  };
   const taskWord = (n) =>
     n === 1 ? "задача" : n >= 2 && n <= 4 ? "задачи" : "задач";
-
-  const fixed = Number(load.fallback_hours);
-  const fixedTxt = hoursWord(fixed);
-  if (withEstimateFallback) {
-    const ratio = Number(load.fallback_estimate_ratio);
-    const ratioTxt = Number.isFinite(ratio)
-      ? `${fmtNumber(Math.round(ratio * 100))}% от оценки задачи`
-      : "доля от оценки задачи";
+  if (zeroRemaining) {
     notes.push(
-      `<div class="person-load-note">${fmtNumber(withEstimateFallback)} ${taskWord(
-        withEstimateFallback
-      )} с нулевым remaining — учтены как ${ratioTxt}, либо ${fixedTxt}</div>`
+      `<div class="person-load-note">${fmtNumber(zeroRemaining)} ${taskWord(
+        zeroRemaining
+      )} с нулевым Remaining Estimate — не добавляют будущие часы</div>`
     );
   }
-  if (missing) {
+  if (missingRemaining) {
     notes.push(
-      `<div class="person-load-note">${fmtNumber(missing)} ${
-        missing === 1
+      `<div class="person-load-note">${fmtNumber(missingRemaining)} ${
+        missingRemaining === 1
           ? "задача без оценки в Jira"
-          : missing >= 2 && missing <= 4
+          : missingRemaining >= 2 && missingRemaining <= 4
             ? "задачи без оценки в Jira"
             : "задач без оценки в Jira"
-      } — для них взяли по ${fixedTxt}; реальная нагрузка может быть выше</div>`
+      } Remaining Estimate — реальная нагрузка может быть выше</div>`
     );
   }
   const tipText =
-    "Оставшаяся оценка active-задач / (бюджет спринта − уже списанные часы). Бюджет = рабочие дни спринта × норма в день. Если remaining в Jira = 0 (часто после разработки на QA), берём max(фикс. часы, доля Original Estimate).";
+    "Положительный Remaining Estimate active-задач / (бюджет спринта − уже списанные часы). Бюджет = рабочие дни спринта × норма в день. Нулевой или отсутствующий Remaining Estimate не заменяется условными часами.";
   return `
     <div class="person-load level-${escapeHtml(level)}">
       <div class="person-load-head">
@@ -2875,13 +3232,19 @@ function formatCommentHtml(raw) {
   return formatJiraWikiHtml(text);
 }
 
-function openIssueModal(issueKey) {
+function openIssueModal(issueKey, { jiraUrl = null } = {}) {
   const key = String(issueKey || "").trim().toUpperCase();
   const issue = currentSprintReport?.issues?.[key];
   if (!issue) {
+    // Release/epic tasks may be outside sprint issue dossier — open Jira, no stub modal.
+    const url = jiraBrowseUrlForKey(key, jiraUrl);
+    if (url) {
+      window.open(url, "_blank", "noopener,noreferrer");
+      return;
+    }
     openAppModal(
       `<h2 id="app-modal-title">${escapeHtml(key || "Задача")}</h2>
-       <p class="muted">Нет данных по задаче в текущем отчёте спринта. Откройте её в Jira.</p>`,
+       <p class="muted">Нет данных по задаче в текущем отчёте, и ссылку на Jira собрать не удалось.</p>`,
       { type: "issue" }
     );
     return;
@@ -3102,6 +3465,25 @@ function openRatingModal(catId) {
   const cat = (currentSprintReport?.ratings || []).find((c) => c.id === catId);
   if (!cat) return;
   const people = cat.all_people || cat.people || [];
+  const stabilityPct = (value) => {
+    if (value === null || value === undefined) return "—";
+    const number = Number(value);
+    return Number.isFinite(number) ? `${number.toFixed(1)}%` : "—";
+  };
+  const modalDetail = (person) => {
+    const stability = person.stability;
+    if (cat.id !== "stability" || !stability) {
+      return `<div class="muted rating-score-detail">${escapeHtml(person.detail || "")}</div>`;
+    }
+    return `
+      <div class="rating-stability-details">
+        <span>Темп <strong>${escapeHtml(stabilityPct(stability.pace_pct))}</strong></span>
+        <span>Вовремя <strong>${escapeHtml(stabilityPct(stability.timely_pct))}</strong></span>
+        <span>Наперёд <strong>${escapeHtml(fmtNumber(stability.advance_hours || 0))} ч</strong> за ${escapeHtml(fmtNumber(stability.advance_days || 0))} дн.</span>
+        <span>Равномерность <strong>${escapeHtml(stabilityPct(stability.cadence_pct))}</strong></span>
+        <span>Закрыто задач <strong>${escapeHtml(fmtNumber(stability.closed_tasks || 0))}</strong></span>
+      </div>`;
+  };
   const podium = people.filter((p) => Number(p.place) >= 1 && Number(p.place) <= 3);
   const podiumHtml = podium.length
     ? `<div class="rating-modal-podium">${[2, 1, 3]
@@ -3134,7 +3516,7 @@ function openRatingModal(catId) {
           </div>
           <div class="rating-score">
             <div class="rating-score-value">${escapeHtml(p.value || "")}</div>
-            <div class="muted rating-score-detail">${escapeHtml(p.detail || "")}</div>
+            ${modalDetail(p)}
           </div>
         </div>`;
         })
@@ -3160,20 +3542,12 @@ function openPersonTasksModal(name) {
   const profile = currentSprintReport?.people?.[name];
   if (!profile) return;
   const tasks = profile.tasks_active || profile.tasks || [];
-  const rows = tasks
-    .map(
-      (t) => `
-      <div class="person-task-row ${t.risk ? "task-row-risk" : ""}">
-        <div>${taskTitle(t, { showTags: true })}</div>
-        <div class="muted">${timeCell(t.hours, t.estimate_hours, { warnZero: true })}</div>
-      </div>`
-    )
-    .join("");
+  const rows = tasks.map((t) => releaseTaskRowHtml(t, { showAssignee: false })).join("");
   openAppModal(
     `
     <h2 id="app-modal-title">Задачи · ${escapeHtml(shortName(name))}</h2>
     <p class="muted">${escapeHtml(profile.direction || "")} · активных ${fmtNumber(profile.tasks_open)} · с рисками ${fmtNumber(profile.risk_count)}</p>
-    <div class="person-task-list" style="margin-top:0.85rem">${rows || `<p class="muted">Нет задач</p>`}</div>
+    <div class="person-task-list release-task-list" style="margin-top:0.85rem">${rows || `<p class="muted">Нет задач</p>`}</div>
   `,
     { wide: true, type: "person_tasks" }
   );
@@ -3186,68 +3560,147 @@ function isTaskDone(task) {
   return cat === "done";
 }
 
-function releaseTaskRowHtml(t, { forceRisk = false } = {}) {
-  const done = isTaskDone(t);
-  const rowCls = [
-    "person-task-row",
-    forceRisk || t.risk ? "task-row-risk" : "",
-    done ? "task-row-done" : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
-  const status = done
-    ? `<span class="task-done-badge">Выполнено</span>${statusChip(t.status, t.status_category)}`
-    : statusChip(t.status, t.status_category);
+function assigneeStatusNodeHtml(assignee, status, { showPerson = true } = {}) {
+  // Same visual as task modal «Движение» nodes: white rounded pill with chip + status.
+  const person = showPerson
+    ? assignee
+      ? activityPersonChip(assignee, { withLoad: false })
+      : `<span class="muted">—</span>`
+    : "";
+  const statusHtml = status
+    ? `<span class="issue-flow-status">${escapeHtml(activityStatusLabel(status))}</span>`
+    : `<span class="issue-flow-status is-empty">—</span>`;
   return `
-    <div class="${rowCls}">
-      <div>
-        ${taskTitle(t, { showTags: true })}
-        <div class="task-row-status">${status}</div>
-      </div>
-      <div class="muted">${escapeHtml(shortName(t.assignee || t.direction || "—"))}</div>
+    <div class="issue-flow-node${showPerson ? "" : " is-status-only"}">
+      <div class="issue-flow-node-main">${person}${statusHtml}</div>
     </div>`;
 }
 
-function releaseRiskItemsHtml(release) {
-  const items = release.risk_items || [];
-  if (!items.length) {
-    if (release.released || release.risk === "done") {
-      return `<div class="release-modal-risk severity-ok"><div class="release-modal-risk-title">Релиз выпущен</div><p class="muted">Активных задач команды на версии нет</p></div>`;
-    }
-    if (release.risk === "ok" || release.risk === "on_track") {
-      return `<div class="release-modal-risk severity-ok"><div class="release-modal-risk-title">${escapeHtml(release.risk_label || "В графике")}</div><p class="muted">Явных причин риска нет</p></div>`;
+function releaseTaskRowHtml(
+  t,
+  {
+    forceRisk = false,
+    showReleaseTags = false,
+    outOfSprint = false,
+    showAssignee = true,
+  } = {}
+) {
+  const key = String(t?.key || "").trim().toUpperCase();
+  const dossier = key ? currentSprintReport?.issues?.[key] : null;
+  const merged = { ...(dossier || {}), ...(t || {}), key: key || t?.key };
+  const done = isTaskDone(merged);
+  const rowCls = [
+    "person-task-row",
+    "release-task-row",
+    forceRisk || merged.risk ? "task-row-risk" : "",
+    done ? "task-row-done" : "",
+    outOfSprint || merged.in_sprint === false ? "task-row-out-of-sprint" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const tags = (merged.tags || []).filter((tag) => {
+    if (!tag) return false;
+    if (tag.id === "release") return !!showReleaseTags;
+    return true;
+  });
+  const tagsInline = tags.length
+    ? `<span class="task-tags release-task-tags">${tagsHtml(tags, {
+        clickableReleases: !!showReleaseTags,
+      })}</span>`
+    : "";
+  const summary = merged.summary
+    ? `<span class="release-task-summary" title="${escapeHtml(merged.summary)}">${escapeHtml(merged.summary)}</span>`
+    : "";
+  const assigneeKey = merged.assignee_canonical || merged.assignee;
+  const meta = assigneeStatusNodeHtml(assigneeKey || merged.assignee, merged.status, {
+    showPerson: !!showAssignee,
+  });
+  return `
+    <div class="${rowCls}">
+      <div class="release-task-main">
+        <div class="release-task-line">
+          ${issueLink(merged)}
+          ${summary}
+          ${tagsInline}
+        </div>
+      </div>
+      <div class="release-task-meta">${meta}</div>
+    </div>`;
+}
+
+function releaseAiBriefHtml(release) {
+  const local = release?.ai_brief;
+  const bundle = currentSprintReport?.ai_release_briefs || {};
+  const gkey = releaseDateGroupKey(release);
+  const fromBundle =
+    (gkey && bundle.briefs?.[gkey]) ||
+    (release?.id != null && bundle.briefs?.[String(release.id)]) ||
+    bundle.briefs?.[release?.name] ||
+    null;
+  const brief =
+    local?.markdown || local?.text
+      ? local
+      : fromBundle?.status === "ok"
+        ? fromBundle
+        : null;
+  const dateLabel =
+    gkey === "undated" ? "без даты" : fmtDay(brief?.release_date || release?.release_date || gkey);
+  const reused = brief?.reason === "reused" || bundle.reason === "reused";
+  const label = `${reused ? "Прошлая AI-оценка" : "AI-оценка"} релизов на ${dateLabel}`;
+  if (!brief?.markdown && !brief?.text) {
+    if (bundle.status === "error") {
+      return `
+        <div class="person-modal-section">
+          <div class="release-ai-brief tone-info">
+            <div class="person-ai-note-head">
+              <span class="person-ai-note-label">${escapeHtml(label)}</span>
+            </div>
+            <p class="muted">AI-оценка сейчас недоступна.</p>
+          </div>
+        </div>`;
     }
     return "";
   }
-  return items
-    .map((item) => {
-      const dirs = (item.directions || [])
-        .map(
-          (d) => `
-          <span class="release-dir-chip ${Number(d.lag_pp) > 12 ? "is-lagging" : ""}" style="--chip-color:${escapeHtml(d.color || "#8a968c")}">
-            ${escapeHtml(d.direction || "")}
-            <strong>${fmtNumber(d.progress_pct)}%</strong>
-            ${
-              Number(d.lag_pp) > 0
-                ? `<span class="muted">−${fmtNumber(d.lag_pp)} п.п.</span>`
-                : `<span class="muted">${fmtNumber(d.active_tasks)} акт.</span>`
-            }
-          </span>`
-        )
-        .join("");
-      const tasks = (item.tasks || [])
-        .map((t) => releaseTaskRowHtml(t, { forceRisk: true }))
-        .join("");
-      return `
-        <div class="release-modal-risk severity-${escapeHtml(item.severity || "warn")}">
-          <div class="release-modal-risk-title">${escapeHtml(item.title || "Риск")}</div>
-          <p class="release-modal-risk-summary">${escapeHtml(item.summary || "")}</p>
-          ${item.detail ? `<p class="muted release-modal-risk-detail">${escapeHtml(item.detail)}</p>` : ""}
-          ${dirs ? `<div class="release-dirs" style="margin-top:0.55rem">${dirs}</div>` : ""}
-          ${tasks ? `<div class="person-task-list" style="margin-top:0.55rem">${tasks}</div>` : ""}
-        </div>`;
-    })
-    .join("");
+  const markdown = brief.markdown || brief.text || "";
+  const verdictText =
+    brief.verdict ||
+    extractAiVerdict(markdown) ||
+    "Откройте подробности, чтобы увидеть оценку.";
+  const tone = ["attention", "ok", "info"].includes(brief.tone) ? brief.tone : "ok";
+  const author = brief.author || bundle.author || corporateAuthorLabel(bundle) || "corporate";
+  const when = brief.generated_at
+    ? fmtRelativeAgo(brief.generated_at)
+    : bundle.generated_at
+      ? fmtRelativeAgo(bundle.generated_at)
+      : "";
+  const meta = [reused ? "переиспользована" : "", author, when].filter(Boolean).join(" · ");
+  return `
+    <div class="person-modal-section">
+      <div class="release-ai-brief is-collapsed tone-${escapeHtml(tone)}" data-release-ai-card role="button" tabindex="0" aria-expanded="false" title="Нажмите, чтобы раскрыть">
+        <div class="person-ai-note-head">
+          <span class="person-ai-note-label">${escapeHtml(label)}</span>
+          <div class="release-ai-brief-head-right">
+            ${meta ? `<span class="person-ai-note-meta">${escapeHtml(meta)}</span>` : ""}
+            <button type="button" class="release-ai-expand-btn" data-release-ai-expand aria-expanded="false">Подробнее</button>
+          </div>
+        </div>
+        <div class="release-ai-brief-verdict">${formatAiInlineMarkdown(verdictText)}</div>
+        <div class="release-ai-brief-body">${renderAiMarkdown(markdown)}</div>
+      </div>
+    </div>`;
+}
+
+function toggleReleaseAiBriefCard(card, forceOpen = null) {
+  if (!card) return;
+  const open = forceOpen == null ? card.classList.contains("is-collapsed") : !!forceOpen;
+  card.classList.toggle("is-collapsed", !open);
+  card.setAttribute("aria-expanded", open ? "true" : "false");
+  const btn = card.querySelector("[data-release-ai-expand]");
+  if (btn) {
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+    btn.textContent = open ? "Свернуть" : "Подробнее";
+  }
+  card.title = open ? "Нажмите, чтобы свернуть" : "Нажмите, чтобы раскрыть";
 }
 
 function findRelease(releaseId, releaseName) {
@@ -3269,7 +3722,7 @@ function openReleaseModal(releaseId, releaseName) {
       </div>
       <p class="muted">Этого релиза нет в текущем снимке спринта — карточка недоступна.</p>
       `,
-      { wide: true, type: "release" }
+      { wide: true, release: true, type: "release" }
     );
     return;
   }
@@ -3291,11 +3744,10 @@ function openReleaseModal(releaseId, releaseName) {
             ${lagBadge}
           </h3>
           <div class="progress" style="margin:0.35rem 0 0.55rem"><div class="progress-bar" style="width:${Math.min(s.progress_pct || 0, 100)}%"></div></div>
-          <div class="person-task-list">${taskList || `<p class="muted">Нет задач направления</p>`}</div>
+          <div class="person-task-list release-task-list">${taskList || `<p class="muted">Нет задач направления</p>`}</div>
         </div>`;
     })
     .join("");
-  const riskHtml = releaseRiskItemsHtml(release);
   openAppModal(
     `
     <div class="release-modal-head">
@@ -3319,17 +3771,12 @@ function openReleaseModal(releaseId, releaseName) {
           ? ""
           : `<div class="person-stat"><span class="label">Ост. / ёмкость</span><span class="value">${fmtDuration(release.active_estimate_hours)} / ${fmtDuration(release.capacity_hours)}</span></div>`
       }
-      ${
-        Number(release.slip_gap_pp) > 0 && !release.released
-          ? `<div class="person-stat"><span class="label">Отставание</span><span class="value metric-warn">${fmtNumber(release.slip_gap_pp)} п.п.</span></div>`
-          : ""
-      }
     </div>
-    ${riskHtml ? `<div class="person-modal-section"><h3>Риски релиза</h3><div class="release-modal-risks">${riskHtml}</div></div>` : ""}
+    ${releaseAiBriefHtml(release)}
     ${release.description ? `<div class="person-modal-section"><h3>Описание</h3><p class="muted">${escapeHtml(release.description)}</p></div>` : ""}
     ${dirBlocks || `<p class="muted">Нет задач команды на версии</p>`}
   `,
-    { wide: true, type: "release" }
+    { wide: true, release: true, type: "release" }
   );
 }
 
@@ -3349,6 +3796,445 @@ function taskRow(t, { withCommits = true } = {}) {
       <td class="col-hours">${timeCell(t.hours, t.estimate_hours, { warnZero: true })}</td>
       ${commitsCell}
     </tr>`;
+}
+
+function slugifyId(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-zа-яё0-9]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48) || "item";
+}
+
+let reportNavSpyRaf = 0;
+let reportNavSpyLockUntil = 0;
+let reportNavSpyBound = false;
+
+function setReportNavActive(targetId) {
+  const nav = document.getElementById("report-nav");
+  if (!nav || !targetId) return;
+  nav.querySelectorAll(".report-nav-btn").forEach((btn) => {
+    const on = btn.getAttribute("data-nav-target") === targetId;
+    btn.classList.toggle("is-active", on);
+    if (on) btn.setAttribute("aria-current", "true");
+    else btn.removeAttribute("aria-current");
+  });
+}
+
+function reportNavTargetIds() {
+  const nav = document.getElementById("report-nav");
+  if (!nav) return [];
+  return [...nav.querySelectorAll(".report-nav-btn[data-nav-target]")]
+    .map((btn) => btn.getAttribute("data-nav-target"))
+    .filter(Boolean);
+}
+
+function updateReportNavFromScroll() {
+  if (Date.now() < reportNavSpyLockUntil) return;
+  const ids = reportNavTargetIds();
+  if (!ids.length) return;
+  const marker = window.scrollY + Math.min(160, window.innerHeight * 0.22);
+  let active = ids[0];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (!el || el.classList.contains("hidden")) continue;
+    const top = el.getBoundingClientRect().top + window.scrollY;
+    if (top <= marker) active = id;
+  }
+  const nearBottom =
+    window.innerHeight + window.scrollY >=
+    (document.documentElement.scrollHeight || document.body.scrollHeight) - 24;
+  if (nearBottom) active = ids[ids.length - 1];
+  setReportNavActive(active);
+}
+
+function scheduleReportNavSpy() {
+  if (reportNavSpyRaf) return;
+  reportNavSpyRaf = requestAnimationFrame(() => {
+    reportNavSpyRaf = 0;
+    updateReportNavFromScroll();
+  });
+}
+
+function bindReportNavSpy() {
+  if (!reportNavSpyBound) {
+    reportNavSpyBound = true;
+    window.addEventListener("scroll", scheduleReportNavSpy, { passive: true });
+    window.addEventListener("resize", scheduleReportNavSpy);
+  }
+  scheduleReportNavSpy();
+}
+
+function scrollToReportSection(targetId) {
+  const el = document.getElementById(targetId);
+  if (!el) return;
+  setReportNavActive(targetId);
+  // Keep click selection until smooth scroll settles.
+  reportNavSpyLockUntil = Date.now() + 900;
+  el.scrollIntoView({ behavior: "smooth", block: "start" });
+  // Expand collapsed target panels so the jump is useful.
+  if (el.classList.contains("collapsible-panel") && !el.classList.contains("is-open")) {
+    const toggle = el.querySelector("[data-collapse-toggle]");
+    if (toggle) toggle.click();
+  }
+  window.setTimeout(() => {
+    reportNavSpyLockUntil = 0;
+    updateReportNavFromScroll();
+  }, 950);
+}
+
+const NAV_ICONS = {
+  directions: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="8" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/></svg>`,
+  releases: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4v6c0 4.5-3.2 7.8-8 9-4.8-1.2-8-4.5-8-9V7l8-4z"/><path d="M9.5 12l1.8 1.8L15 10"/></svg>`,
+  epics: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 4h9l5 5v11H5V4z"/><path d="M14 4v5h5"/><path d="M8 13h8M8 17h5"/></svg>`,
+  worklog: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3.2 2"/></svg>`,
+  risks: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 4l9 16H3L12 4z"/><path d="M12 10v4M12 17.5h.01"/></svg>`,
+  ratings: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3.8l2.3 4.7 5.2.8-3.8 3.7.9 5.2L12 15.8 7.4 18.2l.9-5.2L4.5 9.3l5.2-.8L12 3.8z"/></svg>`,
+  search: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="6.5"/><path d="M16.2 16.2L20 20"/></svg>`,
+  fallback: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8"/></svg>`,
+};
+
+function reportNavIconHtml(item) {
+  if (item.kind === "direction") {
+    return (DIRECTION_ICONS[item.label] && DIRECTION_ICONS[item.label].svg) || NAV_ICONS.fallback;
+  }
+  return NAV_ICONS[item.icon] || NAV_ICONS.fallback;
+}
+
+function renderReportNav(directions) {
+  const nav = document.getElementById("report-nav");
+  if (!nav) return;
+  const items = [
+    { id: "directions-section", label: "Направления", kind: "main", icon: "directions" },
+    { id: "releases-section", label: "Релизы", kind: "main", icon: "releases" },
+    { id: "epic-timeline-section", label: "Эпики", kind: "main", icon: "epics" },
+  ];
+  for (const d of directions || []) {
+    items.push({
+      id: `direction-${slugifyId(d.name)}`,
+      label: d.name,
+      kind: "direction",
+    });
+  }
+  items.push(
+    { id: "team-section", label: "Списание времени", kind: "main", icon: "worklog" },
+    { id: "risks-section", label: "Риски спринта", kind: "main", icon: "risks" },
+    { id: "ratings-section", label: "Рейтинг", kind: "main", icon: "ratings" }
+  );
+  const visible = items.filter((item) => {
+    const el = document.getElementById(item.id);
+    return el && !el.classList.contains("hidden");
+  });
+  const navBtns = visible
+    .map(
+      (item) => `
+    <button type="button" class="report-nav-btn kind-${escapeHtml(item.kind)}" data-nav-target="${escapeHtml(item.id)}" title="${escapeHtml(item.label)}" aria-label="${escapeHtml(item.label)}">
+      ${reportNavIconHtml(item)}
+    </button>`
+    )
+    .join("");
+  const searchBtn = `
+    <button type="button" class="report-nav-btn kind-search" data-report-search title="Поиск" aria-label="Поиск">
+      ${NAV_ICONS.search}
+    </button>`;
+  nav.innerHTML = `${navBtns}${searchBtn}`;
+  nav.classList.toggle("hidden", !visible.length && !searchBtn);
+  bindReportNavSpy();
+}
+
+let reportSearchDebounce = 0;
+let reportSearchProgressTimer = 0;
+let reportSearchToken = 0;
+let reportSearchIndex = null;
+
+function clearReportSearchState() {
+  if (reportSearchDebounce) {
+    clearTimeout(reportSearchDebounce);
+    reportSearchDebounce = 0;
+  }
+  if (reportSearchProgressTimer) {
+    clearInterval(reportSearchProgressTimer);
+    reportSearchProgressTimer = 0;
+  }
+  reportSearchToken += 1;
+  reportSearchIndex = null;
+}
+
+function normalizeSearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function haystackHas(haystack, query) {
+  return !!query && haystack.includes(query);
+}
+
+function collectSearchTasks(sr) {
+  const byKey = new Map();
+  const push = (t) => {
+    if (!t || typeof t !== "object") return;
+    const key = String(t.key || "").trim().toUpperCase();
+    if (!key) return;
+    const prev = byKey.get(key) || {};
+    byKey.set(key, { ...prev, ...t, key });
+  };
+  for (const issue of Object.values(sr.issues || {})) push(issue);
+  for (const d of sr.directions || []) {
+    for (const t of [...(d.remaining_tasks || []), ...(d.tasks || []), ...(d.top_tasks_by_commits || [])]) {
+      push(t);
+    }
+  }
+  for (const r of sr.releases || []) {
+    for (const t of r.tasks || []) push(t);
+    for (const s of r.sections || []) {
+      for (const t of s.tasks_detail || []) push(t);
+    }
+  }
+  for (const profile of Object.values(sr.people || {})) {
+    for (const t of [...(profile.tasks_active || []), ...(profile.tasks || [])]) push(t);
+  }
+  const risks = sr.risks || {};
+  for (const list of Object.values(risks)) {
+    if (!Array.isArray(list)) continue;
+    for (const t of list) push(t);
+  }
+  for (const epic of sr.epic_timeline?.epics || []) {
+    for (const s of epic.sections || []) {
+      for (const t of s.tasks_detail || []) push(t);
+    }
+  }
+  return [...byKey.values()];
+}
+
+function buildReportSearchIndex(sr) {
+  if (!sr) {
+    return { tasks: [], releases: [], people: [], epics: [] };
+  }
+  const tasks = collectSearchTasks(sr).map((t) => {
+    const key = String(t.key || "").toUpperCase();
+    const dossier = sr.issues?.[key] || {};
+    const merged = { ...dossier, ...t, key };
+    const assignee = merged.assignee_canonical || merged.assignee || "";
+    return {
+      item: merged,
+      hay: normalizeSearchText(
+        [merged.key, merged.summary, assignee, shortGivenSurname(assignee), shortName(assignee)].join(" ")
+      ),
+    };
+  });
+  const releases = (sr.releases || []).map((r) => ({
+    item: r,
+    hay: normalizeSearchText(
+      [r.name, r.description, r.release_date, fmtDay(r.release_date), r.project].join(" ")
+    ),
+  }));
+  const people = Object.values(sr.people || {}).map((p) => ({
+    item: p,
+    hay: normalizeSearchText(
+      [p.name, shortGivenSurname(p.name), shortName(p.name), p.direction, p.role].join(" ")
+    ),
+  }));
+  const epicMap = new Map();
+  for (const e of sr.epic_timeline?.epics || []) {
+    if (e?.key) epicMap.set(String(e.key), e);
+  }
+  for (const d of sr.directions || []) {
+    for (const e of d.epics || []) {
+      const key = String(e.key || "");
+      if (!key || epicMap.has(key)) continue;
+      epicMap.set(key, e);
+    }
+  }
+  const epics = [...epicMap.values()].map((e) => {
+    const releaseNames = (e.releases || []).map((r) => r.name).filter(Boolean);
+    return {
+      item: e,
+      hay: normalizeSearchText([e.key, e.summary, ...releaseNames].join(" ")),
+    };
+  });
+  return { tasks, releases, people, epics };
+}
+
+function getReportSearchIndex() {
+  if (!reportSearchIndex) {
+    reportSearchIndex = buildReportSearchIndex(currentSprintReport);
+  }
+  return reportSearchIndex;
+}
+
+function runReportSearch(query) {
+  const q = normalizeSearchText(query);
+  if (q.length < 2) {
+    return { query: q, groups: [] };
+  }
+  const index = getReportSearchIndex();
+  const limit = 24;
+  const tasks = index.tasks.filter((x) => haystackHas(x.hay, q)).slice(0, limit).map((x) => x.item);
+  const releases = index.releases
+    .filter((x) => haystackHas(x.hay, q))
+    .slice(0, limit)
+    .map((x) => x.item);
+  const people = index.people.filter((x) => haystackHas(x.hay, q)).slice(0, limit).map((x) => x.item);
+  const epics = index.epics.filter((x) => haystackHas(x.hay, q)).slice(0, limit).map((x) => x.item);
+  const groups = [];
+  if (releases.length) groups.push({ type: "releases", label: "Релизы", items: releases });
+  if (tasks.length) groups.push({ type: "tasks", label: "Задачи", items: tasks });
+  if (epics.length) groups.push({ type: "epics", label: "Эпики", items: epics });
+  if (people.length) groups.push({ type: "people", label: "Сотрудники", items: people });
+  return { query: q, groups };
+}
+
+function searchPersonCardHtml(profile) {
+  const name = profile?.name || "—";
+  const avatarUrl =
+    teamAvatarOverride(name) || profile?.avatar_url || null;
+  const load = profile?.load || null;
+  const dir = profile?.direction || "—";
+  return `
+    <button type="button" class="search-person-card person-btn" data-person="${escapeHtml(name)}" title="${escapeHtml(name)}">
+      ${avatarWithLoad(avatarImgHtml(name, avatarUrl), load, { size: "sm" })}
+      <span class="search-person-meta">
+        <span class="search-person-name">${escapeHtml(name)}</span>
+        <span class="search-person-dir">${escapeHtml(dir)}</span>
+      </span>
+    </button>`;
+}
+
+function renderReportSearchResults(root, result) {
+  if (!root) return;
+  if (!result.query || result.query.length < 2) {
+    root.innerHTML = `<p class="muted search-hint">Введите минимум 2 символа</p>`;
+    return;
+  }
+  if (!result.groups.length) {
+    root.innerHTML = `<p class="muted search-hint">Ничего не найдено</p>`;
+    return;
+  }
+  root.innerHTML = `<div class="search-groups">${result.groups
+    .map((g) => {
+      let list = "";
+      if (g.type === "releases") {
+        list = `<div class="search-group-list">${g.items
+          .map((r) => releaseCardHtml(r, { showDate: true }))
+          .join("")}</div>`;
+      } else if (g.type === "tasks") {
+        list = `<div class="search-group-list person-task-list release-task-list">${g.items
+          .map((t) =>
+            releaseTaskRowHtml(t, {
+              showReleaseTags: true,
+              outOfSprint: t.in_sprint === false,
+            })
+          )
+          .join("")}</div>`;
+      } else if (g.type === "epics") {
+        list = `<div class="search-group-list epic-rows">${g.items
+          .map((e) => epicTimelineCardHtml(epicCardForDisplay(e) || e))
+          .join("")}</div>`;
+      } else if (g.type === "people") {
+        list = `<div class="search-group-list">${g.items.map(searchPersonCardHtml).join("")}</div>`;
+      }
+      return `
+        <section class="search-group">
+          <h3 class="search-group-title">${escapeHtml(g.label)} · ${fmtNumber(g.items.length)}</h3>
+          ${list}
+        </section>`;
+    })
+    .join("")}</div>`;
+}
+
+function setReportSearchProgress(layer, pct, { hidden = false } = {}) {
+  const wrap = layer?.querySelector("[data-report-search-progress]");
+  const fill = layer?.querySelector("[data-report-search-progress-fill]");
+  if (!wrap || !fill) return;
+  const value = Math.max(0, Math.min(100, Number(pct) || 0));
+  wrap.classList.toggle("hidden", !!hidden);
+  wrap.setAttribute("aria-hidden", hidden ? "true" : "false");
+  const radius = Number(fill.getAttribute("r")) || 8;
+  const circ = 2 * Math.PI * radius;
+  fill.style.strokeDasharray = `${circ}`;
+  fill.style.strokeDashoffset = `${circ * (1 - value / 100)}`;
+}
+
+function scheduleReportSearch(layer, rawQuery) {
+  if (reportSearchDebounce) clearTimeout(reportSearchDebounce);
+  if (reportSearchProgressTimer) {
+    clearInterval(reportSearchProgressTimer);
+    reportSearchProgressTimer = 0;
+  }
+  const results = layer.querySelector("[data-report-search-results]");
+  const q = String(rawQuery || "").trim();
+  if (q.length < 2) {
+    setReportSearchProgress(layer, 0, { hidden: true });
+    renderReportSearchResults(results, { query: normalizeSearchText(q), groups: [] });
+    return;
+  }
+  const token = ++reportSearchToken;
+  setReportSearchProgress(layer, 8, { hidden: false });
+  let pct = 8;
+  reportSearchProgressTimer = setInterval(() => {
+    pct = Math.min(86, pct + 9 + Math.random() * 8);
+    setReportSearchProgress(layer, pct);
+  }, 70);
+  reportSearchDebounce = setTimeout(() => {
+    reportSearchDebounce = 0;
+    // Artificial delay so progress is visible even on fast local search.
+    window.setTimeout(() => {
+      if (token !== reportSearchToken) return;
+      if (reportSearchProgressTimer) {
+        clearInterval(reportSearchProgressTimer);
+        reportSearchProgressTimer = 0;
+      }
+      setReportSearchProgress(layer, 100);
+      const found = runReportSearch(q);
+      renderReportSearchResults(results, found);
+      window.setTimeout(() => {
+        if (token === reportSearchToken) setReportSearchProgress(layer, 0, { hidden: true });
+      }, 180);
+    }, 220);
+  }, 260);
+}
+
+function openSearchModal() {
+  clearReportSearchState();
+  openAppModal(
+    `
+    <div class="search-modal">
+      <div class="search-modal-head">
+        <h2 id="app-modal-title">Поиск</h2>
+        <div class="search-input-wrap">
+          <input type="search" class="search-input" data-report-search-input placeholder="что ищем?" autocomplete="off" spellcheck="false" />
+          <div class="search-progress-circle hidden" data-report-search-progress aria-hidden="true">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle class="search-progress-track" cx="12" cy="12" r="8"></circle>
+              <circle class="search-progress-fill" data-report-search-progress-fill cx="12" cy="12" r="8"></circle>
+            </svg>
+          </div>
+        </div>
+      </div>
+      <div class="search-modal-results" data-report-search-results>
+        <p class="muted search-hint">Введите минимум 2 символа</p>
+      </div>
+    </div>
+  `,
+    { wide: true, type: "search" }
+  );
+  const layer = getModalsRoot()?.querySelector('.modal[data-modal-type="search"]');
+  const input = layer?.querySelector("[data-report-search-input]");
+  if (!input) return;
+  // Prefetch index while the modal is open.
+  getReportSearchIndex();
+  input.addEventListener("input", () => scheduleReportSearch(layer, input.value));
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.stopPropagation();
+      closeAppModal();
+    }
+  });
+  requestAnimationFrame(() => input.focus());
 }
 
 function renderDirectionDetails(directions) {
@@ -3382,8 +4268,9 @@ function renderDirectionDetails(directions) {
         )
         .join("");
 
+      const dirId = `direction-${slugifyId(d.name)}`;
       return `
-        <section class="panel direction-detail collapsible-panel">
+        <section id="${escapeHtml(dirId)}" class="panel direction-detail collapsible-panel" data-direction-nav="${escapeHtml(d.name)}">
           <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="false">
             <div class="section-head tight">
               <h2>${directionIcon(d.name)} ${escapeHtml(d.name)}</h2>
@@ -3441,121 +4328,257 @@ function renderDirectionDetails(directions) {
 
 function renderTeam(report) {
   const worklogs = report.worklogs || {};
-  const days = worklogs.days || [];
-  let index = Math.max(0, days.indexOf(worklogs.selected_date));
-  if (index < 0) index = Math.max(0, days.length - 1);
-
-  const prevBtn = document.getElementById("day-prev");
-  const nextBtn = document.getElementById("day-next");
-  const label = document.getElementById("worklog-day-label");
-  const note = document.getElementById("worklog-day-note");
   const root = document.getElementById("team-by-direction");
   const mini = document.getElementById("worklog-mini");
   const people = report.people || {};
+  const byDay = (worklogs.by_day || []).filter((day) => !day.is_weekend);
+  const days = byDay.map((day) => day.date);
+  const expectedToDate = Number(worklogs.expected_hours_to_date) || 0;
+  const planHours =
+    Number(worklogs.plan_hours) ||
+    days.length * (Number(worklogs.expected_hours_per_day) || 8);
+  const reportCollectedAt = fmtDateTime(currentReportMeta?.fetched_at);
+  const reportUrl = `${window.location.origin}${window.location.pathname}`;
+  const weekdayNames = ["ВС", "ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ"];
+  const weekdayLabel = (value) => {
+    const d = new Date(`${value}T12:00:00`);
+    return weekdayNames[d.getDay()] || "—";
+  };
+  const shortDate = (value) => {
+    const match = String(value || "").match(/^\d{4}-(\d{2})-(\d{2})/);
+    return match ? `${match[2]}.${match[1]}` : fmtDay(value);
+  };
 
-  function paint() {
-    const date = days[index];
-    const day = (worklogs.by_day || []).find((d) => d.date === date);
-    label.textContent = fmtDay(date);
-    note.textContent = day?.is_weekend
-      ? "выходной — контроль списания отключён"
-      : `норма ${fmtNumber(worklogs.expected_hours_per_day)} ч`;
-    prevBtn.disabled = index <= 0;
-    nextBtn.disabled = index >= days.length - 1;
-
-    const hoursByName = {};
-    (day?.people || []).forEach((p) => {
-      hoursByName[p.name] = p;
-    });
-
-    if (mini) {
-      const dayHours = (day?.people || []).reduce((s, p) => s + (Number(p.hours) || 0), 0);
-      const riskPeople = Object.values(people).filter((p) => (p.risk_count || 0) > 0).length;
-      mini.innerHTML = `
-        <span class="mini-chip"><strong>${fmtDay(date)}</strong></span>
-        <span class="mini-chip">списано за день <strong>${fmtNumber(dayHours)} ч</strong></span>
-        <span class="mini-chip">с рисками <strong>${fmtNumber(riskPeople)}</strong> чел.</span>`;
-    }
-
-    root.innerHTML = (report.directions || [])
-      .map((direction) => {
-        const rows = (direction.members || [])
-          .map((person) => {
-            const profile = people[person.name] || {};
-            const dayRow = hoursByName[person.name];
-            const hours = dayRow ? dayRow.hours : person.hours_today;
-            const level = day?.is_weekend
-              ? "skip"
-              : dayRow
-                ? dayRow.level
-                : person.hours_level;
-            const tasksTone =
-              person.tasks_total > 0 && person.tasks_done === person.tasks_total
-                ? "metric-accent"
-                : "metric-info";
-            const riskCount = Number(profile.risk_count) || 0;
-            const remain = Number(profile.remaining_hours) || 0;
-            return `
-              <tr data-name="${escapeHtml(person.name || "")}" data-tasks="${person.tasks_open || 0}" data-hours="${hours || 0}" data-sprint="${person.hours_sprint || 0}" data-risks="${riskCount}" data-remain="${remain}">
-                <td>${personCell(person.name, person.avatar_url, {
-                  short: true,
-                  load: profile.load || person.load || null,
-                })}</td>
-                <td>
-                  <button type="button" class="tasks-cell-btn metric ${tasksTone}" data-person-tasks="${escapeHtml(person.name)}">
-                    ${fmtNumber(person.tasks_done)}/${fmtNumber(person.tasks_total)}
-                  </button>
-                </td>
-                <td><span class="metric ${riskCount ? "metric-warn" : ""}">${fmtNumber(riskCount)}</span></td>
-                <td>${hoursCell(hours, level)}</td>
-                <td><span class="metric metric-info">${fmtNumber(person.hours_sprint)}</span></td>
-                <td><span class="metric">${tip(fmtDuration(remain), "Сумма remaining estimate по active-задачам")}</span></td>
-              </tr>`;
-          })
-          .join("");
-        return `
-          <div class="direction-block">
-            <h3>${directionIcon(direction.name)} ${escapeHtml(direction.name)}</h3>
-            <div class="table-wrap">
-              <table class="js-sortable table-people">
-                <thead>
-                  <tr>
-                    <th class="sortable col-person" data-sort="name" data-type="string">Сотрудник</th>
-                    <th class="sortable col-tasks" data-sort="tasks" data-type="number">Задачи</th>
-                    <th class="sortable col-risks" data-sort="risks" data-type="number">Риски</th>
-                    <th class="sortable col-hours-day" data-sort="hours" data-type="number">Часы за день</th>
-                    <th class="sortable col-hours-sprint" data-sort="sprint" data-type="number">Часы за спринт</th>
-                    <th class="sortable col-remain" data-sort="remain" data-type="number">Ост. оценка</th>
-                  </tr>
-                </thead>
-                <tbody>${rows || `<tr><td colspan="6" class="muted">Нет сотрудников</td></tr>`}</tbody>
-              </table>
-            </div>
-          </div>`;
-      })
-      .join("");
-    bindSortableTables(root);
+  const weekGroups = [];
+  for (const day of byDay) {
+    const week = Number(day.week_index) || 1;
+    const last = weekGroups[weekGroups.length - 1];
+    if (!last || last.week !== week) weekGroups.push({ week, count: 1 });
+    else last.count += 1;
   }
 
-  prevBtn.onclick = () => {
-    if (index > 0) {
-      index -= 1;
-      paint();
+  const teamRows = [];
+  for (const direction of report.directions || []) {
+    for (const person of direction.members || []) {
+      teamRows.push({ ...person, directionName: direction.name, directionColor: direction.color });
     }
+  }
+
+  const valueLevel = (hours, target) => {
+    if (target <= 0) return "future";
+    if (hours <= 0) return "bad";
+    return hours + 0.01 >= target ? "ok" : "warn";
   };
-  nextBtn.onclick = () => {
-    if (index < days.length - 1) {
-      index += 1;
-      paint();
+  const underlogged = teamRows.filter((person) => {
+    const actual = Number(person.hours_sprint) || 0;
+    return expectedToDate > 0 && actual + 0.01 < expectedToDate;
+  }).length;
+
+  if (mini) {
+    mini.innerHTML = `
+      <span class="mini-chip">рабочих дней <strong>${fmtNumber(days.length)}</strong></span>
+      <span class="mini-chip">план <strong>${fmtDuration(planHours)}</strong></span>
+      <span class="mini-chip">отстают по списаниям <strong>${fmtNumber(underlogged)}</strong> чел.</span>`;
+  }
+
+  const weekHead = weekGroups
+    .map(
+      (group, index) =>
+        `<th class="worklog-week-head${index ? " week-start" : ""}" colspan="${group.count}">Неделя ${fmtNumber(group.week)}</th>`
+    )
+    .join("");
+  const dayHead = byDay
+    .map((day, index) => {
+      const prev = byDay[index - 1];
+      const weekStart = prev && Number(prev.week_index) !== Number(day.week_index);
+      return `<th class="worklog-day-head${weekStart ? " week-start" : ""}${day.is_today ? " is-today" : ""}" title="${escapeHtml(fmtDay(day.date))}">${weekdayLabel(day.date)}</th>`;
+    })
+    .join("");
+
+  const rows = teamRows
+    .map((person) => {
+      const profile = people[person.name] || {};
+      const actual = Number(person.hours_sprint) || 0;
+      const totalLevel = valueLevel(actual, expectedToDate);
+      const missingDays = byDay
+        .filter((day) => {
+          if (day.is_future) return false;
+          const target = Number(day.expected_hours) || 0;
+          const fullNorm = Number(worklogs.expected_hours_per_day) || 8;
+          // Do not remind for today until the configured workday is complete.
+          return !day.is_today || target + 0.01 >= fullNorm;
+        })
+        .map((day) => {
+          const row = (day.people || []).find((item) => item.name === person.name) || {};
+          const hours = Number(row.hours) || 0;
+          const norm = Number(worklogs.expected_hours_per_day) || 8;
+          return { day, missing: Math.max(0, norm - hours) };
+        })
+        .filter((item) => item.missing > 0.01);
+      const missingTotal = missingDays.reduce((sum, item) => sum + item.missing, 0);
+      const reminderText = missingDays.length
+        ? [
+            "Привет! Напоминаю о необходимости списать время.",
+            "",
+            "У тебя не хватает списаний:",
+            ...missingDays.map(
+              ({ day, missing }) =>
+                `${weekdayLabel(day.date)} (${shortDate(day.date)}) — ${fmtNumber(missing)} ч`
+            ),
+            "",
+            `Всего не хватает: ${fmtNumber(missingTotal)} ч`,
+          ].join("\n")
+        : "";
+      const cells = byDay
+        .map((day, index) => {
+          const prev = byDay[index - 1];
+          const weekStart = prev && Number(prev.week_index) !== Number(day.week_index);
+          const row = (day.people || []).find((item) => item.name === person.name) || {};
+          const hours = Number(row.hours) || 0;
+          const level = row.level || (day.is_future ? "future" : valueLevel(hours, Number(day.expected_hours) || 0));
+          const value = level === "future" ? "—" : fmtNumber(hours);
+          const hint = level === "future"
+            ? `${fmtDay(day.date)} · будущий рабочий день`
+            : `${fmtDay(day.date)} · списано ${fmtDuration(hours)} · план ${fmtDuration(day.expected_hours)}`;
+          return `<td class="worklog-day-cell tone-${escapeHtml(level)}${weekStart ? " week-start" : ""}${day.is_today ? " is-today" : ""}" title="${escapeHtml(hint)}"><span>${escapeHtml(value)}</span></td>`;
+        })
+        .join("");
+      return `
+        <tr data-name="${escapeHtml(person.name || "")}" data-total="${actual}">
+          <td class="worklog-person-cell">
+            ${personCell(person.name, person.avatar_url, { short: true, load: profile.load || person.load || null })}
+            <span class="worklog-direction" style="--direction-color:${escapeHtml(person.directionColor || "var(--muted)")}">${escapeHtml(person.directionName || "")}</span>
+          </td>
+          ${cells}
+          <td class="worklog-total-cell tone-${totalLevel}" title="Ожидается к текущему времени: ${escapeHtml(fmtDuration(expectedToDate))}"><span>${fmtNumber(actual)}</span></td>
+          <td class="worklog-plan-cell"><span>${fmtNumber(planHours)}</span></td>
+          <td class="worklog-reminder-cell">
+            ${reminderText ? `<button type="button" class="worklog-reminder-btn" data-worklog-reminder="${escapeHtml(person.name)}" title="Будет скопировано сообщение и выполнен переход в профиль сотрудника в мессенджере">Напомнить</button>` : "—"}
+          </td>
+        </tr>`;
+    })
+    .join("");
+
+  const reminders = new Map();
+  for (const person of teamRows) {
+    const completedMissing = byDay
+      .filter((day) => {
+        if (day.is_future) return false;
+        const target = Number(day.expected_hours) || 0;
+        const norm = Number(worklogs.expected_hours_per_day) || 8;
+        return !day.is_today || target + 0.01 >= norm;
+      })
+      .map((day) => {
+        const row = (day.people || []).find((item) => item.name === person.name) || {};
+        const norm = Number(worklogs.expected_hours_per_day) || 8;
+        return { day, missing: Math.max(0, norm - (Number(row.hours) || 0)) };
+      })
+      .filter((item) => item.missing > 0.01);
+    if (!completedMissing.length) continue;
+    const total = completedMissing.reduce((sum, item) => sum + item.missing, 0);
+    reminders.set(person.name, {
+      text: [
+        "Привет! Напоминаю о необходимости списать время.",
+        "",
+        "У тебя не хватает списаний:",
+        ...completedMissing.map(
+          ({ day, missing }) =>
+            `${weekdayLabel(day.date)} (${shortDate(day.date)}) — ${fmtNumber(missing)} ч`
+        ),
+        "",
+        `Всего не хватает: ${fmtNumber(total)} ч`,
+        "",
+        `[Отчёт](${reportUrl}) на дату ${reportCollectedAt}`,
+      ].join("\n"),
+      messengerUrl: person.messenger_url || people[person.name]?.messenger_url || "",
+    });
+  }
+
+  root.innerHTML = `
+    <div class="worklog-matrix-wrap" role="region" aria-label="Списания сотрудников по рабочим дням спринта" tabindex="0">
+      <table class="js-sortable worklog-matrix" style="min-width:${27.45 + days.length * 3}rem">
+        <thead>
+          <tr>
+            <th class="sortable worklog-person-head" rowspan="2" data-sort="name" data-type="string">Сотрудник</th>
+            ${weekHead}
+            <th class="sortable worklog-total-head" rowspan="2" data-sort="total" data-type="number">Итого</th>
+            <th class="worklog-plan-head" rowspan="2">План</th>
+            <th class="worklog-reminder-head" rowspan="2">Действие</th>
+          </tr>
+          <tr>${dayHead}</tr>
+        </thead>
+        <tbody>${rows || `<tr><td colspan="${days.length + 4}" class="muted">Нет сотрудников</td></tr>`}</tbody>
+      </table>
+    </div>`;
+  bindSortableTables(root);
+  const copyText = async (value) => {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+      return;
     }
+    const area = document.createElement("textarea");
+    area.value = value;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const copied = document.execCommand("copy");
+    area.remove();
+    if (!copied) throw new Error("copy failed");
   };
-  paint();
+  root.querySelectorAll("[data-worklog-reminder]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const reminder = reminders.get(button.dataset.worklogReminder);
+      if (!reminder) return;
+      try {
+        const copyPromise = copyText(reminder.text);
+        if (reminder.messengerUrl) {
+          window.open(reminder.messengerUrl, "_blank", "noopener,noreferrer");
+        }
+        await copyPromise;
+        button.textContent = "Скопировано";
+        button.classList.add("is-copied");
+        if (!reminder.messengerUrl) {
+          button.title = "Сообщение скопировано; messenger_url сотрудника не настроен";
+        }
+        window.setTimeout(() => {
+          button.textContent = "Напомнить";
+          button.classList.remove("is-copied");
+        }, 2200);
+      } catch (_error) {
+        button.textContent = "Не скопировано";
+        button.classList.add("is-error");
+      }
+    });
+  });
 }
 
 function renderRisks(risks) {
-  function block(title, items, empty) {
-    const count = (items || []).length;
-    const rows = (items || [])
+  const filters = {
+    outsideSprint: true,
+    withoutDate: true,
+  };
+
+  function visibleItems(items) {
+    return (items || []).filter((item) => {
+      if (!filters.outsideSprint && item.release_outside_sprint) return false;
+      if (!filters.withoutDate && item.release_without_date) return false;
+      return true;
+    });
+  }
+
+  function block(title, sourceItems, empty) {
+    const allItems = sourceItems || [];
+    const items = visibleItems(allItems);
+    const count = items.length;
+    const countText =
+      count === allItems.length
+        ? count
+          ? `${count} задач`
+          : "пусто"
+        : `${count} из ${allItems.length} задач`;
+    const rows = items
       .map(
         (item) => `
       <tr data-assignee="${escapeHtml(item.assignee || "")}" data-direction="${escapeHtml(item.direction || "")}" data-status="${escapeHtml(item.status || "")}" data-hours="${item.hours || 0}" data-key="${escapeHtml(item.key || "")}">
@@ -3575,7 +4598,7 @@ function renderRisks(risks) {
     return `
       <div class="risk-block">
         <h3>${title}</h3>
-        <p class="risk-count">${count ? `${count} задач` : "пусто"}</p>
+        <p class="risk-count">${countText}</p>
         ${
           rows
             ? `<div class="table-wrap"><table class="js-sortable js-collapsible table-risks" data-collapse-limit="${TASK_TABLE_PREVIEW}">
@@ -3597,26 +4620,57 @@ function renderRisks(risks) {
   }
 
   const root = document.getElementById("risks");
-  root.innerHTML = [
-    block(
-      "Могут не закрыться до конца спринта",
-      risks.at_risk,
-      "Критичных задач не видно"
-    ),
-    block(
-      `Застрявшие (нет обновлений ≥ ${fmtNumber(risks.stale_days ?? currentSprintReport?.settings?.metrics?.stale_days ?? 5)} дн.)`,
-      risks.stale,
-      "Нет застрявших задач"
-    ),
-    block("Открыты без списаний", risks.no_worklogs, "Нет таких задач"),
-    block(
-      "Задачи без оценки",
-      risks.no_estimate,
-      "У всех открытых задач спринта есть оценка"
-    ),
-  ].join("");
-  bindSortableTables(root);
-  bindCollapsibleTables(root);
+  function paint() {
+    const toolbar = `
+      <div class="risk-filters" role="group" aria-label="Показывать риск-задачи">
+        <span class="risk-filters-label">Показывать задачи:</span>
+        <label class="risk-filter-toggle">
+          <input type="checkbox" data-risk-filter="outsideSprint" ${filters.outsideSprint ? "checked" : ""}>
+          <span>Релиз вне спринта</span>
+        </label>
+        <label class="risk-filter-toggle">
+          <input type="checkbox" data-risk-filter="withoutDate" ${filters.withoutDate ? "checked" : ""}>
+          <span>Релиз без даты</span>
+        </label>
+      </div>`;
+    root.innerHTML = toolbar + [
+      block(
+        "Могут не закрыться до конца спринта",
+        risks.at_risk,
+        "Критичных задач не видно"
+      ),
+      block(
+        `Застрявшие (нет обновлений ≥ ${fmtNumber(risks.stale_days ?? currentSprintReport?.settings?.metrics?.stale_days ?? 5)} дн.)`,
+        risks.stale,
+        "Нет застрявших задач"
+      ),
+      block("Открыты без списаний", risks.no_worklogs, "Нет таких задач"),
+      block(
+        "Задачи без оценки",
+        risks.no_estimate,
+        "У всех открытых задач спринта есть оценка"
+      ),
+      block(
+        "Задачи без релиза",
+        risks.no_release,
+        "У всех открытых задач спринта указан релиз"
+      ),
+      block(
+        "Релиз выпущен — задача не закрыта",
+        risks.released_not_closed,
+        "Нет открытых задач в уже выпущенных релизах"
+      ),
+    ].join("");
+    root.querySelectorAll("[data-risk-filter]").forEach((input) => {
+      input.addEventListener("change", () => {
+        filters[input.dataset.riskFilter] = input.checked;
+        paint();
+      });
+    });
+    bindSortableTables(root);
+    bindCollapsibleTables(root);
+  }
+  paint();
 }
 
 function paintReport(report) {
@@ -3656,6 +4710,7 @@ function paintReport(report) {
     Number(sr.settings?.ui?.task_table_preview) || 5
   );
   showReport(true);
+  reportSearchIndex = null;
   renderSprintHeader(sr.sprint, sr.team_mood, sr.ai_brief);
   renderDirections(directions);
   renderReleases(sr.releases || []);
@@ -3665,6 +4720,7 @@ function paintReport(report) {
   renderRisks(sr.risks || {});
   renderRatings(sr.ratings || []);
   bindCollapseToggles(document.getElementById("report-root") || document);
+  renderReportNav(directions);
 }
 
 async function refreshData() {
@@ -3718,10 +4774,52 @@ async function main() {
   document.addEventListener("scroll", hideFloatTip, true);
 
   document.addEventListener("click", (event) => {
+    const searchNavBtn = event.target.closest("[data-report-search]");
+    if (searchNavBtn) {
+      event.preventDefault();
+      openSearchModal();
+      return;
+    }
+    const navBtn = event.target.closest("[data-nav-target]");
+    if (navBtn) {
+      event.preventDefault();
+      scrollToReportSection(navBtn.getAttribute("data-nav-target"));
+      return;
+    }
     const closeEl = event.target.closest("[data-modal-close]");
     if (closeEl) {
       closeAppModal();
       return;
+    }
+    const searchTaskRow = event.target.closest(
+      '.modal[data-modal-type="search"] .release-task-row'
+    );
+    if (
+      searchTaskRow &&
+      !event.target.closest("a, .issue-key-btn, .person-btn, .release-tag-btn, button")
+    ) {
+      const issueBtn = searchTaskRow.querySelector(".issue-key-btn[data-issue]");
+      if (issueBtn) {
+        event.preventDefault();
+        openIssueModal(issueBtn.getAttribute("data-issue"), {
+          jiraUrl: issueBtn.getAttribute("data-jira-url"),
+        });
+        return;
+      }
+    }
+    const releaseAiCard = event.target.closest("[data-release-ai-card]");
+    if (releaseAiCard) {
+      // Issue/person links must fall through; expand btn and empty card area toggle.
+      if (
+        !event.target.closest(
+          "a, .issue-key-btn, .person-btn, .ai-person-link, .release-tag-btn"
+        )
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleReleaseAiBriefCard(releaseAiCard);
+        return;
+      }
     }
     const tasksBtn = event.target.closest("[data-person-tasks]");
     if (tasksBtn) {
@@ -3737,11 +4835,32 @@ async function main() {
       openPersonModal(personBtn.getAttribute("data-person"));
       return;
     }
+    const epicBtn = event.target.closest(".issue-key-btn[data-epic]");
+    if (epicBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      openEpicModal(epicBtn.getAttribute("data-epic"));
+      return;
+    }
     const issueBtn = event.target.closest(".issue-key-btn[data-issue]");
     if (issueBtn) {
       event.preventDefault();
       event.stopPropagation();
-      openIssueModal(issueBtn.getAttribute("data-issue"));
+      openIssueModal(issueBtn.getAttribute("data-issue"), {
+        jiraUrl: issueBtn.getAttribute("data-jira-url"),
+      });
+      return;
+    }
+    const releaseTagBtn = event.target.closest(
+      ".release-tag-btn[data-release-id], .epic-release-chip[data-release-id]"
+    );
+    if (releaseTagBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      openReleaseModal(
+        releaseTagBtn.getAttribute("data-release-id"),
+        releaseTagBtn.getAttribute("data-release-name") || releaseTagBtn.textContent
+      );
       return;
     }
     const epicRow = event.target.closest(
@@ -3788,8 +4907,16 @@ async function main() {
     }
     const aiCard = event.target.closest(".ai-brief-card[data-ai-brief]");
     if (aiCard) {
-      openAiBriefModal(currentSprintReport?.ai_brief);
-      return;
+      if (
+        event.target.closest(
+          "a, .issue-key-btn, .person-btn, .ai-person-link, .release-tag-btn"
+        )
+      ) {
+        // fall through to issue/person handlers
+      } else {
+        openAiBriefModal(currentSprintReport?.ai_brief);
+        return;
+      }
     }
     const ratingCard = event.target.closest(".rating-card[data-rating-id]");
     if (ratingCard && !event.target.closest(".person-btn")) {
@@ -3802,6 +4929,12 @@ async function main() {
       hideFloatTip();
     }
     if (event.key === "Enter" || event.key === " ") {
+      const releaseAiCard = event.target.closest?.("[data-release-ai-card]");
+      if (releaseAiCard && !event.target.closest?.("a, .issue-key-btn, .person-btn")) {
+        event.preventDefault();
+        toggleReleaseAiBriefCard(releaseAiCard);
+        return;
+      }
       const epicRow = event.target.closest?.(
         ".epic-row[data-epic-key], tr.epic-table-row[data-epic-key]"
       );
@@ -3825,7 +4958,10 @@ async function main() {
         return;
       }
       const aiCard = event.target.closest?.(".ai-brief-card[data-ai-brief]");
-      if (aiCard) {
+      if (
+        aiCard &&
+        !event.target.closest?.("a, .issue-key-btn, .person-btn, .ai-person-link")
+      ) {
         event.preventDefault();
         openAiBriefModal(currentSprintReport?.ai_brief);
         return;

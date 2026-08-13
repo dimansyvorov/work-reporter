@@ -14,7 +14,9 @@ from .jira_client import collect_jira_raw
 from .metrics import compute_report
 from .mock_data import build_mock_raw
 from .ai_brief import attach_ai_brief
+from .ai_release_briefs import attach_ai_release_briefs
 from .ai_person_notes import attach_ai_person_notes
+from .ai_reuse import reuse_previous_ai
 from .publish import localize_avatars
 from .state import AppState
 from .team_config import load_team_config
@@ -69,6 +71,7 @@ def collect_and_build(
     *,
     raw_path: Path,
     report_path: Path,
+    reuse_ai: bool = False,
 ) -> dict:
     if not state.begin_collection("Собираю данные…"):
         existing = state.get_report()
@@ -277,13 +280,27 @@ def collect_and_build(
             except (OSError, json.JSONDecodeError):
                 previous_report = None
 
-        state.run_step("ai_brief", "AI-оценка спринта…")
-        state.set_status("collecting", "Генерирую AI-оценку спринта…")
-        report = attach_ai_brief(
-            report,
-            previous_report=previous_report if isinstance(previous_report, dict) else None,
-            mock=cfg.mock,
+        if reuse_ai:
+            report = reuse_previous_ai(
+                report,
+                previous_report if isinstance(previous_report, dict) else None,
+            )
+
+        ai_brief_action = (
+            "Переиспользую прошлую AI-оценку спринта…"
+            if reuse_ai
+            else "Генерирую AI-оценку спринта…"
         )
+        state.run_step("ai_brief", ai_brief_action)
+        state.set_status("collecting", ai_brief_action)
+        if not reuse_ai:
+            report = attach_ai_brief(
+                report,
+                previous_report=(
+                    previous_report if isinstance(previous_report, dict) else None
+                ),
+                mock=cfg.mock,
+            )
         brief = ((report or {}).get("sprint_report") or {}).get("ai_brief") or {}
         brief_status = brief.get("status") or "skipped"
         if brief_status == "ok":
@@ -291,7 +308,13 @@ def collect_and_build(
                 "ai_brief",
                 "done",
                 f"AI-оценка: {brief.get('author') or 'corporate'}"
-                + (" (cache)" if brief.get("reason") == "cache" else ""),
+                + (
+                    " (прошлая оценка)"
+                    if brief.get("reason") == "reused"
+                    else " (cache)"
+                    if brief.get("reason") == "cache"
+                    else ""
+                ),
             )
         elif brief_status == "error":
             state.update_step(
@@ -306,13 +329,21 @@ def collect_and_build(
                 f"AI-оценка пропущена ({brief.get('reason') or 'skipped'})",
             )
 
-        state.run_step("ai_person_notes", "AI-заметки по сотрудникам…")
-        state.set_status("collecting", "Генерирую AI-заметки по сотрудникам…")
-        report = attach_ai_person_notes(
-            report,
-            previous_report=previous_report if isinstance(previous_report, dict) else None,
-            mock=cfg.mock,
+        ai_notes_action = (
+            "Переиспользую прошлые AI-заметки по сотрудникам…"
+            if reuse_ai
+            else "Генерирую AI-заметки по сотрудникам…"
         )
+        state.run_step("ai_person_notes", ai_notes_action)
+        state.set_status("collecting", ai_notes_action)
+        if not reuse_ai:
+            report = attach_ai_person_notes(
+                report,
+                previous_report=(
+                    previous_report if isinstance(previous_report, dict) else None
+                ),
+                mock=cfg.mock,
+            )
         notes = ((report or {}).get("sprint_report") or {}).get("ai_person_notes") or {}
         notes_status = notes.get("status") or "skipped"
         if notes_status == "ok":
@@ -321,7 +352,13 @@ def collect_and_build(
                 "ai_person_notes",
                 "done",
                 f"AI-заметки: {n_count}"
-                + (" (cache)" if notes.get("reason") == "cache" else ""),
+                + (
+                    " (прошлые оценки)"
+                    if notes.get("reason") == "reused"
+                    else " (cache)"
+                    if notes.get("reason") == "cache"
+                    else ""
+                ),
             )
         elif notes_status == "error":
             state.update_step(
@@ -334,6 +371,66 @@ def collect_and_build(
                 "ai_person_notes",
                 "done",
                 f"AI-заметки пропущены ({notes.get('reason') or 'skipped'})",
+            )
+
+        ai_releases_action = (
+            "Переиспользую прошлые AI-оценки групп релизов…"
+            if reuse_ai
+            else "Генерирую AI-оценку групп релизов…"
+        )
+        state.run_step("ai_release_briefs", ai_releases_action)
+        state.set_status("collecting", ai_releases_action)
+
+        def release_ai_progress(current, total, name=None):
+            label = f"AI-группы релизов: {current}/{total}"
+            if name:
+                short = str(name).strip()
+                if len(short) > 42:
+                    short = short[:41].rstrip() + "…"
+                label = f"{label} · {short}"
+            state.update_step("ai_release_briefs", "running", label)
+            state.set_status(
+                "collecting",
+                f"Генерирую AI-оценку групп релизов… {current}/{total}",
+            )
+
+        if not reuse_ai:
+            report = attach_ai_release_briefs(
+                report,
+                previous_report=(
+                    previous_report if isinstance(previous_report, dict) else None
+                ),
+                mock=cfg.mock,
+                on_progress=release_ai_progress,
+            )
+        release_briefs = (
+            ((report or {}).get("sprint_report") or {}).get("ai_release_briefs") or {}
+        )
+        rb_status = release_briefs.get("status") or "skipped"
+        if rb_status == "ok":
+            state.update_step(
+                "ai_release_briefs",
+                "done",
+                f"AI-релизы: {release_briefs.get('ok_count') or len(release_briefs.get('briefs') or {})}"
+                + (
+                    " (прошлые оценки)"
+                    if release_briefs.get("reason") == "reused"
+                    else " (cache)"
+                    if release_briefs.get("reason") == "cache"
+                    else ""
+                ),
+            )
+        elif rb_status == "error":
+            state.update_step(
+                "ai_release_briefs",
+                "done",
+                f"AI-релизы недоступны: {str(release_briefs.get('error') or 'error')[:80]}",
+            )
+        else:
+            state.update_step(
+                "ai_release_briefs",
+                "done",
+                f"AI-релизы пропущены ({release_briefs.get('reason') or 'skipped'})",
             )
 
         state.run_step("save", "Сохраняю отчёт…")

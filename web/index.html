@@ -49,6 +49,7 @@
       <section id="error" class="panel error hidden"></section>
 
       <div id="report-root" class="hidden">
+        <nav id="report-nav" class="report-nav" aria-label="Разделы отчёта"></nav>
         <section id="sprint-header" class="summary"></section>
 
         <section id="directions-section" class="panel collapsible-panel is-open">
@@ -85,7 +86,7 @@
           <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="false">
             <div class="section-head tight">
               <h2>Эпики</h2>
-              <p class="muted">Длина полосы — оценка; заливка — доля закрытых задач</p>
+              <p class="muted">Только эпики релизного окна · длина полосы — оценка; заливка — доля закрытых задач</p>
             </div>
             <span class="collapse-toggle-btn">
               <span class="collapse-chevron" aria-hidden="true">▾</span>
@@ -106,7 +107,7 @@
           <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="false">
             <div class="section-head tight">
               <h2>Списание времени</h2>
-              <p class="muted">По дням спринта</p>
+              <p class="muted">Все рабочие дни спринта</p>
             </div>
             <span class="collapse-toggle-btn">
               <span class="collapse-chevron" aria-hidden="true">▾</span>
@@ -115,15 +116,11 @@
           </button>
           <div id="worklog-mini" class="collapsible-summary"></div>
           <div class="collapsible-body">
-            <div class="toolbar">
-              <div class="toolbar-right day-nav">
-                <button type="button" id="day-prev" class="nav-btn" aria-label="Предыдущий день">←</button>
-                <div class="day-current">
-                  <div id="worklog-day-label">—</div>
-                  <div id="worklog-day-note" class="muted"></div>
-                </div>
-                <button type="button" id="day-next" class="nav-btn" aria-label="Следующий день">→</button>
-              </div>
+            <div class="worklog-legend" aria-label="Обозначения списаний">
+              <span><i class="worklog-dot is-ok"></i>норма</span>
+              <span><i class="worklog-dot is-warn"></i>меньше нормы</span>
+              <span><i class="worklog-dot is-bad"></i>нет списаний</span>
+              <span><i class="worklog-dot is-future"></i>будущий день</span>
             </div>
             <div id="team-by-direction"></div>
           </div>

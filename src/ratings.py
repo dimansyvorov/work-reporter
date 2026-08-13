@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from statistics import pstdev
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .team import TEAM_ROSTER, canonical_team_name
 from .team_config import get_team_config
@@ -28,6 +29,172 @@ def _working_days(start: date, end: date) -> list[date]:
             days.append(cur)
         cur += timedelta(days=1)
     return days
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip().replace("Z", "+00:00")
+    if len(text) >= 5 and text[-5] in "+-" and ":" not in text[-5:]:
+        text = text[:-2] + ":" + text[-2:]
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _rating_timezone() -> ZoneInfo:
+    name = get_team_config().ratings.timezone
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("Europe/Moscow")
+
+
+def _workday_start(day: date, tz: ZoneInfo, start_hour: float) -> datetime:
+    hour = int(start_hour)
+    minute = int(round((start_hour - hour) * 60))
+    if minute >= 60:
+        hour += 1
+        minute = 0
+    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz)
+
+
+def _expected_hours_for_day(
+    day: date, *, now: datetime, expected_hours: float, start_hour: float
+) -> float:
+    if day < now.date():
+        return expected_hours
+    if day > now.date():
+        return 0.0
+    elapsed = (now - _workday_start(day, now.tzinfo, start_hour)).total_seconds() / 3600.0
+    return min(expected_hours, max(0.0, elapsed))
+
+
+def _next_workday(day: date) -> date:
+    cur = day + timedelta(days=1)
+    while _is_weekend(cur):
+        cur += timedelta(days=1)
+    return cur
+
+
+def _allowed_record_day(work_day: date, grace_workdays: int) -> date:
+    allowed = work_day
+    for _ in range(max(0, grace_workdays)):
+        allowed = _next_workday(allowed)
+    return allowed
+
+
+def _worklog_discipline(
+    name: str,
+    *,
+    worklogs: list[dict],
+    now: datetime,
+    expected_hours: float,
+    start_hour: float,
+    grace_workdays: int,
+    advance_tolerance_hours: float,
+) -> dict:
+    """Score timely recording and discourage logging hours before they elapsed."""
+    tz = now.tzinfo
+    rows: list[dict] = []
+    for log in worklogs:
+        author = log.get("author") or {}
+        raw_name = author.get("displayName") or author.get("name") or author.get("emailAddress")
+        if canonical_team_name(raw_name) != name:
+            continue
+        started = _parse_dt(log.get("started"))
+        created = _parse_dt(log.get("created"))
+        updated = _parse_dt(log.get("updated"))
+        recorded = max((x for x in (created, updated) if x), default=None)
+        if not started or not recorded:
+            continue
+        started_local = started.astimezone(tz)
+        recorded_local = recorded.astimezone(tz)
+        hours = max(0.0, float(log.get("time_spent_seconds") or 0) / 3600.0)
+        if hours <= 0:
+            continue
+        rows.append(
+            {
+                "work_day": started_local.date(),
+                "recorded": recorded_local,
+                "hours": hours,
+            }
+        )
+
+    total_hours = sum(row["hours"] for row in rows)
+    if total_hours <= 0:
+        return {
+            "score": 100.0,
+            "timely_pct": None,
+            "advance_hours": 0.0,
+            "advance_days": 0,
+            "cadence_pct": None,
+            "known_hours": 0.0,
+        }
+
+    timely_hours = 0.0
+    advance_hours = 0.0
+    by_day: dict[date, list[dict]] = defaultdict(list)
+    for row in rows:
+        allowed_day = _allowed_record_day(row["work_day"], grace_workdays)
+        if row["recorded"].date() <= allowed_day:
+            timely_hours += row["hours"]
+        by_day[row["work_day"]].append(row)
+
+    cadence_values: list[float] = []
+    advance_days = 0
+    for work_day, day_rows in by_day.items():
+        day_rows.sort(key=lambda x: x["recorded"])
+        cumulative = 0.0
+        day_advance_peak = 0.0
+        record_times: list[datetime] = []
+        for row in day_rows:
+            cumulative += row["hours"]
+            if row["recorded"].date() < work_day:
+                # The entry was created before the day it claims to cover.
+                day_advance_peak = max(day_advance_peak, cumulative)
+                continue
+            if row["recorded"].date() != work_day:
+                continue
+            elapsed = _expected_hours_for_day(
+                work_day,
+                now=row["recorded"],
+                expected_hours=expected_hours,
+                start_hour=start_hour,
+            )
+            day_advance_peak = max(
+                day_advance_peak,
+                max(0.0, cumulative - elapsed - advance_tolerance_hours),
+            )
+            record_times.append(row["recorded"])
+        if day_advance_peak > 0:
+            advance_days += 1
+            advance_hours += day_advance_peak
+        # A single honest daily entry is neutral. Multiple entries get a small
+        # bonus for being spread across the workday, without rewarding splitting.
+        if len(record_times) >= 2 and expected_hours > 0:
+            span = (record_times[-1] - record_times[0]).total_seconds() / 3600.0
+            cadence_values.append(min(1.0, max(0.0, span / (expected_hours * 0.6))))
+
+    timely_pct = timely_hours / total_hours
+    advance_ratio = min(1.0, advance_hours / total_hours)
+    cadence_pct = (
+        sum(cadence_values) / len(cadence_values) if cadence_values else None
+    )
+    cadence_score = cadence_pct if cadence_pct is not None else 1.0
+    score = 100.0 * (
+        0.70 * timely_pct + 0.20 * (1.0 - advance_ratio) + 0.10 * cadence_score
+    )
+    return {
+        "score": max(0.0, min(100.0, score)),
+        "timely_pct": timely_pct * 100.0,
+        "advance_hours": advance_hours,
+        "advance_days": advance_days,
+        "cadence_pct": cadence_pct * 100.0 if cadence_pct is not None else None,
+        "known_hours": total_hours,
+    }
 
 
 def _round(value: float | None, digits: int = 1) -> float | None:
@@ -144,11 +311,15 @@ def compute_ratings(
     hours_by_person_day: dict[str, dict[str, float]],
     hours_by_issue: dict[str, float],
     hours_by_person_issue: dict[str, dict[str, float]] | None = None,
+    worklogs: list[dict] | None = None,
     links: dict,
     gitlab_raw: dict | None,
     expected_hours: float,
 ) -> list[dict]:
-    today = datetime.now(timezone.utc).date()
+    rating_cfg = get_team_config().ratings
+    tz = _rating_timezone()
+    now = datetime.now(tz)
+    today = now.date()
     start = date.fromisoformat(sprint["start_date"]) if sprint.get("start_date") else None
     end = date.fromisoformat(sprint["end_date"]) if sprint.get("end_date") else None
     if not start or not end:
@@ -208,38 +379,74 @@ def compute_ratings(
             prize_places[name] += 1
             prize_points[name] += points[place]
 
-    # 1) Человек-стабильность — ежедневная близость к норме, штраф за «свалку» в конце
+    # 1) Человек-стабильность: pace vs elapsed work time + worklog discipline.
     stability_rows = []
     for name in TEAM_ROSTER:
         daily = []
+        day_targets = []
         for day in workdays:
             daily.append(hours_by_person_day.get(name, {}).get(day.isoformat(), 0.0))
+            day_targets.append(
+                _expected_hours_for_day(
+                    day,
+                    now=now,
+                    expected_hours=expected_hours,
+                    start_hour=rating_cfg.workday_start_hour,
+                )
+            )
         if not workdays:
             continue
-        # Per-day score: 1.0 at exactly expected, 0 at 0h or ≥2× expected
+        # Current day target grows with elapsed working time; completed days use full norm.
         day_scores = []
-        for hours in daily:
-            if expected_hours <= 0:
-                day_scores.append(0.0)
+        for hours, target in zip(daily, day_targets):
+            if target <= 0:
+                # Before the workday starts, no hours is correct; advance logs are not.
+                day_scores.append(1.0 if hours <= 0 else 0.0)
                 continue
-            ratio = hours / expected_hours
+            ratio = hours / target
             day_scores.append(max(0.0, 1.0 - abs(ratio - 1.0)))
         mean_day = sum(day_scores) / len(day_scores)
-        spread = pstdev(daily) if len(daily) > 1 else 0.0
-        total_hours = sum(daily)
-        # Binge penalty: large share of hours dumped into last 1–2 workdays
-        tail = sum(daily[-2:]) if len(daily) >= 2 else total_hours
-        binge = (tail / total_hours) if total_hours > 0 else 0.0
-        score = mean_day * 100.0 - spread * 2.0 - binge * 25.0
+        normalized = [
+            hours / target if target > 0 else (0.0 if hours <= 0 else 2.0)
+            for hours, target in zip(daily, day_targets)
+        ]
+        spread = pstdev(normalized) if len(normalized) > 1 else 0.0
+        discipline = _worklog_discipline(
+            name,
+            worklogs=worklogs or [],
+            now=now,
+            expected_hours=expected_hours,
+            start_hour=rating_cfg.workday_start_hour,
+            grace_workdays=rating_cfg.worklog_grace_workdays,
+            advance_tolerance_hours=rating_cfg.advance_tolerance_hours,
+        )
+        # Daily pace dominates; actual worklog timestamps provide anti-gaming checks.
+        score = mean_day * 65.0 + discipline["score"] * 0.35 - spread * 8.0
         closed_n = int(closed_by_person.get(name, 0))
+        timely = discipline.get("timely_pct")
+        timely_text = "—" if timely is None else f"{_round(timely, 0)}%"
         stability_rows.append(
             {
                 "name": name,
                 "direction": TEAM_ROSTER[name],
                 "score": score,
                 "tiebreak": closed_n,
-                "value": f"{_round(mean_day * 100.0, 0)}% к норме",
-                "detail": f"σ={_round(spread, 1)} · закрыто {closed_n}",
+                "value": f"{_round(score, 0)} баллов",
+                "detail": (
+                    f"темп {_round(mean_day * 100.0, 0)}% · "
+                    f"вовремя {timely_text} · "
+                    f"наперёд {_round(discipline.get('advance_hours') or 0.0, 1)} ч "
+                    f"за {int(discipline.get('advance_days') or 0)} дн."
+                ),
+                "stability": {
+                    "pace_pct": _round(mean_day * 100.0, 1),
+                    "timely_pct": _round(timely, 1),
+                    "advance_hours": _round(discipline.get("advance_hours"), 2),
+                    "advance_days": int(discipline.get("advance_days") or 0),
+                    "cadence_pct": _round(discipline.get("cadence_pct"), 1),
+                    "spread": _round(spread, 2),
+                    "closed_tasks": closed_n,
+                },
             }
         )
     stability_top = _with_places(stability_rows)
@@ -249,9 +456,9 @@ def compute_ratings(
             "id": "stability",
             "title": "Человек-стабильность",
             "description": (
-                "Близость ежедневных списаний к норме; "
-                "учитывается доля часов в последних 2 рабочих днях. "
-                "При равном score выше тот, у кого больше закрытых задач"
+                "Темп списаний относительно уже прошедшего рабочего времени; "
+                "учитываются задние и преждевременные worklog. "
+                "При равном балле выше тот, у кого больше закрытых задач"
             ),
             "enabled": True,
             "people": stability_top,

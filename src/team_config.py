@@ -106,17 +106,16 @@ class MetricsSettings:
     risks_limit: int = 40
     person_tasks_limit: int = 40
     person_active_tasks_limit: int = 30
-    # Hybrid load: when Jira remaining is 0/missing on an active task
-    # (typical for QA after dev estimate was burned), assume at least this
-    # many hours, or estimate × ratio — whichever is larger.
-    load_fallback_hours: float = 2.0
-    load_fallback_estimate_ratio: float = 0.25
 
 
 @dataclass
 class RatingsSettings:
     top_n: int = 3
     place_points: dict[int, int] = field(default_factory=lambda: {1: 3, 2: 2, 3: 1})
+    timezone: str = "Europe/Moscow"
+    workday_start_hour: float = 9.0
+    worklog_grace_workdays: int = 1
+    advance_tolerance_hours: float = 0.5
 
 
 @dataclass
@@ -161,6 +160,8 @@ class TeamConfig:
     jira_profile_urls: dict[str, str] = field(default_factory=dict)
     gitlab_usernames: dict[str, str] = field(default_factory=dict)
     gitlab_profile_urls: dict[str, str] = field(default_factory=dict)
+    # person display name -> external messenger profile URL or app deep link
+    messenger_urls: dict[str, str] = field(default_factory=dict)
     direction_order: list[str] = field(default_factory=list)  # display names
     direction_keys_order: list[str] = field(default_factory=list)
     dev_directions: set[str] = field(default_factory=set)  # display names
@@ -251,6 +252,10 @@ class TeamConfig:
                 "place_points": {
                     str(k): v for k, v in sorted(self.ratings.place_points.items())
                 },
+                "timezone": self.ratings.timezone,
+                "workday_start_hour": self.ratings.workday_start_hour,
+                "worklog_grace_workdays": self.ratings.worklog_grace_workdays,
+                "advance_tolerance_hours": self.ratings.advance_tolerance_hours,
             },
             "ui": {
                 "task_table_preview": self.ui.task_table_preview,
@@ -320,6 +325,12 @@ class TeamConfig:
         if not canonical:
             return None
         return self.gitlab_usernames.get(canonical) or None
+
+    def messenger_url_for(self, name: str | None) -> str | None:
+        canonical = self.canonical_name(name) or (name or "").strip()
+        if not canonical:
+            return None
+        return self.messenger_urls.get(canonical) or None
 
     def canonical_name(self, name: str | None) -> str | None:
         if not name:
@@ -547,12 +558,6 @@ def _parse_metrics(raw: dict | None, *, inactive_days: int) -> MetricsSettings:
         person_active_tasks_limit=max(
             1, _as_int(raw.get("person_active_tasks_limit"), 30)
         ),
-        load_fallback_hours=max(
-            0.0, _as_float(raw.get("load_fallback_hours"), 2.0)
-        ),
-        load_fallback_estimate_ratio=min(
-            1.0, max(0.0, _as_float(raw.get("load_fallback_estimate_ratio"), 0.25))
-        ),
     )
 
 
@@ -569,7 +574,23 @@ def _parse_ratings(raw: dict | None) -> RatingsSettings:
                 continue
     if not place_points:
         place_points = {1: 3, 2: 2, 3: 1}
-    return RatingsSettings(top_n=top_n, place_points=place_points)
+    timezone_name = str(raw.get("timezone") or "Europe/Moscow").strip()
+    if not timezone_name:
+        timezone_name = "Europe/Moscow"
+    return RatingsSettings(
+        top_n=top_n,
+        place_points=place_points,
+        timezone=timezone_name,
+        workday_start_hour=min(
+            23.99, max(0.0, _as_float(raw.get("workday_start_hour"), 9.0))
+        ),
+        worklog_grace_workdays=max(
+            0, _as_int(raw.get("worklog_grace_workdays"), 1)
+        ),
+        advance_tolerance_hours=max(
+            0.0, _as_float(raw.get("advance_tolerance_hours"), 0.5)
+        ),
+    )
 
 
 def _parse_ui(raw: dict | None) -> UiSettings:
@@ -614,6 +635,7 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
     jira_profile_urls: dict[str, str] = {}
     gitlab_usernames: dict[str, str] = {}
     gitlab_profile_urls: dict[str, str] = {}
+    messenger_urls: dict[str, str] = {}
     for person in data.get("people") or []:
         name = (person.get("name") or "").strip()
         direction_raw = (person.get("direction") or "").strip()
@@ -664,6 +686,9 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
         gitlab_url = str(person.get("gitlab_url") or person.get("gitlab_profile_url") or "").strip()
         if gitlab_url:
             gitlab_profile_urls[name] = gitlab_url
+        messenger_url = str(person.get("messenger_url") or "").strip()
+        if messenger_url:
+            messenger_urls[name] = messenger_url
         for alias in person.get("aliases") or []:
             alias_s = str(alias).strip()
             if alias_s:
@@ -790,6 +815,7 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
         jira_profile_urls=jira_profile_urls,
         gitlab_usernames=gitlab_usernames,
         gitlab_profile_urls=gitlab_profile_urls,
+        messenger_urls=messenger_urls,
         aliases=aliases,
         direction_order=direction_order,
         direction_keys_order=keys_order,

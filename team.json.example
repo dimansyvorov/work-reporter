@@ -58,9 +58,7 @@
     "epic_section_min_pct": 14,
     "risks_limit": 40,
     "person_tasks_limit": 40,
-    "person_active_tasks_limit": 30,
-    "load_fallback_hours": 2,
-    "load_fallback_estimate_ratio": 0.25
+    "person_active_tasks_limit": 30
   },
   "ratings": {
     "top_n": 3,
@@ -68,7 +66,11 @@
       "1": 3,
       "2": 2,
       "3": 1
-    }
+    },
+    "timezone": "Europe/Moscow",
+    "workday_start_hour": 9,
+    "worklog_grace_workdays": 1,
+    "advance_tolerance_hours": 0.5
   },
   "ui": {
     "task_table_preview": 5
@@ -82,7 +84,8 @@
       "aliases": ["Ivan Ivanov", "ivan.ivanov"],
       "avatar_url": "https://example.com/avatars/ivanov.png",
       "jira_username": "ivan.ivanov",
-      "gitlab_username": "ivan.ivanov"
+      "gitlab_username": "ivan.ivanov",
+      "messenger_url": "https://messenger.example/profile/ivan.ivanov"
     },
     {
       "name": "Петрова Анна Сергеевна",

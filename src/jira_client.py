@@ -989,6 +989,8 @@ def _filter_worklogs_for_window(
                 "issue_summary": summary,
                 "id": log.get("id"),
                 "started": log.get("started"),
+                "created": log.get("created"),
+                "updated": log.get("updated"),
                 "time_spent_seconds": log.get("timeSpentSeconds") or 0,
                 "author": log.get("author") or {},
                 "comment": log.get("comment"),
@@ -1031,7 +1033,8 @@ def _collect_worklogs_for_issues(
             skipped_zero += 1
             continue
         updated = str(fields.get("updated") or "")
-        cache_key = f"{key}|{updated}|{since_s}|{until_s}"
+        # v2 stores created/updated timestamps required for worklog-timeliness ratings.
+        cache_key = f"v2|{key}|{updated}|{since_s}|{until_s}"
         cached = cache.get(cache_key)
         if isinstance(cached, list):
             worklogs.extend(cached)

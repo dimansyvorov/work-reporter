@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .activity import build_people_activity, report_today
 from .linking import link_sprint_issues
@@ -123,6 +124,32 @@ def _hours_level(hours: float, expected: float, warn_ratio: float | None = None)
     if hours >= expected * ratio:
         return "warn"
     return "bad"
+
+
+def _report_local_now() -> datetime:
+    timezone_name = get_team_config().ratings.timezone
+    try:
+        tz = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        tz = ZoneInfo("Europe/Moscow")
+    return datetime.now(tz)
+
+
+def _expected_hours_at(
+    day: date, *, now: datetime, expected_hours: float, start_hour: float
+) -> float:
+    if day < now.date():
+        return expected_hours
+    if day > now.date():
+        return 0.0
+    hour = int(start_hour)
+    minute = int(round((start_hour - hour) * 60))
+    if minute >= 60:
+        hour += 1
+        minute = 0
+    start = datetime(day.year, day.month, day.day, hour, minute, tzinfo=now.tzinfo)
+    elapsed = (now - start).total_seconds() / 3600.0
+    return min(expected_hours, max(0.0, elapsed))
 
 
 def _looks_like_default_avatar(url: str | None) -> bool:
@@ -349,27 +376,12 @@ def _working_days_between(start: date, end: date) -> int:
     return n
 
 
-def _effective_load_hours(
-    task: dict,
-    *,
-    fallback_hours: float,
-    fallback_ratio: float,
-) -> tuple[float, str]:
-    """
-    Hours counted toward person load for one active task.
-
-    - remaining > 0 → Jira remaining
-    - remaining 0/missing → hybrid fallback: max(fixed hours, estimate × ratio)
-      (covers QA plate where automation zeroed the leftover after development)
-    """
+def _effective_load_hours(task: dict) -> tuple[float, str]:
+    """Use only an explicit positive Jira Remaining Estimate for future load."""
     rem = task.get("remaining_hours")
     if rem is not None and float(rem) > 0:
         return float(rem), "jira"
-    est = task.get("estimate_hours")
-    assumed = max(float(fallback_hours or 0.0), 0.0)
-    if est is not None and float(est) > 0 and fallback_ratio > 0:
-        assumed = max(assumed, float(est) * float(fallback_ratio))
-    return assumed, "fallback"
+    return 0.0, "zero" if rem is not None else "missing"
 
 
 def _build_person_load(
@@ -386,33 +398,24 @@ def _build_person_load(
     load_pct = remaining_hours / max(0, total_sprint_capacity − hours_sprint) × 100
     where total_sprint_capacity = workdays(start, end) × expected_hours.
 
-    Hybrid: active tasks with Jira remaining ≤ 0 still count via fallback
-    (fixed hours and/or share of original estimate).
+    Active tasks with zero/missing Jira remaining do not invent future hours.
     """
-    m = get_team_config().metrics
-    fallback_hours = float(m.load_fallback_hours)
-    fallback_ratio = float(m.load_fallback_estimate_ratio)
     expected = float(expected_hours or 8.0)
     logged = max(float(hours_sprint or 0.0), 0.0)
 
     remain = 0.0
     with_remaining = 0
-    with_fallback = 0
-    without_estimate = 0
+    with_zero_remaining = 0
+    without_remaining = 0
     for task in active_tasks:
-        hours, source = _effective_load_hours(
-            task,
-            fallback_hours=fallback_hours,
-            fallback_ratio=fallback_ratio,
-        )
+        hours, source = _effective_load_hours(task)
         remain += max(hours, 0.0)
         if source == "jira":
             with_remaining += 1
+        elif source == "zero":
+            with_zero_remaining += 1
         else:
-            with_fallback += 1
-            est = task.get("estimate_hours")
-            if est is None or float(est or 0) <= 0:
-                without_estimate += 1
+            without_remaining += 1
 
     start_d = (
         date.fromisoformat(sprint["start_date"]) if sprint.get("start_date") else None
@@ -453,10 +456,8 @@ def _build_person_load(
         "level": level,
         "active_tasks": len(active_tasks),
         "tasks_with_remaining": with_remaining,
-        "tasks_with_fallback": with_fallback,
-        "tasks_without_estimate": without_estimate,
-        "fallback_hours": fallback_hours,
-        "fallback_estimate_ratio": fallback_ratio,
+        "tasks_with_zero_remaining": with_zero_remaining,
+        "tasks_without_remaining": without_remaining,
     }
 
 
@@ -472,12 +473,15 @@ def _release_version_tags(fields: dict) -> list[dict]:
         seen.add(name)
         released = bool(item.get("released"))
         vid = str(item.get("id") or "").strip() or None
+        release_date = str(item.get("releaseDate") or "").strip() or None
         tags.append(
             {
                 "id": "release",
                 "label": name,
                 "tone": "release",
                 "release_id": vid,
+                "release_date": release_date,
+                "released": released,
                 "hint": (
                     f"Fix Version «{name}»"
                     + (" · уже выпущена в Jira" if released else " · ещё не выпущена")
@@ -485,6 +489,45 @@ def _release_version_tags(fields: dict) -> list[dict]:
             }
         )
     return tags
+
+
+def _risk_release_meta(fields: dict, sprint: dict) -> dict:
+    """Classify unreleased Fix Versions relative to the current sprint window."""
+    start = date.fromisoformat(sprint["start_date"]) if sprint.get("start_date") else None
+    end = date.fromisoformat(sprint["end_date"]) if sprint.get("end_date") else None
+    versions = []
+    outside = False
+    without_date = False
+    for item in fields.get("fixVersions") or []:
+        if not isinstance(item, dict):
+            continue
+        raw_date = str(item.get("releaseDate") or "").strip()
+        released = bool(item.get("released"))
+        versions.append(
+            {
+                "id": str(item.get("id") or "").strip() or None,
+                "name": str(item.get("name") or "").strip() or None,
+                "release_date": raw_date or None,
+                "released": released,
+            }
+        )
+        if released:
+            continue
+        if not raw_date:
+            without_date = True
+            continue
+        try:
+            release_day = date.fromisoformat(raw_date[:10])
+        except ValueError:
+            without_date = True
+            continue
+        if start and end and (release_day < start or release_day > end):
+            outside = True
+    return {
+        "release_outside_sprint": outside,
+        "release_without_date": without_date,
+        "fix_versions": versions,
+    }
 
 
 def _has_risk_tags(tags: list[dict] | None) -> bool:
@@ -504,6 +547,20 @@ def _build_task_tags(
 ) -> list[dict]:
     tags: list[dict] = []
     tags.extend(_release_version_tags(fields))
+    # Auxiliary tasks (display_task_filters) stay out of «Без релиза» risk.
+    if (
+        direction_state == "active"
+        and not any(t.get("id") == "release" for t in tags)
+        and not get_team_config().is_hidden_from_display(fields.get("summary"))
+    ):
+        tags.append(
+            {
+                "id": "no_release",
+                "label": "Без релиза",
+                "tone": "warn",
+                "hint": "У задачи нет Fix Version — не привязана к релизу",
+            }
+        )
     if _has_sprint_delay(fields, sprint_id):
         tags.append(
             {
@@ -735,9 +792,10 @@ def _build_epic_timeline(
             if vname:
                 version_names.append(vname)
 
+        summary = fields.get("summary") or key
         task_row = {
             "key": key,
-            "summary": fields.get("summary") or key,
+            "summary": summary,
             "status": status_name,
             "status_category": (
                 ((fields.get("status") or {}).get("statusCategory") or {}).get("key")
@@ -753,6 +811,7 @@ def _build_epic_timeline(
             "epic_key": epic_key,
             "tags": tags,
             "risk": _has_risk_tags(tags),
+            "hidden_from_display": team_cfg.is_hidden_from_display(summary),
             "in_sprint": in_sprint,
             "version_ids": version_ids,
             "version_names": version_names,
@@ -990,7 +1049,11 @@ def _build_epic_timeline(
         "omitted_count": omitted,
         "sort": {
             "group_by": "has_release",
-            "within_group": "progress_pct_asc",
+            "within_group": [
+                "nearest_release_date_asc",
+                "release_link_strength_desc",
+                "progress_pct_asc",
+            ],
         },
     }
 
@@ -1142,15 +1205,88 @@ def _enrich_epics_with_releases(epic_timeline: dict, releases: list[dict]) -> No
         epic["conflicts"] = list(uniq.values())
         epic["has_release"] = bool(epic.get("releases"))
 
+        # Nearest release date (unreleased first, else any) — aligns with release list order.
+        date_candidates: list[str] = []
+        for r in epic.get("releases") or []:
+            if r.get("released"):
+                continue
+            raw = str(r.get("release_date") or "").strip()
+            if raw:
+                date_candidates.append(raw[:10])
+        if not date_candidates:
+            for r in epic.get("releases") or []:
+                raw = str(r.get("release_date") or "").strip()
+                if raw:
+                    date_candidates.append(raw[:10])
+        epic["nearest_release_date"] = min(date_candidates) if date_candidates else None
+
+        # How strongly epic tasks bind to report releases (open tasks with Fix Version).
+        report_ids = {
+            str(r.get("id"))
+            for r in (releases or [])
+            if r.get("id") is not None and str(r.get("id")).strip()
+        }
+        report_names = {
+            str(r.get("name") or "").strip().lower()
+            for r in (releases or [])
+            if str(r.get("name") or "").strip()
+        }
+        task_rows: list[dict] = []
+        seen_task_keys: set[str] = set()
+        for t in epic.get("open_task_list") or []:
+            if not isinstance(t, dict):
+                continue
+            tk = str(t.get("key") or "").upper()
+            if not tk or tk in seen_task_keys:
+                continue
+            seen_task_keys.add(tk)
+            task_rows.append(t)
+        for section in epic.get("sections") or []:
+            for t in section.get("tasks_detail") or []:
+                if not isinstance(t, dict):
+                    continue
+                tk = str(t.get("key") or "").upper()
+                if not tk or tk in seen_task_keys:
+                    continue
+                seen_task_keys.add(tk)
+                task_rows.append(t)
+        linked_open = 0
+        for t in task_rows:
+            vids = {str(x) for x in (t.get("version_ids") or []) if x}
+            vnames = {
+                str(x).strip().lower() for x in (t.get("version_names") or []) if x
+            }
+            if (vids & report_ids) or (vnames & report_names):
+                linked_open += 1
+        open_n = int(epic.get("tasks_open") or 0) or len(task_rows)
+        if open_n <= 0 and epic.get("has_release"):
+            strength = 1.0
+        elif open_n <= 0:
+            strength = 0.0
+        else:
+            strength = linked_open / float(open_n)
+        epic["release_linked_open_tasks"] = linked_open
+        epic["release_link_strength"] = _round(strength, 3) or 0.0
+
     epics = epic_timeline.get("epics") or []
     epics.sort(
         key=lambda e: (
             0 if e.get("has_release") else 1,
+            e.get("nearest_release_date") or "9999-12-31",
+            -float(e.get("release_link_strength") or 0.0),
             float(e.get("progress_pct") or 0),
             e.get("key") or "",
         )
     )
     epic_timeline["epics"] = epics
+    epic_timeline["sort"] = {
+        "group_by": "has_release",
+        "within_group": [
+            "nearest_release_date_asc",
+            "release_link_strength_desc",
+            "progress_pct_asc",
+        ],
+    }
 
 
 def _issue_fix_version_ids(fields: dict) -> list[str]:
@@ -1198,6 +1334,7 @@ def _build_releases(
                 "issue": issue,
                 "fields": fields,
                 "canonical": canonical,
+                "display": assignee_name or canonical,
                 "direction": direction,
                 "version_ids": _issue_fix_version_ids(fields),
             }
@@ -1274,22 +1411,25 @@ def _build_releases(
                 expected_hours=expected_hours,
                 inactive_days=team_cfg.inactive_days,
             )
+            summary = fields.get("summary") or key
             task_row = {
                 "key": key,
-                "summary": fields.get("summary") or key,
+                "summary": summary,
                 "status": ((fields.get("status") or {}).get("name")),
                 "status_category": (
                     ((fields.get("status") or {}).get("statusCategory") or {}).get("key")
                 ),
                 "direction": direction,
                 "direction_state": kind,
-                "assignee": row.get("canonical"),
+                "assignee": row.get("display") or row.get("canonical"),
+                "assignee_canonical": row.get("canonical"),
                 "estimate_hours": _round(_estimate_hours(fields), 2),
                 "hours": _round(float(fields.get("timespent") or 0) / 3600.0, 2) or 0.0,
                 "web_url": f"{browse_base}/browse/{key}" if browse_base and key else None,
                 "epic_key": row["issue"].get("_epic_key"),
                 "tags": tags,
                 "risk": _has_risk_tags(tags),
+                "hidden_from_display": team_cfg.is_hidden_from_display(summary),
             }
             version_tasks.append(task_row)
             tasks_by_dir[direction].append(task_row)
@@ -1632,10 +1772,11 @@ def _build_people_profiles(
             inactive_days=team_cfg.inactive_days,
         )
         rem = _remaining_estimate_hours(fields)
+        summary = fields.get("summary") or key
         tasks_by_person[name].append(
             {
                 "key": key,
-                "summary": fields.get("summary") or key,
+                "summary": summary,
                 "status": status_name,
                 "status_category": ((fields.get("status") or {}).get("statusCategory") or {}).get(
                     "key"
@@ -1650,6 +1791,7 @@ def _build_people_profiles(
                 "epic_key": issue.get("_epic_key"),
                 "tags": tags,
                 "risk": _has_risk_tags(tags),
+                "hidden_from_display": team_cfg.is_hidden_from_display(summary),
             }
         )
 
@@ -2095,10 +2237,11 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
 
     start_d = date.fromisoformat(sprint["start_date"]) if sprint.get("start_date") else None
     end_d = date.fromisoformat(sprint["end_date"]) if sprint.get("end_date") else None
-    today = datetime.now(timezone.utc).date()
-    sprint_day_dates = (
-        _daterange(start_d, min(end_d, today)) if start_d and end_d else []
-    )
+    local_now = _report_local_now()
+    today = local_now.date()
+    sprint_calendar_dates = _daterange(start_d, end_d) if start_d and end_d else []
+    sprint_day_dates = [day for day in sprint_calendar_dates if day <= today]
+    sprint_work_dates = [day for day in sprint_calendar_dates if not _is_weekend(day)]
 
     # Worklogs only from roster
     hours_by_person_day: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
@@ -2218,6 +2361,7 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
             "direction": direction,
             "jira_url": links_for.get("jira_url"),
             "gitlab_url": links_for.get("gitlab_url"),
+            "messenger_url": team_cfg.messenger_url_for(name),
             "gender": gender,
             "lead": team_cfg.is_lead(name),
             "tasks_done": tasks["done"],
@@ -2410,13 +2554,32 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         )
 
     by_day = []
-    for day in sprint_day_dates:
+    week_starts: dict[date, int] = {}
+    expected_to_date = 0.0
+    for day in sprint_work_dates:
         day_key = day.isoformat()
-        weekend = _is_weekend(day)
+        future = day > today
+        target_hours = _expected_hours_at(
+            day,
+            now=local_now,
+            expected_hours=expected,
+            start_hour=team_cfg.ratings.workday_start_hour,
+        )
+        expected_to_date += target_hours
+        monday = day - timedelta(days=day.weekday())
+        if monday not in week_starts:
+            week_starts[monday] = len(week_starts) + 1
         rows = []
         for name in sorted(people, key=lambda x: x.lower()):
             hours = _round(hours_by_person_day.get(name, {}).get(day_key, 0.0), 2) or 0.0
-            level = "skip" if weekend else _hours_level(hours, expected)
+            if future or target_hours <= 0:
+                level = "future"
+            elif hours <= 0:
+                level = "bad"
+            elif hours + 0.01 >= target_hours:
+                level = "ok"
+            else:
+                level = "warn"
             rows.append(
                 {
                     "name": name,
@@ -2425,31 +2588,37 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
                     ),
                     "direction": TEAM_ROSTER[name],
                     "hours": hours,
-                    "expected_hours": expected,
+                    "expected_hours": target_hours,
                     "level": level,
-                    "ok": level in {"ok", "skip"},
-                    "delta_hours": _round(hours - expected, 2),
+                    "ok": level in {"ok", "future"},
+                    "delta_hours": _round(hours - target_hours, 2),
                 }
             )
         rows.sort(key=lambda r: (r["ok"], r["hours"], r["name"].lower()))
         by_day.append(
             {
                 "date": day_key,
-                "is_weekend": weekend,
+                "is_weekend": False,
+                "is_future": future,
+                "is_today": day == today,
+                "week_index": week_starts[monday],
+                "expected_hours": _round(target_hours, 2) or 0.0,
                 "people": rows,
-                "underlogged_count": 0
-                if weekend
-                else sum(1 for r in rows if r["level"] in {"warn", "bad"}),
+                "underlogged_count": sum(
+                    1 for r in rows if r["level"] in {"warn", "bad"}
+                ),
                 "ok_count": sum(1 for r in rows if r["level"] == "ok"),
             }
         )
 
-    # Risks: finish threat / stale / no recent worklogs / no estimate
+    # Risks: finish threat / stale / no recent worklogs / estimates / releases
     days_left = max((end_d - today).days, 0) if end_d else None
     at_risk = []
     stale = []
     no_recent_logs = []
     no_estimate = []
+    no_release = []
+    released_not_closed = []
 
     for issue in issues:
         fields = issue.get("fields") or {}
@@ -2494,6 +2663,7 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
             "hours": _round(hours_by_issue.get(key, 0.0), 2) or 0.0,
             "estimate_hours": None,
             "tags": tags,
+            **_risk_release_meta(fields, sprint),
         }
         est_h = _estimate_hours(fields)
         if est_h is not None:
@@ -2548,10 +2718,37 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
             missing_est["reason"] = "нет оценки (Original Estimate)"
             no_estimate.append(missing_est)
 
+        if not (fields.get("fixVersions") or []):
+            missing_rel = dict(item)
+            missing_rel["reason"] = "нет Fix Version (релиза)"
+            no_release.append(missing_rel)
+
+        released_versions = [
+            version
+            for version in (item.get("fix_versions") or [])
+            if version.get("released")
+        ]
+        if released_versions:
+            released_item = dict(item)
+            released_item["released_versions"] = released_versions
+            names = ", ".join(
+                f"«{version.get('name') or version.get('id') or '?'}»"
+                for version in released_versions
+            )
+            released_item["reason"] = (
+                f"Релиз {names} выпущен, задача осталась "
+                f"в статусе «{status}»"
+            )
+            released_not_closed.append(released_item)
+
     at_risk.sort(key=lambda x: x["assignee"])
     stale.sort(key=lambda x: x["assignee"])
     no_recent_logs.sort(key=lambda x: x["assignee"])
     no_estimate.sort(key=lambda x: (-(x.get("hours") or 0.0), x.get("key") or ""))
+    no_release.sort(key=lambda x: (-(x.get("hours") or 0.0), x.get("key") or ""))
+    released_not_closed.sort(
+        key=lambda x: (x.get("status") or "", x.get("assignee") or "", x.get("key") or "")
+    )
 
     state_label = {
         "active": "Активный",
@@ -2568,6 +2765,7 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         hours_by_person_day=hours_by_person_day,
         hours_by_issue=hours_by_issue,
         hours_by_person_issue=hours_by_person_issue,
+        worklogs=jira_raw.get("worklogs") or [],
         links=links,
         gitlab_raw=gitlab_raw,
         expected_hours=expected,
@@ -2676,9 +2874,11 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         ),
         "worklogs": {
             "expected_hours_per_day": expected,
+            "plan_hours": _round(len(sprint_work_dates) * expected, 2) or 0.0,
+            "expected_hours_to_date": _round(expected_to_date, 2) or 0.0,
             "selected_date": selected_day,
             "selected_is_weekend": selected_is_weekend,
-            "days": [d.isoformat() for d in sprint_day_dates],
+            "days": [d.isoformat() for d in sprint_work_dates],
             "by_day": by_day,
         },
         "risks": {
@@ -2686,6 +2886,8 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
             "stale": stale[: team_cfg.metrics.risks_limit],
             "no_worklogs": no_recent_logs[: team_cfg.metrics.risks_limit],
             "no_estimate": no_estimate[: team_cfg.metrics.risks_limit],
+            "no_release": no_release[: team_cfg.metrics.risks_limit],
+            "released_not_closed": released_not_closed[: team_cfg.metrics.risks_limit],
             "selected_is_weekend": selected_is_weekend,
             "stale_days": team_cfg.metrics.stale_days,
         },
@@ -2696,12 +2898,17 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
                 "stale": stale,
                 "no_worklogs": no_recent_logs,
                 "no_estimate": no_estimate,
+                "no_release": no_release,
                 "stale_days": team_cfg.metrics.stale_days,
             },
             releases=releases,
             epic_timeline=epic_timeline,
         ),
-        "settings": team_cfg.settings_public(),
+        "jira_browse_base": browse_base or None,
+        "settings": {
+            **team_cfg.settings_public(),
+            "jira_browse_base": browse_base or None,
+        },
     }
 
 
@@ -2863,13 +3070,15 @@ def _compute_team_mood(
     stale_n = len(risks.get("stale") or [])
     no_wl_n = len(risks.get("no_worklogs") or [])
     no_est_n = len(risks.get("no_estimate") or [])
+    no_rel_n = len(risks.get("no_release") or [])
     denom = max(open_n, 1)
     risk_penalty = min(
         100.0,
         (at_risk_n / denom) * 55.0
         + (stale_n / denom) * 32.0
         + (no_wl_n / denom) * 28.0
-        + min(1.0, no_est_n / denom) * 12.0,
+        + min(1.0, no_est_n / denom) * 12.0
+        + min(1.0, no_rel_n / denom) * 14.0,
     )
     risk_score = _clamp_score(100.0 - risk_penalty * urgency)
     if at_risk_n:
@@ -2916,6 +3125,19 @@ def _compute_team_mood(
                 ),
                 "severity": "warn",
                 "impact": _round(min(12.0, no_est_n * 0.35), 1) or 0.0,
+            }
+        )
+    if no_rel_n and (no_rel_n / denom) >= 0.2:
+        drivers.append(
+            {
+                "id": "tasks_no_release",
+                "title": "Задачи без релиза",
+                "summary": (
+                    f"{no_rel_n} открытых задач без Fix Version — "
+                    "сложнее связать работу с целью и релизами."
+                ),
+                "severity": "warn",
+                "impact": _round(min(14.0, no_rel_n * 0.4), 1) or 0.0,
             }
         )
 
@@ -3047,6 +3269,55 @@ def _compute_team_mood(
         "releases": _round(release_score, 0) or 0.0,
         "epics_in_sprint": _round(epic_score, 0) or 0.0,
     }
+    weights_pct = {
+        "schedule": _round(100.0 * w_schedule / w_sum, 0) or 0.0,
+        "completion": _round(100.0 * w_completion / w_sum, 0) or 0.0,
+        "task_risks": _round(100.0 * w_risks / w_sum, 0) or 0.0,
+        "releases": _round(100.0 * w_releases / w_sum, 0) or 0.0,
+        "epics_in_sprint": _round(100.0 * w_epics / w_sum, 0) or 0.0,
+    }
+    components_meta = {
+        "schedule": {
+            "label": "Соблюдение плана",
+            "hint": (
+                "Насколько % закрытых задач не отстаёт от % прошедшего времени спринта. "
+                "100 — идём в ногу или опережаем; ниже — отстаём."
+            ),
+            "weight_pct": weights_pct["schedule"],
+        },
+        "completion": {
+            "label": "Темп закрытия",
+            "hint": (
+                "Насколько фактическое закрытие задач соответствует ожидаемому к текущему "
+                "моменту спринта. Не «сколько всего закрыли», а «успеваем ли по календарю»."
+            ),
+            "weight_pct": weights_pct["completion"],
+        },
+        "task_risks": {
+            "label": "Здоровье задач",
+            "hint": (
+                "Штраф за доли открытых задач с рисками: угроза срока, неактивность, "
+                "без списаний, без оценки, без релиза. 100 — таких почти нет."
+            ),
+            "weight_pct": weights_pct["task_risks"],
+        },
+        "releases": {
+            "label": "Готовность релизов",
+            "hint": (
+                "Доля активных релизов без риска срыва/просрочки минус среднее отставание "
+                "прогресса. Это не «% выпущенных релизов»."
+            ),
+            "weight_pct": weights_pct["releases"],
+        },
+        "epics_in_sprint": {
+            "label": "Эпики в спринте",
+            "hint": (
+                "Средний прогресс эпиков с задачами текущего спринта с учётом доли "
+                "рисковых задач в них."
+            ),
+            "weight_pct": weights_pct["epics_in_sprint"],
+        },
+    }
 
     return {
         "score": _round(score, 0) or 0.0,
@@ -3055,6 +3326,14 @@ def _compute_team_mood(
         "recommendation": recommendation,
         "drivers": drivers,
         "components": components,
+        "components_meta": components_meta,
+        "weights": weights_pct,
+        "formula_hint": (
+            "Итог = взвешенное среднее пяти оценок (каждая 0…100). "
+            "Вес «Темпа закрытия» растёт к концу спринта. "
+            "В начале спринта высокий балл слегка приглушается, "
+            "чтобы отсутствие рисков не выглядело как победа."
+        ),
         "context": {
             "tasks_progress_pct": _round(tasks_pct, 0) or 0.0,
             "time_progress_pct": _round(time_pct, 0) or 0.0,

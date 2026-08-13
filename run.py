@@ -58,6 +58,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Опубликовать уже существующий data/report.json без нового сбора.",
     )
+    parser.add_argument(
+        "--reuse-ai",
+        action="store_true",
+        help=(
+            "Не обращаться к AI и переиспользовать AI-оценки из "
+            "существующего data/report.json того же спринта."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -252,7 +260,11 @@ def main() -> None:
         state = AppState()
         try:
             report = collect_and_build(
-                cfg, state, raw_path=raw_path, report_path=report_path
+                cfg,
+                state,
+                raw_path=raw_path,
+                report_path=report_path,
+                reuse_ai=args.reuse_ai,
             )
         except BaseException as exc:
             print(f"Ошибка сбора: {exc}")
@@ -266,7 +278,11 @@ def main() -> None:
     if args.dump_only:
         state = AppState()
         report = collect_and_build(
-            cfg, state, raw_path=raw_path, report_path=report_path
+            cfg,
+            state,
+            raw_path=raw_path,
+            report_path=report_path,
+            reuse_ai=args.reuse_ai,
         )
         print(f"Сохранено: {raw_path.relative_to(PROJECT_ROOT)}")
         print(f"Сохранено: {report_path.relative_to(PROJECT_ROOT)}")
@@ -285,7 +301,11 @@ def main() -> None:
         def worker() -> None:
             try:
                 report = collect_and_build(
-                    cfg, state, raw_path=raw_path, report_path=report_path
+                    cfg,
+                    state,
+                    raw_path=raw_path,
+                    report_path=report_path,
+                    reuse_ai=args.reuse_ai,
                 )
                 print(f"Сохранено: {raw_path.relative_to(PROJECT_ROOT)}")
                 print(f"Сохранено: {report_path.relative_to(PROJECT_ROOT)}")

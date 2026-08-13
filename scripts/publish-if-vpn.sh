@@ -65,15 +65,59 @@ if [[ -z "$JIRA_URL" ]]; then
   exit 0
 fi
 
-# host from https://jira.example.com/...
-JIRA_HOST="$(printf '%s' "$JIRA_URL" | sed -E 's#^[a-zA-Z]+://##' | cut -d/ -f1 | cut -d@ -f2 | cut -d: -f1)"
-if [[ -z "$JIRA_HOST" ]]; then
-  log "skip: cannot parse JIRA host from JIRA_URL"
+JIRA_TOKEN="${JIRA_TOKEN:-}"
+if [[ -z "$JIRA_TOKEN" ]]; then
+  log "skip: JIRA_TOKEN empty"
   exit 0
 fi
 
-if ! nc -z -G 2 "$JIRA_HOST" 443 >/dev/null 2>&1; then
-  log "skip: VPN/Jira unreachable ($JIRA_HOST:443) — retry on next poll"
+# Real API preflight (not TCP ping): VPN/TLS/auth must work for collect.
+# /rest/api/2/myself is cheap; non-200 → skip without Telegram noise.
+jira_base="${JIRA_URL%/}"
+myself_url="${jira_base}/rest/api/2/myself"
+
+curl_config_escape() {
+  local value="${1:-}"
+  case "$value" in
+    *$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  printf '%s' "$value" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+jira_auth_config() {
+  local escaped_token escaped_identity
+  escaped_token="$(curl_config_escape "$JIRA_TOKEN")" || return 1
+  if [[ -n "${JIRA_EMAIL:-}" ]]; then
+    escaped_identity="$(curl_config_escape "$JIRA_EMAIL")" || return 1
+    printf 'user = "%s:%s"\n' "$escaped_identity" "$escaped_token"
+  elif [[ -n "${JIRA_USER:-}" ]]; then
+    escaped_identity="$(curl_config_escape "$JIRA_USER")" || return 1
+    printf 'user = "%s:%s"\n' "$escaped_identity" "$escaped_token"
+  else
+    printf 'header = "Authorization: Bearer %s"\n' "$escaped_token"
+  fi
+}
+
+case "${JIRA_TOKEN}${JIRA_EMAIL:-}${JIRA_USER:-}" in
+  *$'\n'*|*$'\r'*)
+    log "skip: Jira credentials contain unsupported line breaks"
+    exit 0
+    ;;
+esac
+
+http_code="$(
+  # Keep secrets in shell memory and the curl stdin config, not argv/environment.
+  export -n JIRA_TOKEN
+  if [[ -n "${GITLAB_TOKEN+x}" ]]; then export -n GITLAB_TOKEN; fi
+  if [[ -n "${CORP_LLM_TOKEN+x}" ]]; then export -n CORP_LLM_TOKEN; fi
+  jira_auth_config |
+    curl --config - -sS -o /dev/null -w '%{http_code}' \
+      --connect-timeout 5 --max-time 8 \
+      "$myself_url" 2>/dev/null || true
+)"
+http_code="${http_code:-000}"
+if [[ "$http_code" != "200" ]]; then
+  log "skip: Jira API unavailable (myself HTTP ${http_code}) — VPN off or auth/TLS issue"
   exit 0
 fi
 
@@ -89,7 +133,7 @@ if [[ ! -x "$PYTHON" ]]; then
   exit 1
 fi
 
-log "start: python run.py --publish (vpn ok → $JIRA_HOST)"
+log "start: python run.py --publish (jira myself ok)"
 set +e
 # Mark trigger for Telegram notify wording («Режим: Автоматически»).
 export WORK_REPORTER_PUBLISH_MODE=auto

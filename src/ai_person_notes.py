@@ -11,6 +11,7 @@ from .ai_brief import (
     _call_litellm_chat,
     _goal_token,
     _iso_now,
+    _is_hidden_task,
     _llm_settings,
     _person_task_pressure,
     _release_labels,
@@ -23,9 +24,9 @@ from .ai_brief import (
 )
 from .team_config import get_team_config
 
-NOTES_PROMPT_VERSION = "person-notes-v4"
-# Before this Moscow hour, "no hours today" is not a signal — day just started.
-TODAY_WORKLOG_JUDGE_AFTER_HOUR = 14
+NOTES_PROMPT_VERSION = "person-notes-v10"
+# Workday ends 18:00 MSK; mute "no hours today" while >2h remain → before 16:00.
+TODAY_WORKLOG_JUDGE_AFTER_HOUR = 16
 
 SYSTEM_PROMPT = """Ты пишешь короткие живые заметки по сотрудникам спринта — как коллега-аналитик, а не как HR-отчёт.
 
@@ -36,46 +37,75 @@ SYSTEM_PROMPT = """Ты пишешь короткие живые заметки 
 Правила:
 1. НЕ переоценивай спринт заново. Опирайся на brief_context (вердикт, риски, рекомендации, цель).
 2. Заметка только про конкретного человека и его данные в people.
-3. 2–4 предложения, по-русски, в свободном мягком тоне («стоит», «важно», «имеет смысл», «похоже»).
-   Не канцелярит и не «отчитывай». Можно чуть теплее обычного делового стиля.
-4. Без грубых императивов («должен», «немедленно», «обязан»).
-5. Запрещены обесценивающие слова про людей: «ресурс», «юнит», «голова», «FTE»,
+3. Пиши СТРОГО от третьего лица — как заметка О человеке для руководителя/команды,
+   а не обращение К нему.
+   Правильно: «у него», «у неё», «его нагрузка», «ей стоит», «держит ритм», «фокус на задаче».
+   Запрещено: «у вас», «вам», «вы», «держите», «следите», «ваш/ваша», обращения на «ты/вы».
+   Согласуй род по gender: m → он/его/нему/него; f → она/её/ней/неё.
+   Если gender нет — нейтральные формулировки без «он/она» («нагрузка высокая», «фокус на…»).
+4. 3–5 предложения, по-русски, в свободном мягком тоне («стоит», «важно», «имеет смысл», «похоже»).
+   Не «отчитывай» сотрудника. Можно чуть теплее обычного делового стиля.
+   В text НЕ называй человека по имени/фамилии — карточка уже про него.
+5. Без грубых императивов («должен», «немедленно», «обязан»).
+6. Запрещены обесценивающие слова про людей: «ресурс», «юнит», «голова», «FTE»,
    «простаивает как ресурс», «свободный ресурс». Пиши про человека/коллегу/ёмкость задач.
-6. Не используй сырые ключи JSON (load_pct, carryover_share, on_goal_release, hours_level и т.п.).
-7. Учитывай роль и направление:
+7. Не используй сырые ключи JSON (load_pct, carryover_share, on_goal_release, hours_level и т.п.).
+8. Учитывай роль и направление:
    - role=lead — мягко про координацию направления / приоритеты команды;
    - role=member — про личную нагрузку и фокус;
-   - direction — по возможности вплети контекст направления.
-8. Смотри не только на нагрузку. По возможности затронь 1–2 сигнала из:
+   - direction — направления сотрудника.
+9. Смотри не только на нагрузку. По возможности затронь 1–2 сигнала из:
    - worklog.sprint — ГЛАВНЫЙ критерий списаний (ритм за прошедшие рабочие дни спринта);
    - worklog.today — только если today.judge=true; если today.too_early=true,
      НЕ пиши, что человек «сегодня не списывает» / «мало списаний сегодня»
-     (утро, день ещё идёт);
+     если до конца рабочего дня 18:00 по МСК осталось более 2 часов;
    - ratings (стабильность списаний, закрытие задач, эффективность, недо/переоценка);
-   - task_pressure (срочные задачи цели vs перенос из прошлых спринтов);
+   - task_pressure (срочные задачи цели vs перенос из прошлых спринтов;
+     no_release_tasks — активные задачи без Fix Version / «Без релиза»);
+   - risk_tasks — персональные риски из панелей спринта:
+     at_risk («могут не закрыться до конца спринта»),
+     no_estimate («без оценки»),
+     no_release («без релиза»).
+     Если risk_tasks.at_risk / no_estimate / no_release не пусты — обязательно упомяни
+     1–3 ключа задач (SPRINT-123) в тексте;
    - focus_tasks — срочные задачи цели спринта / ближайшего релиза.
      Если focus_tasks не пуст, обязательно мягко подсвети 1–3 ключа задач (SPRINT-123)
      в тексте заметки.
    Если задач нет — не своди всё к «свободен»; мягко отметь паузу по задачам и списаниям
-   за спринт, и что можно подхватить работу направления/цели, если это уместно.
-9. Если высокий перенос из прошлых спринтов — скажи об этом явно.
-10. tone: attention | ok | info
-   - attention: перегруз / риск / сильный хвост переноса / заметный провал списаний;
+   за спринт, и что можно подхватить работу направления/цели, если это уместно,
+   можешь сделать шутку про отпуск.
+10. Если высокий перенос из прошлых спринтов — скажи об этом явно.
+11. Если у человека есть задачи без релиза (task_pressure.no_release_tasks или risk_tasks.no_release) —
+    мягко отметь, что стоит привязать работу к Fix Version / релизу.
+12. Форматирование в text (лёгкий markdown, без HTML и без ```fence```):
+   - задачу/эпик упоминай ТОЛЬКО ключом в бэктиках: `SPRINT-123`;
+     UI сам подставит «KEY | название» и сделает ссылку.
+     ЗАПРЕЩЕНО писать название после ключа, в скобках или повторять summary из JSON;
+   - НЕ выделяй ключи задач жирным (`**…**`) — обычный текст;
+   - *курсив* допустим редко; **жирный** — только для коротких акцентов не про ключи задач;
+   - не используй заголовки ## и длинные списки — заметка короткая.
+13. tone: attention | ok | info
+   - attention: перегруз / риск / сильный хвост переноса / заметный провал списаний /
+     задачи под угрозой срока или без оценки;
    - ok: спокойная картина;
    - info: нейтральный нюанс без тревоги.
-11. focus — массив из: carryover, overload, underload, goal, stale, worklog, ratings
-    (только релевантные).
-12. Верни СТРОГО JSON без markdown-ограждений:
-{"notes":[{"name":"Фамилия И.О. или полное ФИО","text":"...","tone":"attention","focus":["carryover"]}]}
-13. Нужна заметка на КАЖДОГО человека из people (по short или name).
+14. focus — массив из: carryover, overload, underload, goal, stale, worklog, ratings,
+    no_release, at_risk, no_estimate (только релевантные).
+15. Верни СТРОГО JSON без markdown-ограждений вокруг всего ответа:
+{"notes":[{"name":"Имя Ф. или полное ФИО","text":"...","tone":"attention","focus":["carryover"]}]}
+16. Нужна заметка на КАЖДОГО человека из people (по short или name; short вида «Роман Щ.»).
 """
 
 USER_PROMPT_PREFIX = """Сформируй мини-заметки по всем людям из JSON ниже.
 Учитывай brief_context, не повторяй полный анализ спринта.
-Пиши живо и уважительно: про человека, а не про «ресурс».
+Пиши от третьего лица (у него / у неё / его / её) по gender человека — не обращайся на «вы/вам».
+В text не называй человека по имени — контекст карточки уже известен.
 По списаниям опирайся на worklog.sprint (весь спринт), а не на утренний сегодняшний ноль.
 Если worklog.today.too_early=true — не делай вывод «сегодня не списывает».
-Если у человека есть focus_tasks — упомяни их ключи (например SPRINT-12345) как фокус на цель/релиз.
+Если у человека есть focus_tasks или risk_tasks — упомяни только ключи в бэктиках
+(`SPRINT-12345`), без названий задач рядом: UI добавит «KEY | название» сам.
+Если task_pressure.no_release_tasks заметно > 0 — мягко отметь, что стоит привязать задачи к релизу.
+Не делай ключи задач жирными.
 
 JSON:
 """
@@ -231,6 +261,11 @@ def soft_person_note_text(text: str | None) -> str:
     )
     for pattern, repl in replacements:
         out = re.sub(pattern, repl, out)
+    # Keep markdown-ish notes readable: don't flatten newlines / backticks.
+    if "\n" in out or re.search(r"[`*_]", out):
+        out = re.sub(r"[^\S\n]{2,}", " ", out)
+        out = re.sub(r"\n{3,}", "\n\n", out)
+        return out.strip()
     out = re.sub(r"\s{2,}", " ", out).strip()
     out = re.sub(r"\s+([,.!?])", r"\1", out)
     # Capitalize sentence starts after replacements
@@ -239,6 +274,69 @@ def soft_person_note_text(text: str | None) -> str:
         (chunk[:1].upper() + chunk[1:]) if chunk else chunk for chunk in chunks
     )
     return out
+
+
+def _person_risk_tasks(
+    sprint_report: dict,
+    person_name: str,
+    *,
+    limit: int = 4,
+) -> dict[str, list[dict]]:
+    """Pick this person's tasks from sprint risk panels (at_risk / no_estimate / no_release)."""
+    risks = sprint_report.get("risks") or {}
+    if not isinstance(risks, dict):
+        return {}
+    cfg = get_team_config()
+    canonical = cfg.canonical_name(person_name) or person_name
+    aliases = {
+        str(person_name or "").strip().lower(),
+        str(canonical or "").strip().lower(),
+    }
+    short = _short_person_name(person_name)
+    if short:
+        aliases.add(short.lower())
+    aliases.discard("")
+
+    def _match(item: dict) -> bool:
+        for field in ("assignee_canonical", "assignee"):
+            raw = str(item.get(field) or "").strip()
+            if not raw:
+                continue
+            if raw.lower() in aliases:
+                return True
+            other = cfg.canonical_name(raw)
+            if other and other.lower() in aliases:
+                return True
+        return False
+
+    def _samples(items: object) -> list[dict]:
+        out: list[dict] = []
+        if not isinstance(items, list):
+            return out
+        for item in items:
+            if not isinstance(item, dict) or not _match(item):
+                continue
+            key = str(item.get("key") or "").strip().upper()
+            if not key:
+                continue
+            out.append(
+                {
+                    "key": key,
+                    "summary": (str(item.get("summary") or "")[:80] or None),
+                    "status": item.get("status"),
+                    "reason": item.get("reason"),
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
+
+    result: dict[str, list[dict]] = {}
+    for kind in ("at_risk", "no_estimate", "no_release"):
+        samples = _samples(risks.get(kind))
+        if samples:
+            result[kind] = samples
+    return result
 
 
 def _is_early_for_today_worklog(now: datetime | None = None) -> bool:
@@ -266,7 +364,7 @@ def _build_worklog_block(
     *,
     expected: float,
 ) -> dict[str, Any]:
-    """Sprint-first worklog signals; today is optional and muted in the morning."""
+    """Sprint-first worklog signals; today muted until <2h left before 18:00 MSK."""
     expected_f = float(expected or 8.0) or 8.0
     warn_ratio = float(get_team_config().metrics.hours_warn_ratio or 0.6)
     today = report_today()
@@ -338,7 +436,8 @@ def _build_worklog_block(
         today_judge = False
         today_too_early = True
         today_hint = (
-            f"утро (до {TODAY_WORKLOG_JUDGE_AFTER_HOUR}:00 МСК) — рано судить о списаниях за сегодня"
+            f"до {TODAY_WORKLOG_JUDGE_AFTER_HOUR}:00 МСК (>2 ч до конца дня 18:00) "
+            "— рано судить о списаниях за сегодня"
         )
         # Don't leak a scary today_level to the model while it's early
         today_level = "pending"
@@ -412,7 +511,11 @@ def _focus_tasks_for_profile(
     """Deterministic urgent tasks for goal / nearest release (for note + UI chips)."""
     if not isinstance(profile, dict):
         return []
-    active = list(profile.get("tasks_active") or [])
+    active = [
+        t
+        for t in (profile.get("tasks_active") or [])
+        if isinstance(t, dict) and not _is_hidden_task(t)
+    ]
     goal_items: list[dict] = []
     near_items: list[dict] = []
     for task in active:
@@ -495,12 +598,17 @@ def build_person_rows(sprint_report: dict) -> list[dict]:
         focus_tasks = _focus_tasks_for_profile(
             profile, goal_token=token, near_token=near_token, limit=3
         )
+        risk_tasks = _person_risk_tasks(sprint_report, name, limit=4)
+        gender = person.get("gender")
+        if gender not in {"m", "f"}:
+            gender = get_team_config().gender_for(name)
         row: dict[str, Any] = {
             "name": name,
             "short": _short_person_name(name),
             "direction": person.get("direction"),
             "role": "lead" if is_lead else "member",
             "lead": is_lead,
+            "gender": gender if gender in {"m", "f"} else None,
             "load_pct": load.get("load_pct"),
             "level": load.get("level"),
             "hours_sprint": hours_sprint_f,
@@ -510,6 +618,8 @@ def build_person_rows(sprint_report: dict) -> list[dict]:
         }
         if focus_tasks:
             row["focus_tasks"] = focus_tasks
+        if risk_tasks:
+            row["risk_tasks"] = risk_tasks
         hits = []
         if isinstance(profile, dict):
             for hit in profile.get("ratings") or []:
@@ -535,6 +645,7 @@ def build_person_rows(sprint_report: dict) -> list[dict]:
                 "carryover_not_goal": pressure["carryover_not_goal"],
                 "urgent_tasks": pressure["urgent_tasks"],
                 "on_goal_release": pressure["on_goal_release"],
+                "no_release_tasks": pressure["no_release_tasks"],
                 "with_remaining": pressure["with_remaining"],
                 "carryover_share": pressure["carryover_share"],
                 "note": pressure["note"],
@@ -658,12 +769,55 @@ def _fallback_note(row: dict) -> dict:
     if on_goal > 0 and "goal" not in focus and tone == "attention":
         focus.append("goal")
 
+    no_rel = int(pressure.get("no_release_tasks") or 0)
+    active_n = int(pressure.get("active_tasks") or 0)
+    if no_rel >= 2 and (active_n == 0 or no_rel >= max(2, active_n // 2)):
+        focus.append("no_release")
+        if tone == "ok":
+            tone = "info"
+        parts.append(
+            f"У части активных задач ({no_rel}) нет релиза — "
+            "стоит привязать их к Fix Version, чтобы работа шла в цель."
+        )
+
+    risk_tasks = row.get("risk_tasks") if isinstance(row.get("risk_tasks"), dict) else {}
+    at_risk_items = [
+        t for t in (risk_tasks.get("at_risk") or []) if isinstance(t, dict) and t.get("key")
+    ][:3]
+    if at_risk_items:
+        focus.append("at_risk")
+        tone = "attention"
+        keys = ", ".join(f"`{t['key']}`" for t in at_risk_items)
+        parts.append(f"Под риском не успеть к концу спринта: {keys}.")
+    no_est_items = [
+        t
+        for t in (risk_tasks.get("no_estimate") or [])
+        if isinstance(t, dict) and t.get("key")
+    ][:3]
+    if no_est_items:
+        focus.append("no_estimate")
+        if tone == "ok":
+            tone = "info"
+        keys = ", ".join(f"`{t['key']}`" for t in no_est_items)
+        parts.append(f"Без Original Estimate: {keys} — стоит оценить объём.")
+    no_rel_items = [
+        t
+        for t in (risk_tasks.get("no_release") or [])
+        if isinstance(t, dict) and t.get("key")
+    ][:3]
+    if no_rel_items and "no_release" not in focus:
+        focus.append("no_release")
+        if tone == "ok":
+            tone = "info"
+        keys = ", ".join(f"`{t['key']}`" for t in no_rel_items)
+        parts.append(f"Без релиза: {keys} — полезно привязать к Fix Version.")
+
     focus_tasks = [
         t for t in (row.get("focus_tasks") or []) if isinstance(t, dict) and t.get("key")
     ][:3]
     if focus_tasks:
         focus.append("goal")
-        keys = ", ".join(str(t["key"]) for t in focus_tasks)
+        keys = ", ".join(f"`{t['key']}`" for t in focus_tasks)
         label = focus_tasks[0].get("reason_label") or "цель/релиз"
         parts.append(f"В фокусе на {label}: {keys}.")
 
@@ -748,6 +902,9 @@ def _normalize_focus(value: object) -> list[str]:
         "stale",
         "worklog",
         "ratings",
+        "no_release",
+        "at_risk",
+        "no_estimate",
     }
     out: list[str] = []
     items = value if isinstance(value, list) else []

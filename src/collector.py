@@ -14,6 +14,7 @@ from .jira_client import collect_jira_raw
 from .metrics import compute_report
 from .mock_data import build_mock_raw
 from .ai_brief import attach_ai_brief
+from .ai_sprint_review import attach_ai_sprint_review
 from .ai_release_briefs import attach_ai_release_briefs
 from .ai_person_notes import attach_ai_person_notes
 from .ai_reuse import reuse_previous_ai
@@ -327,6 +328,45 @@ def collect_and_build(
                 "ai_brief",
                 "done",
                 f"AI-оценка пропущена ({brief.get('reason') or 'skipped'})",
+            )
+
+        review_action = (
+            "Переиспользую оценку прошедшего спринта…"
+            if reuse_ai
+            else "Анализирую историю прохождения спринта…"
+        )
+        state.run_step("ai_sprint_review", review_action)
+        state.set_status("collecting", review_action)
+        if not reuse_ai:
+            report = attach_ai_sprint_review(
+                report,
+                previous_report=(
+                    previous_report if isinstance(previous_report, dict) else None
+                ),
+                mock=cfg.mock,
+            )
+        review = ((report or {}).get("sprint_report") or {}).get("ai_sprint_review") or {}
+        review_status = review.get("status") or "skipped"
+        if review_status == "ok":
+            state.update_step(
+                "ai_sprint_review",
+                "done",
+                "Итоги спринта: сформированы"
+                + (" (прошлая оценка)" if review.get("reason") == "reused" else ""),
+            )
+        elif review_status == "error":
+            state.update_step(
+                "ai_sprint_review",
+                "done",
+                f"Итоги спринта недоступны: {str(review.get('error') or 'error')[:80]}",
+            )
+        else:
+            state.update_step(
+                "ai_sprint_review",
+                "done",
+                "Итоги спринта появятся в последний рабочий день"
+                if review.get("reason") == "too_early"
+                else f"Итоги спринта пропущены ({review.get('reason') or 'skipped'})",
             )
 
         ai_notes_action = (

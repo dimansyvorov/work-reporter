@@ -24,7 +24,7 @@ from .ai_brief import (
 )
 from .team_config import get_team_config
 
-NOTES_PROMPT_VERSION = "person-notes-v10"
+NOTES_PROMPT_VERSION = "person-notes-v11"
 # Workday ends 18:00 MSK; mute "no hours today" while >2h remain → before 16:00.
 TODAY_WORKLOG_JUDGE_AFTER_HOUR = 16
 
@@ -1012,6 +1012,8 @@ def generate_ai_person_notes(
             model=model,
             temperature=min(float(settings["temperature"]), 0.3),
             timeout=timeout,
+            max_tokens=settings["max_tokens"],
+            reasoning=settings.get("reasoning", False),
             system=SYSTEM_PROMPT,
             user=USER_PROMPT_PREFIX + json.dumps(payload, ensure_ascii=False, indent=2),
         )

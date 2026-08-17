@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from .config import ROOT
 from .team_config import get_team_config
 
-PROMPT_VERSION = "sprint-brief-v6"
+PROMPT_VERSION = "sprint-brief-v8"
 
 SYSTEM_PROMPT = """Ты — аналитик спринтовой разработки. Тебе дают только JSON-снимок спринта (уже агрегированные метрики команды).
 
@@ -23,10 +23,14 @@ SYSTEM_PROMPT = """Ты — аналитик спринтовой разрабо
 Правила:
 1. Опирайся только на факты из JSON. Не выдумывай задачи, людей, релизы, проценты и причины, которых нет в данных.
 2. Если данных мало — так и скажи, не достраивай картину.
-3. Сравнивай прогресс задач с календарным прохождением спринта.
+3. Сравнивай прогресс задач с долей прошедшего рабочего времени спринта.
 4. Приоритет рисков: релизы at_risk/overdue → перегруз людей → отстающие направления → stale/no_estimate/no_release.
 5. Отдельно оцени достижимость цели спринта (goal.text) по связанным релизам из goal.releases.
 6. Если цель сформулирована как релиз — вердикт по цели важнее общего % задач спринта.
+   Блоки sprint_releases, goal.releases и risky_releases уже отфильтрованы по датам
+   текущего спринта. Не рассуждай о релизах за его пределами и не проси данные о них.
+   Учитывай description, key_topics и key_tasks: это бизнесовый состав релиза и
+   ключевая работа для достижения цели спринта.
 7. Различай срочные и несрочные задачи в нагрузке человека:
    - urgent / on_goal_release — важны для цели/ближайшего релиза;
    - carryover (перенос из прошлых спринтов, tag «Задержка») — часто раздувают % нагрузки,
@@ -57,7 +61,7 @@ SYSTEM_PROMPT = """Ты — аналитик спринтовой разрабо
 ## Вердикт
 1–2 предложения: в графике / отстаём / на грани.
 Сравни «выполнение задач» и «прохождение спринта» обычным языком, например:
-«задачи закрыты на 27%, а по календарю прошло 23%». Без имён полей JSON.
+«в спринте завершено 27% задач, а рабочего времени прошло 23%». Без имён полей JSON.
 
 ## Цель спринта
 1. Цитата/пересказ цели.
@@ -82,7 +86,7 @@ SYSTEM_PROMPT = """Ты — аналитик спринтовой разрабо
 USER_PROMPT_PREFIX = """Проанализируй спринт по JSON-снимку ниже.
 
 Особое внимание:
-- разница между выполнением задач и прохождением спринта по календарю;
+- разница между выполнением задач и прошедшим рабочим временем спринта;
 - цель спринта и связанные релизы;
 - релизы в зоне риска;
 - факторы настроения команды;
@@ -137,6 +141,11 @@ def _goal_token(goal: str) -> str | None:
 
 
 def _release_row(rel: dict) -> dict:
+    topics = [
+        part.strip(" .:;–—-")
+        for part in re.split(r"[+;,\n]|\s+[–—]\s+", str(rel.get("description") or ""))
+        if len(part.strip(" .:;–—-")) >= 3
+    ][:8]
     return {
         "name": rel.get("name"),
         "date": rel.get("release_date"),
@@ -151,7 +160,48 @@ def _release_row(rel: dict) -> dict:
         "risk": rel.get("risk"),
         "label": rel.get("risk_label") or rel.get("label"),
         "days_left": rel.get("days_left"),
+        "description": (str(rel.get("description") or "")[:240] or None),
+        "key_topics": topics,
+        "key_tasks": [
+            {
+                "key": task.get("key"),
+                "summary": task.get("summary"),
+                "status": task.get("status"),
+                "done": task.get("direction_state") == "done",
+            }
+            for task in (rel.get("tasks") or [])
+            if isinstance(task, dict) and not _is_hidden_task(task)
+        ][:12],
     }
+
+
+def _release_matches_goal(rel: dict, goal_text: str, token: str | None) -> bool:
+    haystack = " ".join(
+        str(value or "").lower()
+        for value in (rel.get("name"), rel.get("description"), rel.get("release_date"))
+    )
+    if token:
+        token_l = token.lower()
+        if token_l in haystack:
+            return True
+        day = str(rel.get("release_date") or "")[:10]
+        match = re.match(r"(\d{4})-(\d{2})-(\d{2})", day)
+        if match:
+            year, month, date_day = match.groups()
+            variants = {
+                f"{int(date_day)}.{month}",
+                f"{date_day}.{month}",
+                f"{date_day}.{month}.{year}",
+                f"{date_day}.{month}.{year[2:]}",
+            }
+            if token_l in variants:
+                return True
+    words = {
+        word
+        for word in re.findall(r"[a-zа-яё0-9]+", goal_text.lower())
+        if len(word) >= 4 and word not in {"релиз", "спринт", "цель", "задачи"}
+    }
+    return bool(words and any(word in haystack for word in words))
 
 
 def _short_person_name(name: str | None) -> str | None:
@@ -323,18 +373,27 @@ def build_ai_snapshot(sprint_report: dict) -> dict:
     sprint = sprint_report.get("sprint") or {}
     mood = sprint_report.get("team_mood") or {}
     risks = sprint_report.get("risks") or {}
-    releases = sprint_report.get("releases") or []
+    releases = [
+        rel
+        for rel in (sprint_report.get("releases") or [])
+        if isinstance(rel, dict) and rel.get("in_sprint") is True
+    ]
     directions = sprint_report.get("directions") or []
     team = sprint_report.get("team") or []
+
+    def current_risks(key: str) -> list[dict]:
+        return [
+            row
+            for row in (risks.get(key) or [])
+            if isinstance(row, dict) and not row.get("release_outside_sprint")
+        ]
 
     goal_text = (sprint.get("goal") or "").strip()
     token = _goal_token(goal_text)
     goal_releases = []
-    if token:
-        for rel in releases:
-            name = str(rel.get("name") or "")
-            if token in name:
-                goal_releases.append(_release_row(rel))
+    for rel in releases:
+        if _release_matches_goal(rel, goal_text, token):
+            goal_releases.append(_release_row(rel))
 
     risky_releases = [
         _release_row(rel)
@@ -494,20 +553,21 @@ def build_ai_snapshot(sprint_report: dict) -> dict:
             "drivers": drivers,
         },
         "directions": dir_rows,
+        "sprint_releases": [_release_row(rel) for rel in releases[:10]],
         "risky_releases": risky_releases,
         "risk_counts": {
-            "at_risk": len(risks.get("at_risk") or []),
-            "stale": len(risks.get("stale") or []),
-            "no_worklogs": len(risks.get("no_worklogs") or []),
-            "no_estimate": len(risks.get("no_estimate") or []),
+            "at_risk": len(current_risks("at_risk")),
+            "stale": len(current_risks("stale")),
+            "no_worklogs": len(current_risks("no_worklogs")),
+            "no_estimate": len(current_risks("no_estimate")),
             "no_release": len(risks.get("no_release") or []),
             "stale_days": risks.get("stale_days"),
         },
         "risk_examples": {
-            "stale": _keys(risks.get("stale")),
-            "no_estimate": _keys(risks.get("no_estimate")),
+            "stale": _keys(current_risks("stale")),
+            "no_estimate": _keys(current_risks("no_estimate")),
             "no_release": _keys(risks.get("no_release")),
-            "at_risk": _keys(risks.get("at_risk")),
+            "at_risk": _keys(current_risks("at_risk")),
         },
         "leads": leads,
         "capacity": {
@@ -528,7 +588,11 @@ def humanize_ai_text(text: str | None) -> str:
     """Best-effort cleanup of model jargon for UI (does not replace a good prompt)."""
     if not text:
         return ""
-    out = str(text)
+    out = str(text).strip()
+    # Some Qwen gateways put hidden reasoning into the regular content field.
+    # Drop both a regular <think> block and a preamble ending with </think>.
+    out = re.sub(r"(?is)^.*?</think>\s*", "", out)
+    out = re.sub(r"(?is)<think>.*?</think>\s*", "", out)
     replacements = (
         (r"\btasks_pct\b", "выполнение задач"),
         (r"\btime_pct\b", "прохождение спринта"),
@@ -559,13 +623,13 @@ def humanize_ai_text(text: str | None) -> str:
     # Soften leftover "field 12% > field 34%" style if model still emits English keys
     out = re.sub(
         r"\(\s*выполнение задач\s+([0-9]+(?:[.,][0-9]+)?)\s*%\s*>\s*прохождение спринта\s+([0-9]+(?:[.,][0-9]+)?)\s*%\s*\)",
-        r"(задачи закрыты на \1%, по календарю прошло \2%)",
+        r"(в спринте завершено \1% задач, рабочего времени прошло \2%)",
         out,
         flags=re.I,
     )
     out = re.sub(
         r"\(\s*выполнение задач\s+([0-9]+(?:[.,][0-9]+)?)\s*%\s*<\s*прохождение спринта\s+([0-9]+(?:[.,][0-9]+)?)\s*%\s*\)",
-        r"(задачи закрыты на \1%, по календарю прошло \2%)",
+        r"(в спринте завершено \1% задач, рабочего времени прошло \2%)",
         out,
         flags=re.I,
     )
@@ -597,12 +661,16 @@ def _llm_settings() -> dict[str, Any]:
     load_dotenv(ROOT / ".env")
     enabled_raw = (os.getenv("CORP_LLM_ENABLED") or "1").strip().lower()
     enabled = enabled_raw not in {"0", "false", "no", "off"}
+    reasoning_raw = (os.getenv("CORP_LLM_REASONING") or "off").strip().lower()
+    reasoning = reasoning_raw in {"1", "true", "yes", "on"}
     return {
         "enabled": enabled,
+        "reasoning": reasoning,
         "url": (os.getenv("CORP_LLM_URL") or "").strip(),
         "token": (os.getenv("CORP_LLM_TOKEN") or "").strip(),
         "model": (os.getenv("CORP_LLM_MODEL") or "/models/Qwen3.6").strip(),
         "temperature": float(os.getenv("CORP_LLM_TEMPERATURE") or "0.2"),
+        "max_tokens": int(float(os.getenv("CORP_LLM_MAX_TOKENS") or "4096")),
         "timeout": int(float(os.getenv("CORP_LLM_TIMEOUT_SEC") or "45")),
         "cache_sec": int(float(os.getenv("CORP_LLM_CACHE_SEC") or "3000")),
     }
@@ -617,6 +685,8 @@ def _call_litellm_chat(
     timeout: int,
     system: str,
     user: str,
+    max_tokens: int | None = None,
+    reasoning: bool = False,
 ) -> tuple[str, str]:
     payload = {
         "model": model,
@@ -625,7 +695,13 @@ def _call_litellm_chat(
             {"role": "user", "content": user},
         ],
         "temperature": temperature,
+        "chat_template_kwargs": {
+            "enable_thinking": bool(reasoning),
+            "preserve_thinking": bool(reasoning),
+        },
     }
+    if max_tokens is not None and max_tokens > 0:
+        payload["max_tokens"] = int(max_tokens)
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -647,13 +723,25 @@ def _call_litellm_chat(
     return str(content).strip(), str(used_model)
 
 
-def _call_litellm(*, url: str, token: str, model: str, temperature: float, timeout: int, snapshot: dict) -> tuple[str, str]:
+def _call_litellm(
+    *,
+    url: str,
+    token: str,
+    model: str,
+    temperature: float,
+    timeout: int,
+    max_tokens: int,
+    reasoning: bool,
+    snapshot: dict,
+) -> tuple[str, str]:
     return _call_litellm_chat(
         url=url,
         token=token,
         model=model,
         temperature=temperature,
         timeout=timeout,
+        max_tokens=max_tokens,
+        reasoning=reasoning,
         system=SYSTEM_PROMPT,
         user=USER_PROMPT_PREFIX + json.dumps(snapshot, ensure_ascii=False, indent=2),
     )
@@ -734,6 +822,8 @@ def generate_ai_brief(
             model=model,
             temperature=settings["temperature"],
             timeout=settings["timeout"],
+            max_tokens=min(settings["max_tokens"], 1200),
+            reasoning=settings.get("reasoning", False),
             snapshot=snapshot,
         )
         markdown = humanize_ai_text(markdown)

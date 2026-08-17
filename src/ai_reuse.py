@@ -3,8 +3,15 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 
-from .ai_person_notes import _apply_notes_to_people
-from .ai_release_briefs import _apply_briefs_to_releases, release_group_key
+from .ai_person_notes import NOTES_PROMPT_VERSION, _apply_notes_to_people
+from .ai_brief import PROMPT_VERSION as SPRINT_BRIEF_PROMPT_VERSION
+from .ai_release_briefs import (
+    PROMPT_VERSION as RELEASE_BRIEF_PROMPT_VERSION,
+    _apply_briefs_to_releases,
+    release_group_key,
+)
+from .ai_sprint_review import PROMPT_VERSION as SPRINT_REVIEW_PROMPT_VERSION
+from .ai_sprint_review import sprint_review_available
 
 
 def _iso_now() -> str:
@@ -49,6 +56,7 @@ def reuse_previous_ai(report: dict, previous_report: dict | None) -> dict:
     if not isinstance(previous_report, dict):
         reason = "no_previous"
         sprint_report["ai_brief"] = _skipped(reason)
+        sprint_report["ai_sprint_review"] = _skipped(reason)
         sprint_report["ai_person_notes"] = {**_skipped(reason), "notes": {}}
         sprint_report["ai_release_briefs"] = {**_skipped(reason), "briefs": {}}
         return report
@@ -56,6 +64,7 @@ def reuse_previous_ai(report: dict, previous_report: dict | None) -> dict:
     if not _same_sprint(report, previous_report):
         reason = "different_sprint"
         sprint_report["ai_brief"] = _skipped(reason)
+        sprint_report["ai_sprint_review"] = _skipped(reason)
         sprint_report["ai_person_notes"] = {**_skipped(reason), "notes": {}}
         sprint_report["ai_release_briefs"] = {**_skipped(reason), "briefs": {}}
         return report
@@ -64,7 +73,11 @@ def reuse_previous_ai(report: dict, previous_report: dict | None) -> dict:
     reused_at = _iso_now()
 
     previous_brief = previous_sr.get("ai_brief")
-    if isinstance(previous_brief, dict) and previous_brief.get("status") == "ok":
+    if (
+        isinstance(previous_brief, dict)
+        and previous_brief.get("status") == "ok"
+        and previous_brief.get("prompt_version") == SPRINT_BRIEF_PROMPT_VERSION
+    ):
         brief = deepcopy(previous_brief)
         brief["reason"] = "reused"
         brief["reused_at"] = reused_at
@@ -72,11 +85,27 @@ def reuse_previous_ai(report: dict, previous_report: dict | None) -> dict:
     else:
         sprint_report["ai_brief"] = _skipped("no_previous")
 
+    previous_review = previous_sr.get("ai_sprint_review")
+    if not sprint_review_available(sprint_report.get("sprint") or {}):
+        sprint_report["ai_sprint_review"] = _skipped("too_early")
+    elif (
+        isinstance(previous_review, dict)
+        and previous_review.get("status") == "ok"
+        and previous_review.get("prompt_version") == SPRINT_REVIEW_PROMPT_VERSION
+    ):
+        review = deepcopy(previous_review)
+        review["reason"] = "reused"
+        review["reused_at"] = reused_at
+        sprint_report["ai_sprint_review"] = review
+    else:
+        sprint_report["ai_sprint_review"] = _skipped("no_previous")
+
     previous_notes = previous_sr.get("ai_person_notes")
     people = sprint_report.get("people") or {}
     if (
         isinstance(previous_notes, dict)
         and previous_notes.get("status") == "ok"
+        and previous_notes.get("prompt_version") == NOTES_PROMPT_VERSION
         and isinstance(previous_notes.get("notes"), dict)
     ):
         notes = {
@@ -99,11 +128,12 @@ def reuse_previous_ai(report: dict, previous_report: dict | None) -> dict:
     current_group_keys = {
         release_group_key(release)
         for release in (sprint_report.get("releases") or [])
-        if isinstance(release, dict) and release.get("name")
+        if isinstance(release, dict) and release.get("name") and not release.get("released")
     }
     if (
         isinstance(previous_releases, dict)
-        and previous_releases.get("status") == "ok"
+        and previous_releases.get("status") in {"ok", "partial"}
+        and previous_releases.get("prompt_version") == RELEASE_BRIEF_PROMPT_VERSION
         and isinstance(previous_releases.get("briefs"), dict)
     ):
         briefs = {}

@@ -234,6 +234,100 @@ let currentSprintReport = null;
 let currentReportMeta = null;
 let freshnessTimer = null;
 
+function normalizeSprintForDisplay(source, settings = {}, expectedHoursRaw = 8) {
+  const sprint = { ...(source || {}) };
+  const match = String(sprint.name || "").match(
+    /(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})\s*[-–—]\s*(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})/
+  );
+  if (!match) return sprint;
+  const fullYear = (value) => {
+    const year = Number(value);
+    return year < 100 ? 2000 + year : year;
+  };
+  const start = new Date(fullYear(match[3]), Number(match[2]) - 1, Number(match[1]));
+  const end = new Date(fullYear(match[6]), Number(match[5]) - 1, Number(match[4]));
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) {
+    return sprint;
+  }
+  const isoDay = (value) =>
+    `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+  const todayRaw = new Date();
+  const today = new Date(todayRaw.getFullYear(), todayRaw.getMonth(), todayRaw.getDate());
+  const dayMs = 24 * 60 * 60 * 1000;
+  const workdays = [];
+  for (let cursor = new Date(start); cursor <= end; cursor = new Date(cursor.getTime() + dayMs)) {
+    if (cursor.getDay() !== 0 && cursor.getDay() !== 6) workdays.push(new Date(cursor));
+  }
+  const total = workdays.length;
+  const index =
+    today < start
+      ? 0
+      : today > end
+        ? total
+        : workdays.filter((day) => day <= today).length;
+  const startHour = Number(settings?.ratings?.workday_start_hour ?? 9);
+  const expectedHours = Math.max(0.1, Number(expectedHoursRaw) || 8);
+  const exactStart = sprint.start_at ? new Date(sprint.start_at) : null;
+  const exactEnd = sprint.end_at ? new Date(sprint.end_at) : null;
+  let totalHours = 0;
+  let elapsedHours = 0;
+  for (const day of workdays) {
+    const hour = Math.floor(startHour);
+    const minute = Math.round((startHour - hour) * 60);
+    let workStart = new Date(day.getFullYear(), day.getMonth(), day.getDate(), hour, minute);
+    let workEnd = new Date(workStart.getTime() + expectedHours * 60 * 60 * 1000);
+    if (
+      exactStart &&
+      !Number.isNaN(exactStart.getTime()) &&
+      exactStart.getFullYear() === day.getFullYear() &&
+      exactStart.getMonth() === day.getMonth() &&
+      exactStart.getDate() === day.getDate() &&
+      exactStart > workStart
+    ) {
+      workStart = exactStart;
+    }
+    if (
+      exactEnd &&
+      !Number.isNaN(exactEnd.getTime()) &&
+      exactEnd.getFullYear() === day.getFullYear() &&
+      exactEnd.getMonth() === day.getMonth() &&
+      exactEnd.getDate() === day.getDate() &&
+      exactEnd < workEnd
+    ) {
+      workEnd = exactEnd;
+    }
+    const capacity = Math.max(0, (workEnd - workStart) / (60 * 60 * 1000));
+    const elapsed = Math.max(
+      0,
+      (Math.min(todayRaw.getTime(), workEnd.getTime()) - workStart.getTime()) /
+        (60 * 60 * 1000)
+    );
+    totalHours += capacity;
+    elapsedHours += Math.min(capacity, elapsed);
+  }
+  sprint.start_date = isoDay(start);
+  sprint.end_date = isoDay(end);
+  sprint.day_index = index;
+  sprint.day_total = total;
+  sprint.days_left = Math.max(Math.round((end - today) / dayMs), 0);
+  sprint.workdays_left = workdays.filter((day) => day >= today).length;
+  sprint.time_progress_pct =
+    totalHours > 0
+      ? Math.round(Math.min(100, (elapsedHours / totalHours) * 100) * 10) / 10
+      : 0;
+  if (today > end) {
+    sprint.state = "closed";
+    sprint.state_label = "Завершён";
+  } else if (today < start) {
+    sprint.state = "future";
+    sprint.state_label = "Будущий";
+  } else if (sprint.state !== "closed") {
+    sprint.state = "active";
+    sprint.state_label = "Активен";
+  }
+  return sprint;
+}
+
 function fmtRelativeAgo(iso) {
   if (!iso) return "—";
   const ts = Date.parse(iso);
@@ -753,7 +847,7 @@ function openTeamMoodModal(mood) {
     },
     completion: {
       label: "Темп закрытия",
-      hint: "Насколько фактическое закрытие задач соответствует ожидаемому к текущему моменту спринта. Не «сколько всего закрыли», а «успеваем ли по календарю».",
+      hint: "Темп завершений внутри спринта. В первые 20% рабочего времени используется нейтральная стартовая база, потому что фактов ещё мало.",
     },
     task_risks: {
       label: "Здоровье задач",
@@ -765,7 +859,7 @@ function openTeamMoodModal(mood) {
     },
     epics_in_sprint: {
       label: "Эпики в спринте",
-      hint: "Средний прогресс эпиков с задачами текущего спринта с учётом доли рисковых задач в них.",
+      hint: "Прогресс только задач текущего спринта относительно рабочего времени. Текущие риски штрафуются сильнее переносов.",
     },
   };
   const order = ["schedule", "completion", "task_risks", "releases", "epics_in_sprint"];
@@ -800,12 +894,31 @@ function openTeamMoodModal(mood) {
         <div class="mood-driver severity-${escapeHtml(d.severity || "warn")}">
           <p class="mood-driver-title">${escapeHtml(d.title || "Фактор")}</p>
           <p class="mood-driver-summary">${escapeHtml(d.summary || "")}</p>
-          <p class="muted" style="margin:0.35rem 0 0">оценка влияния −${fmtNumber(d.impact)} п.п. к итогу</p>
+          <p class="muted" style="margin:0.35rem 0 0">расчётное влияние ≈ −${fmtNumber(d.impact)} п.п. к итогу</p>
         </div>`
         )
         .join("")
     : `<p class="muted">Явных негативных факторов нет — итог опирается на взвешенные компоненты выше.</p>`;
   const ctx = mood.context || {};
+  const calc = mood.calculation || {};
+  const riskCounts = ctx.risk_counts || {};
+  const adjustmentHtml = calc.early_adjustment_applied
+    ? `<p class="muted mood-calculation-detail">
+        До поправки начала спринта: <strong>${fmtNumber(calc.raw_score)}</strong> ·
+        полнота данных ${fmtNumber(calc.early_evidence_pct)}% ·
+        коэффициент ${fmtNumber(calc.early_factor)} ·
+        поправка ${Number(calc.adjustment_pp) >= 0 ? "+" : ""}${fmtNumber(calc.adjustment_pp)} п.п.
+      </p>`
+    : `<p class="muted mood-calculation-detail">Исходный и итоговый балл совпадают: ${fmtNumber(calc.raw_score ?? mood.score)}.</p>`;
+  const precompletedHtml = Number(ctx.tasks_precompleted || 0) > 0
+    ? ` · уже были закрыты до старта ${fmtNumber(ctx.tasks_precompleted)}`
+    : "";
+  const risksHtml = `
+    угроза срока ${fmtNumber(riskCounts.at_risk || 0)} ·
+    неактивные ${fmtNumber(riskCounts.stale || 0)} ·
+    без списаний ${fmtNumber(riskCounts.no_worklogs || 0)} ·
+    без оценки ${fmtNumber(riskCounts.no_estimate || 0)} ·
+    без релиза ${fmtNumber(riskCounts.no_release || 0)}`;
   const formula =
     mood.formula_hint ||
     "Итог = взвешенное среднее пяти оценок (каждая 0…100). Вес «Темпа закрытия» растёт к концу спринта. В начале спринта высокий балл слегка приглушается, чтобы отсутствие рисков не выглядело как победа.";
@@ -819,8 +932,8 @@ function openTeamMoodModal(mood) {
       Итоговый балл <strong>${fmtNumber(mood.score)}</strong> из 100 — индекс здоровья спринта, не процент выпущенных релизов и не % закрытых задач.
     </p>
     <p class="muted" style="margin:0.55rem 0 0">
-      Контекст: закрыто ${fmtNumber(ctx.tasks_done)}/${fmtNumber(ctx.tasks_total)} задач ·
-      прошло ${fmtNumber(ctx.time_progress_pct)}% времени спринта ·
+      Контекст: завершено в спринте ${fmtNumber(ctx.tasks_done)}/${fmtNumber(ctx.tasks_total)} задач${precompletedHtml} ·
+      прошло ${fmtNumber(ctx.time_progress_pct)}% рабочего времени ·
       активных релизов ${fmtNumber(ctx.active_releases)} ·
       эпиков в скоупе ${fmtNumber(ctx.epics_in_scope)}
     </p>
@@ -828,7 +941,13 @@ function openTeamMoodModal(mood) {
       <h3>Из чего складывается балл</h3>
       <p class="muted mood-formula-hint">${escapeHtml(formula)}</p>
       <div class="mood-components">${componentsHtml}</div>
+      ${adjustmentHtml}
       <p class="muted" style="margin:0.65rem 0 0;font-size:0.82rem">Наведите на карточку — короткое пояснение расчёта.</p>
+    </div>
+    <div class="person-modal-section">
+      <h3>Данные расчёта</h3>
+      <p class="muted">Задачи: ${risksHtml}.</p>
+      <p class="muted">Эпики: открыто ${fmtNumber(ctx.epic_open_tasks || 0)} · текущий риск ${fmtNumber(ctx.epic_risk_tasks || 0)} · переносы ${fmtNumber(ctx.epic_carryover_tasks || 0)} · прогресс задач спринта ${fmtNumber(ctx.epic_progress_pct)}%.</p>
     </div>
     <div class="person-modal-section">
       <h3>Что сильнее всего тянет вниз</h3>
@@ -1292,7 +1411,37 @@ function openAiBriefModal(brief) {
   );
 }
 
-function renderSprintHeader(sprint, mood, aiBrief = null) {
+function openSprintReviewModal(review) {
+  if (!review) return;
+  const author = corporateAuthorLabel(review);
+  const when = review.generated_at ? fmtDateTime(review.generated_at) : "—";
+  const title = "Оценка прошедшего спринта";
+  if (review.status === "ok" && review.markdown) {
+    openAppModal(
+      `
+      <div class="release-modal-head">
+        <h2 id="app-modal-title">${title}</h2>
+        <p class="muted">Автор: ${escapeHtml(author)} · ${escapeHtml(when)}${review.reason === "reused" ? " · переиспользована" : ""}</p>
+      </div>
+      <div class="ai-brief-body">${renderAiMarkdown(review.markdown)}</div>
+      `,
+      { wide: true, type: "sprint_review" }
+    );
+    return;
+  }
+  openAppModal(
+    `
+    <div class="release-modal-head">
+      <h2 id="app-modal-title">${title}</h2>
+      <p class="muted">Автор: ${escapeHtml(author)}</p>
+    </div>
+    <p class="muted">${escapeHtml(review.error || "Оценка временно недоступна")}</p>
+    `,
+    { wide: true, type: "sprint_review" }
+  );
+}
+
+function renderSprintHeader(sprint, mood, aiBrief = null, sprintReview = null) {
   const root = document.getElementById("sprint-header");
   document.getElementById("sprint-title").textContent = sprint.name || "Спринт";
   updateDocumentTitle(sprint);
@@ -1300,8 +1449,10 @@ function renderSprintHeader(sprint, mood, aiBrief = null) {
   const endsHint =
     sprint.days_left == null
       ? "дата окончания неизвестна"
-      : sprint.days_left === 0
-        ? "заканчивается сегодня"
+      : sprint.state === "closed"
+        ? "спринт завершён"
+        : sprint.days_left === 0
+          ? "заканчивается сегодня"
         : `осталось ${fmtNumber(sprint.days_left)} дн.`;
 
   const tasksPct = sprint.tasks_progress_pct;
@@ -1309,7 +1460,15 @@ function renderSprintHeader(sprint, mood, aiBrief = null) {
   const tasksTone =
     tasksPct == null ? "" : tasksPct >= 70 ? "metric-ok" : tasksPct >= 40 ? "metric-info" : "metric-warn";
   const timeTone =
-    timePct == null ? "" : timePct >= 80 ? "metric-warn" : timePct >= 50 ? "metric-info" : "metric-ok";
+    sprint.state === "closed"
+      ? "metric-ok"
+      : timePct == null
+        ? ""
+        : timePct >= 80
+          ? "metric-warn"
+          : timePct >= 50
+            ? "metric-info"
+            : "metric-ok";
 
   const cards = [
     {
@@ -1323,14 +1482,14 @@ function renderSprintHeader(sprint, mood, aiBrief = null) {
       value: timePct == null ? "—" : `${fmtNumber(timePct)}%`,
       hint:
         sprint.day_index != null && sprint.day_total != null
-          ? `день ${sprint.day_index} из ${sprint.day_total} · календарные дни`
-          : "календарные дни",
+          ? `рабочий день ${sprint.day_index} из ${sprint.day_total} · понедельник–пятница`
+          : "рабочее время · понедельник–пятница",
       tone: timeTone,
     },
     {
       label: "Выполнение задач",
       value: tasksPct == null ? "—" : `${fmtNumber(tasksPct)}%`,
-      hint: `${fmtNumber(sprint.done)} / ${fmtNumber(sprint.total)} закрыто`,
+      hint: `${fmtNumber(sprint.completed_in_sprint ?? sprint.done)} / ${fmtNumber(sprint.total)} завершено после старта спринта по Jira changelog${Number(sprint.precompleted || 0) > 0 ? ` · ${fmtNumber(sprint.precompleted)} уже были закрыты` : ""}`,
       tone: tasksTone,
     },
     {
@@ -1388,7 +1547,27 @@ function renderSprintHeader(sprint, mood, aiBrief = null) {
     </article>`;
   }
 
-  root.innerHTML = cards + moodCard + aiCard;
+  let reviewCard = "";
+  if (sprintReview && sprintReview.reason !== "too_early") {
+    const author = corporateAuthorLabel(sprintReview);
+    const tone = sprintReview.status === "error" ? "tone-warn" : "tone-good";
+    const verdict =
+      humanizeAiText(sprintReview.verdict || "") ||
+      extractAiVerdict(sprintReview.markdown) ||
+      (sprintReview.status === "error"
+        ? "Оценка временно недоступна"
+        : "Открыть итоги и рекомендации");
+    const when = sprintReview.generated_at ? fmtRelativeAgo(sprintReview.generated_at) : "—";
+    reviewCard = `
+    <article class="card mood-card ai-brief-card sprint-review-card ${tone}" data-sprint-review="1" role="button" tabindex="0" title="Открыть оценку прошедшего спринта">
+      <p class="label">Оценка прошедшего спринта</p>
+      <p class="ai-brief-author">${escapeHtml(author)}</p>
+      <p class="mood-reco ai-inline">${formatAiInlineMarkdown(verdict)}</p>
+      <p class="hint">${escapeHtml(when)}</p>
+    </article>`;
+  }
+
+  root.innerHTML = cards + moodCard + aiCard + reviewCard;
 }
 
 function shortDirection(name) {
@@ -1409,9 +1588,9 @@ function renderEpicTimeline(timeline) {
     return;
   }
   section.classList.remove("hidden");
-  section.classList.remove("is-open");
+  section.classList.add("is-open");
   const toggle = section.querySelector("[data-collapse-toggle]");
-  if (toggle) syncCollapseLabel(toggle, false);
+  if (toggle) syncCollapseLabel(toggle, true);
 
   if (mini) {
     mini.innerHTML = epics
@@ -2013,11 +2192,15 @@ function releaseCardHtml(r, { showDate = false } = {}) {
             ${releaseStatusBadge(r)}
           </div>
           ${descHtml}
-          <div class="release-progress">
-            <div class="progress">
-              <div class="progress-bar" style="width:${Math.min(Number(r.progress_pct) || 0, 100)}%"></div>
-            </div>
-          </div>
+          ${
+            r.released
+              ? ""
+              : `<div class="release-progress">
+                  <div class="progress">
+                    <div class="progress-bar" style="width:${Math.min(Number(r.progress_pct) || 0, 100)}%"></div>
+                  </div>
+                </div>`
+          }
         </article>`;
 }
 
@@ -2382,6 +2565,7 @@ function openPersonModal(name) {
   const activeTasksHtml = renderPersonActiveTasks(
     profile.tasks_active || profile.tasks || []
   );
+  const completedTasksHtml = renderPersonCompletedTasks(profile.tasks_completed || []);
 
   const activityHtml = renderPersonActivity(profile.activity);
   const loadHtml = renderPersonLoad(profile.load);
@@ -2420,7 +2604,8 @@ function openPersonModal(name) {
     </div>
     <div class="person-modal-stats">
       <div class="person-stat"><span class="label">${tip("Активные", "Задачи в active-статусе направления")}</span><span class="value">${fmtNumber(profile.tasks_open)}</span></div>
-      <div class="person-stat"><span class="label">${tip("Закрыто / всего", "Закрытые по правилам направления / все задачи сотрудника в спринте")}</span><span class="value">${fmtNumber(profile.tasks_done)}/${fmtNumber(profile.tasks_total)}</span></div>
+      <div class="person-stat"><span class="label">${tip("Готово сейчас / всего", "Текущее состояние задач сотрудника в составе спринта")}</span><span class="value">${fmtNumber(profile.tasks_done)}/${fmtNumber(profile.tasks_total)}</span></div>
+      <div class="person-stat"><span class="label">${tip("Завершено в спринте", "Переходы в завершающий статус после начала текущего спринта")}</span><span class="value">${fmtNumber((profile.tasks_completed || []).length)}</span></div>
       <div class="person-stat"><span class="label">${tip("Часы спринта", "Сумма worklog за дни спринта")}</span><span class="value">${fmtDuration(profile.hours_sprint)}</span></div>
       <div class="person-stat"><span class="label">${tip("MR", "Merge request’ы, связанные с задачами сотрудника")}</span><span class="value">${fmtNumber(profile.mr_count)}</span></div>
     </div>
@@ -2439,6 +2624,10 @@ function openPersonModal(name) {
     <div class="person-modal-section">
       <h3>Активные задачи</h3>
       ${activeTasksHtml}
+    </div>
+    <div class="person-modal-section">
+      <h3>Завершено в этом спринте</h3>
+      ${completedTasksHtml}
     </div>`,
     { person: true, type: "person" }
   );
@@ -2726,6 +2915,22 @@ function renderPersonActiveTasks(tasks) {
   }
 
   return `<div class="person-task-groups">${blocks.join("")}</div>`;
+}
+
+function renderPersonCompletedTasks(tasks) {
+  const list = tasks || [];
+  if (!list.length) {
+    return `<p class="muted">После начала спринта завершённых задач нет</p>`;
+  }
+  return `<div class="person-completed-list">${list
+    .map(
+      (task) => `
+        <div class="person-completed-task">
+          ${releaseTaskRowHtml(task, { showAssignee: false, showReleaseTags: true })}
+          <span class="person-completed-at">Завершено ${escapeHtml(fmtDateTime(task.completed_at))}</span>
+        </div>`
+    )
+    .join("")}</div>`;
 }
 
 function renderPersonLoad(load) {
@@ -3629,6 +3834,7 @@ function releaseTaskRowHtml(
 }
 
 function releaseAiBriefHtml(release) {
+  if (release?.released) return "";
   const local = release?.ai_brief;
   const bundle = currentSprintReport?.ai_release_briefs || {};
   const gkey = releaseDateGroupKey(release);
@@ -3648,7 +3854,7 @@ function releaseAiBriefHtml(release) {
   const reused = brief?.reason === "reused" || bundle.reason === "reused";
   const label = `${reused ? "Прошлая AI-оценка" : "AI-оценка"} релизов на ${dateLabel}`;
   if (!brief?.markdown && !brief?.text) {
-    if (bundle.status === "error") {
+    if (bundle.status === "error" || fromBundle?.status === "error") {
       return `
         <div class="person-modal-section">
           <div class="release-ai-brief tone-info">
@@ -3743,7 +3949,11 @@ function openReleaseModal(releaseId, releaseName) {
             ${escapeHtml(s.direction)} · ${fmtNumber(s.progress_pct)}% · акт. ${fmtNumber(s.active_tasks)}
             ${lagBadge}
           </h3>
-          <div class="progress" style="margin:0.35rem 0 0.55rem"><div class="progress-bar" style="width:${Math.min(s.progress_pct || 0, 100)}%"></div></div>
+          ${
+            release.released
+              ? ""
+              : `<div class="progress" style="margin:0.35rem 0 0.55rem"><div class="progress-bar" style="width:${Math.min(s.progress_pct || 0, 100)}%"></div></div>`
+          }
           <div class="person-task-list release-task-list">${taskList || `<p class="muted">Нет задач направления</p>`}</div>
         </div>`;
     })
@@ -3906,31 +4116,18 @@ function renderReportNav(directions) {
   const nav = document.getElementById("report-nav");
   if (!nav) return;
   const items = [
-    { id: "directions-section", label: "Направления", kind: "main", icon: "directions" },
-    { id: "releases-section", label: "Релизы", kind: "main", icon: "releases" },
-    { id: "epic-timeline-section", label: "Эпики", kind: "main", icon: "epics" },
+    { id: "main", label: "Главная", icon: "risks" },
+    { id: "team", label: "Команда", icon: "directions" },
+    { id: "releases", label: "Релизы", icon: "releases" },
+    { id: "epics", label: "Эпики", icon: "epics" },
+    { id: "time", label: "Учёт времени", icon: "worklog" },
   ];
-  for (const d of directions || []) {
-    items.push({
-      id: `direction-${slugifyId(d.name)}`,
-      label: d.name,
-      kind: "direction",
-    });
-  }
-  items.push(
-    { id: "team-section", label: "Списание времени", kind: "main", icon: "worklog" },
-    { id: "risks-section", label: "Риски спринта", kind: "main", icon: "risks" },
-    { id: "ratings-section", label: "Рейтинг", kind: "main", icon: "ratings" }
-  );
-  const visible = items.filter((item) => {
-    const el = document.getElementById(item.id);
-    return el && !el.classList.contains("hidden");
-  });
-  const navBtns = visible
+  const navBtns = items
     .map(
       (item) => `
-    <button type="button" class="report-nav-btn kind-${escapeHtml(item.kind)}" data-nav-target="${escapeHtml(item.id)}" title="${escapeHtml(item.label)}" aria-label="${escapeHtml(item.label)}">
+    <button type="button" class="report-nav-btn ${item.id === "main" ? "is-active" : ""}" data-report-page-target="${escapeHtml(item.id)}" aria-current="${item.id === "main" ? "page" : "false"}">
       ${reportNavIconHtml(item)}
+      <span>${escapeHtml(item.label)}</span>
     </button>`
     )
     .join("");
@@ -3939,8 +4136,23 @@ function renderReportNav(directions) {
       ${NAV_ICONS.search}
     </button>`;
   nav.innerHTML = `${navBtns}${searchBtn}`;
-  nav.classList.toggle("hidden", !visible.length && !searchBtn);
-  bindReportNavSpy();
+  nav.classList.remove("hidden");
+  setReportPage("main");
+}
+
+function setReportPage(page) {
+  const selected = ["main", "team", "releases", "epics", "time"].includes(page)
+    ? page
+    : "main";
+  document.querySelectorAll("[data-report-page]").forEach((panel) => {
+    panel.classList.toggle("is-active", panel.getAttribute("data-report-page") === selected);
+  });
+  document.querySelectorAll("[data-report-page-target]").forEach((button) => {
+    const active = button.getAttribute("data-report-page-target") === selected;
+    button.classList.toggle("is-active", active);
+    if (active) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  });
 }
 
 let reportSearchDebounce = 0;
@@ -4556,14 +4768,12 @@ function renderTeam(report) {
 
 function renderRisks(risks) {
   const filters = {
-    outsideSprint: true,
-    withoutDate: true,
+    outsideSprint: false,
   };
 
   function visibleItems(items) {
     return (items || []).filter((item) => {
       if (!filters.outsideSprint && item.release_outside_sprint) return false;
-      if (!filters.withoutDate && item.release_without_date) return false;
       return true;
     });
   }
@@ -4627,10 +4837,6 @@ function renderRisks(risks) {
         <label class="risk-filter-toggle">
           <input type="checkbox" data-risk-filter="outsideSprint" ${filters.outsideSprint ? "checked" : ""}>
           <span>Релиз вне спринта</span>
-        </label>
-        <label class="risk-filter-toggle">
-          <input type="checkbox" data-risk-filter="withoutDate" ${filters.withoutDate ? "checked" : ""}>
-          <span>Релиз без даты</span>
         </label>
       </div>`;
     root.innerHTML = toolbar + [
@@ -4703,6 +4909,11 @@ function paintReport(report) {
   }
 
   currentSprintReport = sr;
+  sr.sprint = normalizeSprintForDisplay(
+    sr.sprint,
+    sr.settings || {},
+    sr.worklogs?.expected_hours_per_day || 8
+  );
   const directions = sortByDirectionOrder(sr.directions || [], sr.direction_order || []);
   sr.directions = directions;
   TASK_TABLE_PREVIEW = Math.max(
@@ -4711,7 +4922,7 @@ function paintReport(report) {
   );
   showReport(true);
   reportSearchIndex = null;
-  renderSprintHeader(sr.sprint, sr.team_mood, sr.ai_brief);
+  renderSprintHeader(sr.sprint, sr.team_mood, sr.ai_brief, sr.ai_sprint_review);
   renderDirections(directions);
   renderReleases(sr.releases || []);
   renderEpicTimeline(sr.epic_timeline || {});
@@ -4784,6 +4995,12 @@ async function main() {
     if (navBtn) {
       event.preventDefault();
       scrollToReportSection(navBtn.getAttribute("data-nav-target"));
+      return;
+    }
+    const pageBtn = event.target.closest("[data-report-page-target]");
+    if (pageBtn) {
+      event.preventDefault();
+      setReportPage(pageBtn.getAttribute("data-report-page-target"));
       return;
     }
     const closeEl = event.target.closest("[data-modal-close]");
@@ -4918,6 +5135,11 @@ async function main() {
         return;
       }
     }
+    const sprintReviewCard = event.target.closest("[data-sprint-review]");
+    if (sprintReviewCard) {
+      openSprintReviewModal(currentSprintReport?.ai_sprint_review);
+      return;
+    }
     const ratingCard = event.target.closest(".rating-card[data-rating-id]");
     if (ratingCard && !event.target.closest(".person-btn")) {
       openRatingModal(ratingCard.getAttribute("data-rating-id"));
@@ -4964,6 +5186,12 @@ async function main() {
       ) {
         event.preventDefault();
         openAiBriefModal(currentSprintReport?.ai_brief);
+        return;
+      }
+      const sprintReviewCard = event.target.closest?.("[data-sprint-review]");
+      if (sprintReviewCard) {
+        event.preventDefault();
+        openSprintReviewModal(currentSprintReport?.ai_sprint_review);
         return;
       }
       const ratingCard = event.target.closest?.(".rating-card[data-rating-id]");

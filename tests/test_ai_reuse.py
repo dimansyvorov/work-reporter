@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from copy import deepcopy
 
 from src.ai_reuse import reuse_previous_ai
+from src.ai_brief import PROMPT_VERSION as SPRINT_PROMPT_VERSION
+from src.ai_person_notes import NOTES_PROMPT_VERSION
+from src.ai_release_briefs import PROMPT_VERSION as RELEASE_PROMPT_VERSION
 
 
 def _current(sprint_id: int = 42) -> dict:
@@ -31,12 +35,14 @@ def _previous(sprint_id: int = 42) -> dict:
             "sprint": {"id": sprint_id},
             "ai_brief": {
                 "status": "ok",
+                "prompt_version": SPRINT_PROMPT_VERSION,
                 "reason": "generated",
                 "generated_at": "2026-08-12T10:00:00+00:00",
                 "markdown": "Sprint brief",
             },
             "ai_person_notes": {
                 "status": "ok",
+                "prompt_version": NOTES_PROMPT_VERSION,
                 "reason": "generated",
                 "generated_at": "2026-08-12T10:01:00+00:00",
                 "notes": {
@@ -46,6 +52,7 @@ def _previous(sprint_id: int = 42) -> dict:
             },
             "ai_release_briefs": {
                 "status": "ok",
+                "prompt_version": RELEASE_PROMPT_VERSION,
                 "reason": "generated",
                 "generated_at": "2026-08-12T10:02:00+00:00",
                 "briefs": {
@@ -107,6 +114,17 @@ class ReusePreviousAiTest(unittest.TestCase):
         self.assertEqual(sprint["ai_brief"]["reason"], "no_previous")
         self.assertEqual(sprint["ai_person_notes"]["status"], "skipped")
         self.assertEqual(sprint["ai_release_briefs"]["status"], "skipped")
+
+    def test_outdated_prompt_results_are_not_reused(self):
+        previous = deepcopy(_previous())
+        previous["sprint_report"]["ai_brief"]["prompt_version"] = "sprint-brief-v6"
+        previous["sprint_report"]["ai_release_briefs"]["prompt_version"] = "release-group-brief-v2"
+
+        sprint = reuse_previous_ai(_current(), previous)["sprint_report"]
+
+        self.assertEqual(sprint["ai_brief"]["status"], "skipped")
+        self.assertEqual(sprint["ai_release_briefs"]["status"], "skipped")
+        self.assertNotIn("ai_brief", sprint["releases"][0])
 
 
 if __name__ == "__main__":

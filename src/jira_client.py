@@ -696,15 +696,24 @@ def _inclusive_sprint_end_date(end: datetime | None, start: datetime | None) -> 
 
 
 def _normalize_sprint(sprint: dict) -> dict:
+    from .sprint_window import normalize_sprint_window
+    from .team_config import get_team_config
+
     start = _parse_jira_dt(sprint.get("startDate"))
     end = _parse_jira_dt(sprint.get("endDate") or sprint.get("completeDate"))
-    end_day = _inclusive_sprint_end_date(end, start)
+    window = normalize_sprint_window(
+        name=sprint.get("name"),
+        start=start,
+        end=end,
+        timezone_name=get_team_config().ratings.timezone,
+    )
     return {
         "id": sprint.get("id"),
         "name": sprint.get("name") or "Sprint",
         "state": (sprint.get("state") or "unknown").lower(),
-        "start_date": (start.date().isoformat() if start else None),
-        "end_date": (end_day.isoformat() if end_day else None),
+        "start_date": window.start.isoformat() if window.start else None,
+        "end_date": window.end.isoformat() if window.end else None,
+        "date_source": window.source,
         "start_at": start.isoformat() if start else sprint.get("startDate"),
         "end_at": end.isoformat() if end else sprint.get("endDate"),
         "goal": sprint.get("goal"),

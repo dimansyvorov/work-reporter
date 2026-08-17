@@ -148,6 +148,14 @@ def build_mock_raw(days: int = 30) -> dict:
             helper_author = gl_authors.get(helper_name, {"name": helper_name})
             commits_by_author[helper_author["name"]] = 3
             commit_count += 3
+        commit_events = [
+            {
+                "author": commit_author,
+                "committed_at": iso(created + timedelta(minutes=commit_idx + 1)),
+            }
+            for commit_author, author_count in commits_by_author.items()
+            for commit_idx in range(author_count)
+        ]
         direction = TEAM_ROSTER.get(assignee) or ""
         backendish = direction == "Бэкенд"
         title = (
@@ -173,6 +181,7 @@ def build_mock_raw(days: int = 30) -> dict:
                 "web_url": mr_url,
                 "commit_count": commit_count,
                 "commits_by_author": commits_by_author,
+                "commit_events": commit_events,
                 "commit_messages": [f"{key}: implement feature {i}", "cleanup"],
                 "issue_keys_from_commits": [key],
             }
@@ -206,6 +215,13 @@ def build_mock_raw(days: int = 30) -> dict:
             "web_url": f"https://gitlab.example.com/{helper_project}/-/merge_requests/199",
             "commit_count": 4,
             "commits_by_author": {helper_author["name"]: 4},
+            "commit_events": [
+                {
+                    "author": helper_author["name"],
+                    "committed_at": iso(start + timedelta(days=2, minutes=i + 1)),
+                }
+                for i in range(4)
+            ],
             "commit_messages": ["DEMO-103: assist"],
             "issue_keys_from_commits": ["DEMO-103"],
         }
@@ -229,6 +245,23 @@ def build_mock_raw(days: int = 30) -> dict:
             )
 
     changelogs: list[dict] = []
+    for issue in issues:
+        fields = issue.get("fields") or {}
+        if ((fields.get("status") or {}).get("statusCategory") or {}).get("key") != "done":
+            continue
+        assignee = (fields.get("assignee") or {}).get("displayName")
+        changelogs.append(
+            {
+                "issue_key": issue.get("key"),
+                "issue_summary": fields.get("summary"),
+                "at": fields.get("resolutiondate") or iso(now - timedelta(days=1)),
+                "author": assignee,
+                "status_from": "В работе",
+                "status_to": (fields.get("status") or {}).get("name") or "Готово",
+                "assignee_from": assignee,
+                "assignee_to": assignee,
+            }
+        )
     if len(people) >= 2 and len(issues) >= 3:
         p0, p1 = people[0]["displayName"], people[1]["displayName"]
         yday = (now - timedelta(days=1)).replace(hour=16, minute=0, second=0, microsecond=0)

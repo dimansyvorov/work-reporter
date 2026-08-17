@@ -283,6 +283,7 @@ def _should_enrich_mr_commits(
 def _apply_commit_payload(mr: dict, payload: dict) -> None:
     mr["commit_count"] = int(payload.get("commit_count") or 0)
     mr["commits_by_author"] = dict(payload.get("commits_by_author") or {})
+    mr["commit_events"] = list(payload.get("commit_events") or [])
     mr["commit_messages"] = list(payload.get("commit_messages") or [])
     mr["issue_keys_from_commits"] = list(payload.get("issue_keys_from_commits") or [])
 
@@ -291,6 +292,7 @@ def _empty_commit_payload() -> dict:
     return {
         "commit_count": 0,
         "commits_by_author": {},
+        "commit_events": [],
         "commit_messages": [],
         "issue_keys_from_commits": [],
     }
@@ -300,6 +302,7 @@ def _build_commit_payload(commits: list[dict]) -> dict:
     from .linking import extract_issue_keys
 
     by_author: dict[str, int] = {}
+    commit_events: list[dict] = []
     commit_messages: list[str] = []
     keys_from_commits: list[str] = []
     seen_keys: set[str] = set()
@@ -311,6 +314,18 @@ def _build_commit_payload(commits: list[dict]) -> dict:
         )
         if author:
             by_author[author] = by_author.get(author, 0) + 1
+        committed_at = (
+            commit.get("committed_date")
+            or commit.get("authored_date")
+            or commit.get("created_at")
+        )
+        if author and committed_at:
+            commit_events.append(
+                {
+                    "author": author,
+                    "committed_at": committed_at,
+                }
+            )
         message = (commit.get("title") or commit.get("message") or "").strip()
         if message:
             commit_messages.append(message.split("\n", 1)[0][:300])
@@ -321,6 +336,7 @@ def _build_commit_payload(commits: list[dict]) -> dict:
     return {
         "commit_count": len(commits),
         "commits_by_author": by_author,
+        "commit_events": commit_events,
         "commit_messages": commit_messages[:40],
         "issue_keys_from_commits": keys_from_commits,
     }
@@ -379,9 +395,14 @@ def enrich_mr_commit_counts(
                     _apply_commit_payload(mr, _empty_commit_payload())
                     continue
                 updated = str(mr.get("updated_at") or "")
-                cache_key = f"{project_ref}|{iid}|{updated}"
+                # v2 stores author + commit timestamp for exact sprint filtering.
+                cache_key = f"v2|{project_ref}|{iid}|{updated}"
                 cached = cache.get(cache_key)
-                if isinstance(cached, dict) and "commit_count" in cached:
+                if (
+                    isinstance(cached, dict)
+                    and "commit_count" in cached
+                    and "commit_events" in cached
+                ):
                     _apply_commit_payload(mr, cached)
                     cache_hits += 1
                     continue
@@ -406,7 +427,7 @@ def enrich_mr_commit_counts(
         project_ref, mr = item
         iid = int(mr["iid"])
         updated = str(mr.get("updated_at") or "")
-        cache_key = f"{project_ref}|{iid}|{updated}"
+        cache_key = f"v2|{project_ref}|{iid}|{updated}"
         try:
             commits = client.fetch_mr_commits(project_ref, iid)
             payload = _build_commit_payload(commits)
@@ -414,6 +435,7 @@ def enrich_mr_commit_counts(
             payload = {
                 "commit_count": int(mr.get("commit_count") or 0),
                 "commits_by_author": dict(mr.get("commits_by_author") or {}),
+                "commit_events": list(mr.get("commit_events") or []),
                 "commit_messages": list(mr.get("commit_messages") or []),
                 "issue_keys_from_commits": list(mr.get("issue_keys_from_commits") or []),
             }

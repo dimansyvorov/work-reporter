@@ -8,7 +8,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .activity import build_people_activity, report_today
 from .linking import link_sprint_issues
 from .people import best_gitlab_avatar, best_gitlab_person, collect_gitlab_people
-from .ratings import compute_ratings
+from .ratings import completed_tasks_in_window, compute_ratings
+from .sprint_window import sprint_business_state, sprint_name_window
 from .team import (
     DEV_DIRECTIONS,
     DIRECTION_ORDER,
@@ -84,22 +85,71 @@ def _is_weekend(day: date) -> bool:
     return day.weekday() >= 5
 
 
-def _sprint_day_progress(sprint: dict) -> tuple[int | None, int | None, float | None]:
+def _sprint_day_progress(
+    sprint: dict,
+    *,
+    now: datetime | None = None,
+    expected_hours: float | None = None,
+    start_hour: float | None = None,
+) -> tuple[int | None, int | None, float | None]:
+    """Working-time progress of a sprint (Mon–Fri, no holiday calendar)."""
     start = sprint.get("start_date")
     end = sprint.get("end_date")
     if not start or not end:
         return None, None, None
     start_d = date.fromisoformat(start)
     end_d = date.fromisoformat(end)
-    total = max((end_d - start_d).days + 1, 1)
-    today = datetime.now(timezone.utc).date()
-    if today < start_d:
-        idx = 0
-    elif today > end_d:
-        idx = total
+    workdays = [day for day in _daterange(start_d, end_d) if not _is_weekend(day)]
+    if not workdays:
+        return 0, 0, 0.0
+
+    local_now = now or _report_local_now()
+    expected = float(expected_hours or 8.0)
+    work_start = (
+        float(start_hour)
+        if start_hour is not None
+        else float(get_team_config().ratings.workday_start_hour)
+    )
+
+    def local_dt(value: str | None) -> datetime | None:
+        parsed = _parse_dt(value)
+        if not parsed:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(local_now.tzinfo)
+
+    exact_start = local_dt(sprint.get("start_at"))
+    exact_end = local_dt(sprint.get("end_at"))
+    total_hours = 0.0
+    elapsed_hours = 0.0
+    for day in workdays:
+        hour = int(work_start)
+        minute = int(round((work_start - hour) * 60))
+        if minute >= 60:
+            hour += 1
+            minute = 0
+        day_start = datetime(day.year, day.month, day.day, hour, minute, tzinfo=local_now.tzinfo)
+        day_end = day_start + timedelta(hours=expected)
+        if exact_start and exact_start.date() == day:
+            day_start = max(day_start, exact_start)
+        if exact_end and exact_end.date() == day:
+            day_end = min(day_end, exact_end)
+        capacity = max(0.0, (day_end - day_start).total_seconds() / 3600.0)
+        total_hours += capacity
+        elapsed_end = min(local_now, day_end)
+        elapsed_hours += max(0.0, (elapsed_end - day_start).total_seconds() / 3600.0)
+
+    if local_now.date() < start_d:
+        index = 0
+    elif local_now.date() > end_d:
+        index = len(workdays)
     else:
-        idx = (today - start_d).days + 1
-    return idx, total, _round(idx / total * 100.0)
+        index = sum(1 for day in workdays if day <= local_now.date())
+    progress = 100.0 if local_now.date() > end_d else (
+        elapsed_hours / total_hours * 100.0 if total_hours > 0 else 0.0
+    )
+    return index, len(workdays), _round(_clamp_score(progress))
 
 
 def _daterange(start: date, end: date) -> list[date]:
@@ -328,6 +378,22 @@ def _iter_issue_sprints(fields: dict) -> list[dict]:
         else:
             add(value)
     return found
+
+
+def _compact_issue_sprints(fields: dict) -> list[dict]:
+    """Keep already fetched sprint metadata for planning analysis."""
+    rows: list[dict] = []
+    for sprint in _iter_issue_sprints(fields):
+        rows.append(
+            {
+                "id": sprint.get("id"),
+                "name": sprint.get("name"),
+                "state": str(sprint.get("state") or "").lower() or None,
+                "start_date": sprint.get("startDate") or sprint.get("start_date"),
+                "end_date": sprint.get("endDate") or sprint.get("end_date"),
+            }
+        )
+    return rows
 
 
 def _has_sprint_delay(fields: dict, current_sprint_id) -> bool:
@@ -721,7 +787,7 @@ def _build_epic_timeline(
     epic_meta_local: dict[str, dict] = {}
     epic_has_active: set[str] = set()
     tasks_by_epic: dict[str, list[dict]] = defaultdict(list)
-    today = datetime.now(timezone.utc).date()
+    today = report_today()
 
     for issue in source_issues:
         fields = issue.get("fields") or {}
@@ -891,6 +957,29 @@ def _build_epic_timeline(
                 for t in (tasks_by_epic.get(epic_key) or [])
                 if t.get("direction") == direction
             ]
+            sprint_dir_tasks = [t for t in dir_tasks if t.get("in_sprint") is True]
+            sprint_dir_done = [
+                t for t in sprint_dir_tasks if t.get("direction_state") == "done"
+            ]
+            sprint_dir_open = [
+                t for t in sprint_dir_tasks if t.get("direction_state") != "done"
+            ]
+            sprint_dir_risk = [
+                t
+                for t in sprint_dir_open
+                if {tag.get("id") for tag in (t.get("tags") or [])}
+                & {"at_risk", "inactive", "no_release"}
+            ]
+            sprint_dir_carryover = [
+                t
+                for t in sprint_dir_open
+                if any(tag.get("id") == "delay" for tag in (t.get("tags") or []))
+            ]
+            sprint_dir_progress = (
+                len(sprint_dir_done) / len(sprint_dir_tasks) * 100.0
+                if sprint_dir_tasks
+                else 0.0
+            )
             open_detail = sorted(
                 [t for t in dir_tasks if t.get("direction_state") != "done"],
                 key=lambda t: (
@@ -915,6 +1004,12 @@ def _build_epic_timeline(
                     "width_pct": _round(width_pct, 2) or 0.0,
                     "progress_pct": _round(closed_pct, 0) or 0.0,
                     "closed_pct": _round(closed_pct, 0) or 0.0,
+                    "sprint_tasks": len(sprint_dir_tasks),
+                    "sprint_done_tasks": len(sprint_dir_done),
+                    "sprint_open_tasks": len(sprint_dir_open),
+                    "sprint_risk_tasks": len(sprint_dir_risk),
+                    "sprint_carryover_tasks": len(sprint_dir_carryover),
+                    "sprint_progress_pct": _round(sprint_dir_progress, 0) or 0.0,
                     "tasks_detail": open_detail[:30],
                 }
             )
@@ -925,6 +1020,14 @@ def _build_epic_timeline(
         total_done = sum(s["done_tasks"] for s in sections)
         total_active = sum(s["active_tasks"] for s in sections)
         overall = (total_done / total_tasks * 100.0) if total_tasks else 0.0
+        sprint_tasks = sum(s["sprint_tasks"] for s in sections)
+        sprint_done_tasks = sum(s["sprint_done_tasks"] for s in sections)
+        sprint_open_tasks = sum(s["sprint_open_tasks"] for s in sections)
+        sprint_risk_tasks = sum(s["sprint_risk_tasks"] for s in sections)
+        sprint_carryover_tasks = sum(s["sprint_carryover_tasks"] for s in sections)
+        sprint_progress = (
+            sprint_done_tasks / sprint_tasks * 100.0 if sprint_tasks else 0.0
+        )
         created_dt = local.get("created")
         updated_dt = local.get("updated")
         created_day = created_dt.date() if created_dt else None
@@ -977,6 +1080,12 @@ def _build_epic_timeline(
                 "tasks_active": total_active,
                 "tasks_open": len(open_tasks),
                 "tasks_risk": len(risk_tasks),
+                "sprint_tasks": sprint_tasks,
+                "sprint_done_tasks": sprint_done_tasks,
+                "sprint_open_tasks": sprint_open_tasks,
+                "sprint_risk_tasks": sprint_risk_tasks,
+                "sprint_carryover_tasks": sprint_carryover_tasks,
+                "sprint_progress_pct": _round(sprint_progress, 0) or 0.0,
                 "created": created_day.isoformat() if created_day else None,
                 "updated": updated_day.isoformat() if updated_day else None,
                 "age_days": age_days,
@@ -1313,7 +1422,7 @@ def _build_releases(
         return []
 
     team_cfg = get_team_config()
-    today = datetime.now(timezone.utc).date()
+    today = report_today()
     sprint_start = (
         date.fromisoformat(sprint["start_date"]) if sprint.get("start_date") else today
     )
@@ -1357,6 +1466,10 @@ def _build_releases(
         )
         if not vid or not release_day:
             continue
+        in_sprint = bool(
+            sprint_end
+            and sprint_start <= release_day <= sprint_end
+        )
 
         by_dir: dict[str, dict] = defaultdict(
             lambda: {
@@ -1430,6 +1543,8 @@ def _build_releases(
                 "tags": tags,
                 "risk": _has_risk_tags(tags),
                 "hidden_from_display": team_cfg.is_hidden_from_display(summary),
+                "in_current_sprint": _issue_in_sprint(fields, sprint_id),
+                "sprints": _compact_issue_sprints(fields),
             }
             version_tasks.append(task_row)
             tasks_by_dir[direction].append(task_row)
@@ -1672,6 +1787,7 @@ def _build_releases(
                 "project": meta.get("project"),
                 "description": meta.get("description") or "",
                 "released": released,
+                "in_sprint": in_sprint,
                 "release_date": meta.get("release_date"),
                 "start_date": meta.get("start_date"),
                 "web_url": meta.get("web_url")
@@ -1734,7 +1850,7 @@ def _build_people_profiles(
     team_cfg = get_team_config()
     by_name = {r["name"]: dict(r) for r in team_rows}
     tasks_by_person: dict[str, list[dict]] = defaultdict(list)
-    today = datetime.now(timezone.utc).date()
+    today = report_today()
     end_d = date.fromisoformat(sprint["end_date"]) if sprint.get("end_date") else None
     sprint_id = sprint.get("id")
     current_assignee_by_key: dict[str, str] = {}
@@ -1805,6 +1921,7 @@ def _build_people_profiles(
     )
 
     rating_hits: dict[str, list[dict]] = defaultdict(list)
+    completed_rating_tasks: dict[str, list[dict]] = defaultdict(list)
     for cat in ratings or []:
         if not cat.get("enabled"):
             continue
@@ -1821,6 +1938,21 @@ def _build_people_profiles(
                     "detail": person.get("detail"),
                 }
             )
+        if cat.get("id") == "closer":
+            for person in cat.get("all_people") or []:
+                pname = person.get("name")
+                if not pname:
+                    continue
+                for task in person.get("tasks") or []:
+                    row = dict(task)
+                    row["direction_state"] = "done"
+                    row["status_category"] = "done"
+                    row["web_url"] = (
+                        f"{browse_base}/browse/{row.get('key')}"
+                        if browse_base and row.get("key")
+                        else None
+                    )
+                    completed_rating_tasks[pname].append(row)
 
     profiles: dict[str, dict] = {}
     for name, base in by_name.items():
@@ -1882,6 +2014,9 @@ def _build_people_profiles(
             **base,
             "tasks": tasks[: m.person_tasks_limit],
             "tasks_active": active_tasks[: m.person_active_tasks_limit],
+            "tasks_completed": completed_rating_tasks.get(name, [])[
+                : m.person_tasks_limit
+            ],
             "risk_count": len(risk_tasks),
             "remaining_hours": load.get("remaining_hours") or 0.0,
             "load": load,
@@ -2039,6 +2174,7 @@ def _build_issues_index(
             "hidden_from_display": team_cfg.is_hidden_from_display(
                 fields.get("summary")
             ),
+            "in_current_sprint": _issue_in_sprint(fields, sprint_id),
             "version_ids": [
                 str(tag.get("release_id"))
                 for tag in tags
@@ -2119,7 +2255,12 @@ def _build_issues_index(
 
 
 def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
-    sprint = jira_raw.get("sprint") or {}
+    sprint = dict(jira_raw.get("sprint") or {})
+    named_window = sprint_name_window(sprint.get("name"))
+    if named_window:
+        sprint["start_date"] = named_window.start.isoformat() if named_window.start else None
+        sprint["end_date"] = named_window.end.isoformat() if named_window.end else None
+        sprint["date_source"] = named_window.source
     all_issues = jira_raw.get("issues") or []
     expected = float(jira_raw.get("expected_hours_per_day") or 8)
     browse_base = (jira_raw.get("browse_base") or "").rstrip("/")
@@ -2229,15 +2370,41 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
                 count = int(mr.get("commit_count") or 0)
             mr["commit_count"] = int(count or 0)
 
+    local_now = _report_local_now()
     done_count = sum(1 for issue in issues if _is_done(issue.get("fields") or {}))
     total = len(issues)
     open_count = total - done_count
-    day_index, day_total, time_progress_pct = _sprint_day_progress(sprint)
-    tasks_progress_pct = _round((done_count / total * 100.0) if total else 0.0)
+    completed_by_person = completed_tasks_in_window(
+        sprint=sprint,
+        issues=issues,
+        changelogs=jira_raw.get("changelogs") or [],
+        now=local_now,
+    )
+    currently_done_keys = {
+        (issue.get("key") or "").upper()
+        for issue in issues
+        if _is_done(issue.get("fields") or {})
+    }
+    completed_keys = {
+        (task.get("key") or "").upper()
+        for rows in completed_by_person.values()
+        for task in rows
+        if (task.get("key") or "").upper() in currently_done_keys
+    }
+    completed_in_sprint = len(completed_keys)
+    precompleted_count = max(done_count - completed_in_sprint, 0)
+    day_index, day_total, time_progress_pct = _sprint_day_progress(
+        sprint,
+        now=local_now,
+        expected_hours=expected,
+        start_hour=get_team_config().ratings.workday_start_hour,
+    )
+    tasks_progress_pct = _round(
+        (completed_in_sprint / total * 100.0) if total else 0.0
+    )
 
     start_d = date.fromisoformat(sprint["start_date"]) if sprint.get("start_date") else None
     end_d = date.fromisoformat(sprint["end_date"]) if sprint.get("end_date") else None
-    local_now = _report_local_now()
     today = local_now.date()
     sprint_calendar_dates = _daterange(start_d, end_d) if start_d and end_d else []
     sprint_day_dates = [day for day in sprint_calendar_dates if day <= today]
@@ -2750,11 +2917,7 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         key=lambda x: (x.get("status") or "", x.get("assignee") or "", x.get("key") or "")
     )
 
-    state_label = {
-        "active": "Активный",
-        "closed": "Закрыт",
-        "future": "Будущий",
-    }.get(sprint.get("state") or "", sprint.get("state") or "—")
+    business_state, state_label = sprint_business_state(sprint, today=today)
 
     # Attach avatars to rating candidates later in UI via team map
     avatar_map = {r["name"]: r.get("avatar_url") for r in team_rows}
@@ -2766,6 +2929,7 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         hours_by_issue=hours_by_issue,
         hours_by_person_issue=hours_by_person_issue,
         worklogs=jira_raw.get("worklogs") or [],
+        changelogs=jira_raw.get("changelogs") or [],
         links=links,
         gitlab_raw=gitlab_raw,
         expected_hours=expected,
@@ -2843,15 +3007,22 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
     sprint_payload = {
         "id": sprint.get("id"),
         "name": sprint.get("name"),
-        "state": sprint.get("state"),
+        "state": business_state,
+        "jira_state": sprint.get("state"),
         "state_label": state_label,
         "start_date": sprint.get("start_date"),
         "end_date": sprint.get("end_date"),
+        "start_at": sprint.get("start_at"),
+        "end_at": sprint.get("end_at"),
         "goal": sprint.get("goal"),
         "day_index": day_index,
         "day_total": day_total,
         "days_left": days_left,
-        "done": done_count,
+        "workdays_left": _working_days_between(today, end_d) if end_d else None,
+        "done": completed_in_sprint,
+        "completed_in_sprint": completed_in_sprint,
+        "current_done": done_count,
+        "precompleted": precompleted_count,
         "open": open_count,
         "total": total,
         "tasks_progress_pct": tasks_progress_pct,
@@ -2894,10 +3065,14 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         "team_mood": _compute_team_mood(
             sprint=sprint_payload,
             risks={
-                "at_risk": at_risk,
-                "stale": stale,
-                "no_worklogs": no_recent_logs,
-                "no_estimate": no_estimate,
+                "at_risk": [r for r in at_risk if not r.get("release_outside_sprint")],
+                "stale": [r for r in stale if not r.get("release_outside_sprint")],
+                "no_worklogs": [
+                    r for r in no_recent_logs if not r.get("release_outside_sprint")
+                ],
+                "no_estimate": [
+                    r for r in no_estimate if not r.get("release_outside_sprint")
+                ],
                 "no_release": no_release,
                 "stale_days": team_cfg.metrics.stale_days,
             },
@@ -3008,62 +3183,80 @@ def _compute_team_mood(
     releases: list[dict],
     epic_timeline: dict,
 ) -> dict:
-    """
-    Informational sprint health score 0..100 with emoji + recommendation.
-
-    Combines plan vs fact, task risk panels, release risk, and in-sprint epic work.
-    Out-of-sprint epic tasks are ignored for epic risk contribution.
-    """
+    """Deterministic sprint health score with an auditable calculation trace."""
     tasks_pct = float(sprint.get("tasks_progress_pct") or 0.0)
     time_pct = float(sprint.get("time_progress_pct") or 0.0)
     total = int(sprint.get("total") or 0)
     open_n = int(sprint.get("open") or 0)
-    done_n = int(sprint.get("done") or 0)
+    done_n = int(sprint.get("completed_in_sprint") or sprint.get("done") or 0)
+    current_done_n = int(sprint.get("current_done") or sprint.get("done") or 0)
+    precompleted_n = int(sprint.get("precompleted") or 0)
     days_left = sprint.get("days_left")
     urgency = 0.45 + 0.55 * (time_pct / 100.0)
 
     drivers: list[dict] = []
 
-    # --- Plan vs fact (calendar vs closed tasks) ---
+    def add_driver(
+        *,
+        driver_id: str,
+        title: str,
+        summary: str,
+        severity: str,
+        component: str,
+        component_loss: float,
+    ) -> None:
+        drivers.append(
+            {
+                "id": driver_id,
+                "title": title,
+                "summary": summary,
+                "severity": severity,
+                "component": component,
+                "_component_loss": max(0.0, float(component_loss)),
+            }
+        )
+
+    # --- Plan vs fact (elapsed working time vs completions inside the window) ---
     slip = max(0.0, time_pct - tasks_pct)
     schedule_score = _clamp_score(100.0 - slip * 1.35 * urgency)
     if total > 0 and slip >= 12 and time_pct >= 35:
-        drivers.append(
-            {
-                "id": "schedule_slip",
-                "title": "Отстаём от плана спринта",
-                "summary": (
-                    f"Прошло {time_pct:.0f}% времени спринта, закрыто {tasks_pct:.0f}% "
-                    f"задач (разрыв {slip:.0f} п.п., объём {done_n}/{total})."
-                ),
-                "severity": "danger" if slip >= 28 or time_pct >= 75 else "warn",
-                "impact": _round(min(42.0, slip * 0.85 * urgency), 1) or 0.0,
-            }
+        add_driver(
+            driver_id="schedule_slip",
+            title="Отстаём от плана спринта",
+            summary=(
+                f"Прошло {time_pct:.0f}% рабочего времени, в спринте завершено "
+                f"{tasks_pct:.0f}% задач (разрыв {slip:.0f} п.п., объём {done_n}/{total})."
+            ),
+            severity="danger" if slip >= 28 or time_pct >= 75 else "warn",
+            component="schedule",
+            component_loss=100.0 - schedule_score,
         )
     if time_pct >= 70 and tasks_pct < 30 and total > 0:
-        drivers.append(
-            {
-                "id": "low_completion_late",
-                "title": "Мало закрытых задач к концу спринта",
-                "summary": (
-                    f"К {time_pct:.0f}% прохождения закрыто только {tasks_pct:.0f}% "
-                    f"({done_n} из {total})."
-                ),
-                "severity": "danger",
-                "impact": _round(min(35.0, (70.0 - tasks_pct) * 0.45), 1) or 0.0,
-            }
+        add_driver(
+            driver_id="low_completion_late",
+            title="Мало завершений к концу спринта",
+            summary=(
+                f"К {time_pct:.0f}% рабочего времени завершено только {tasks_pct:.0f}% "
+                f"задач ({done_n} из {total})."
+            ),
+            severity="danger",
+            component="completion",
+            component_loss=0.0,  # filled after completion_score is known
         )
 
     if time_pct < 20:
         completion_score = _clamp_score(55.0 + tasks_pct * 0.4)
     else:
-        # Expected closed share ≈ calendar progress; reward catching up / finishing
+        # Expected closed share follows elapsed working time.
         expected = time_pct
         completion_score = _clamp_score(
             0.5 * tasks_pct + 0.5 * (100.0 - max(0.0, expected - tasks_pct) * 1.25)
         )
     if time_pct >= 85 and tasks_pct >= 95 and open_n == 0:
         completion_score = 100.0
+    for driver in drivers:
+        if driver.get("id") == "low_completion_late":
+            driver["_component_loss"] = 100.0 - completion_score
 
     # --- Task risk panels ---
     at_risk_n = len(risks.get("at_risk") or [])
@@ -3072,77 +3265,75 @@ def _compute_team_mood(
     no_est_n = len(risks.get("no_estimate") or [])
     no_rel_n = len(risks.get("no_release") or [])
     denom = max(open_n, 1)
-    risk_penalty = min(
-        100.0,
-        (at_risk_n / denom) * 55.0
-        + (stale_n / denom) * 32.0
-        + (no_wl_n / denom) * 28.0
-        + min(1.0, no_est_n / denom) * 12.0
-        + min(1.0, no_rel_n / denom) * 14.0,
-    )
+    risk_parts = {
+        "tasks_at_risk": (at_risk_n / denom) * 55.0,
+        "tasks_stale": (stale_n / denom) * 32.0,
+        "tasks_no_worklogs": (no_wl_n / denom) * 28.0,
+        "tasks_no_estimate": min(1.0, no_est_n / denom) * 12.0,
+        "tasks_no_release": min(1.0, no_rel_n / denom) * 14.0,
+    }
+    raw_risk_penalty = sum(risk_parts.values())
+    risk_penalty = min(100.0, raw_risk_penalty)
+    risk_scale = risk_penalty / raw_risk_penalty if raw_risk_penalty > 0 else 0.0
     risk_score = _clamp_score(100.0 - risk_penalty * urgency)
     if at_risk_n:
-        drivers.append(
-            {
-                "id": "tasks_at_risk",
-                "title": "Задачи под угрозой срыва срока",
-                "summary": f"{at_risk_n} открытых задач могут не закрыться до конца спринта.",
-                "severity": "danger" if at_risk_n >= 5 or (at_risk_n / denom) >= 0.35 else "warn",
-                "impact": _round(min(30.0, at_risk_n * 2.2 * urgency), 1) or 0.0,
-            }
+        add_driver(
+            driver_id="tasks_at_risk",
+            title="Задачи под угрозой срыва срока",
+            summary=f"{at_risk_n} открытых задач могут не закрыться до конца спринта.",
+            severity="danger" if at_risk_n >= 5 or (at_risk_n / denom) >= 0.35 else "warn",
+            component="task_risks",
+            component_loss=risk_parts["tasks_at_risk"] * risk_scale * urgency,
         )
     if stale_n:
-        drivers.append(
-            {
-                "id": "tasks_stale",
-                "title": "Много неактивных задач",
-                "summary": (
-                    f"{stale_n} задач без обновлений "
-                    f"≥ {risks.get('stale_days') or 5} дн."
-                ),
-                "severity": "warn" if (stale_n / denom) < 0.4 else "danger",
-                "impact": _round(min(22.0, stale_n * 1.6 * urgency), 1) or 0.0,
-            }
+        add_driver(
+            driver_id="tasks_stale",
+            title="Много неактивных задач",
+            summary=f"{stale_n} задач без обновлений ≥ {risks.get('stale_days') or 5} дн.",
+            severity="warn" if (stale_n / denom) < 0.4 else "danger",
+            component="task_risks",
+            component_loss=risk_parts["tasks_stale"] * risk_scale * urgency,
         )
     if no_wl_n:
-        drivers.append(
-            {
-                "id": "tasks_no_worklogs",
-                "title": "Открыты без списаний",
-                "summary": f"{no_wl_n} задач без worklog при позднем спринте.",
-                "severity": "warn",
-                "impact": _round(min(16.0, no_wl_n * 1.3 * urgency), 1) or 0.0,
-            }
+        add_driver(
+            driver_id="tasks_no_worklogs",
+            title="Открыты без списаний",
+            summary=f"{no_wl_n} задач без worklog при позднем спринте.",
+            severity="warn",
+            component="task_risks",
+            component_loss=risk_parts["tasks_no_worklogs"] * risk_scale * urgency,
         )
     if no_est_n and (no_est_n / denom) >= 0.25:
-        drivers.append(
-            {
-                "id": "tasks_no_estimate",
-                "title": "Слабая оценка объёма",
-                "summary": (
-                    f"{no_est_n} открытых задач без Original Estimate — "
-                    "сложнее прогнозировать успеваемость."
-                ),
-                "severity": "warn",
-                "impact": _round(min(12.0, no_est_n * 0.35), 1) or 0.0,
-            }
+        add_driver(
+            driver_id="tasks_no_estimate",
+            title="Слабая оценка объёма",
+            summary=(
+                f"{no_est_n} открытых задач без Original Estimate — "
+                "сложнее прогнозировать успеваемость."
+            ),
+            severity="warn",
+            component="task_risks",
+            component_loss=risk_parts["tasks_no_estimate"] * risk_scale * urgency,
         )
     if no_rel_n and (no_rel_n / denom) >= 0.2:
-        drivers.append(
-            {
-                "id": "tasks_no_release",
-                "title": "Задачи без релиза",
-                "summary": (
-                    f"{no_rel_n} открытых задач без Fix Version — "
-                    "сложнее связать работу с целью и релизами."
-                ),
-                "severity": "warn",
-                "impact": _round(min(14.0, no_rel_n * 0.4), 1) or 0.0,
-            }
+        add_driver(
+            driver_id="tasks_no_release",
+            title="Задачи без релиза",
+            summary=(
+                f"{no_rel_n} открытых задач без Fix Version — "
+                "сложнее связать работу с целью и релизами."
+            ),
+            severity="warn",
+            component="task_risks",
+            component_loss=risk_parts["tasks_no_release"] * risk_scale * urgency,
         )
 
     # --- Releases ---
-    active_releases = [r for r in (releases or []) if not r.get("released")]
+    active_releases = [
+        r
+        for r in (releases or [])
+        if r.get("in_sprint") is True and not r.get("released")
+    ]
     risky_releases = [
         r
         for r in active_releases
@@ -3163,63 +3354,86 @@ def _compute_team_mood(
         release_score = _clamp_score(100.0 * ok_share - min(28.0, avg_slip * 0.9))
         if risky_releases:
             names = ", ".join((r.get("name") or "?") for r in risky_releases[:3])
-            drivers.append(
-                {
-                    "id": "releases_risk",
-                    "title": "Риски по релизам",
-                    "summary": (
-                        f"{len(risky_releases)} из {len(active_releases)} активных релизов "
-                        f"в зоне риска: {names}."
-                    ),
-                    "severity": "danger"
+            add_driver(
+                driver_id="releases_risk",
+                title="Риски по релизам",
+                summary=(
+                    f"{len(risky_releases)} из {len(active_releases)} активных релизов "
+                    f"в зоне риска: {names}."
+                ),
+                severity=(
+                    "danger"
                     if any(r.get("risk") == "overdue" for r in risky_releases)
-                    else "warn",
-                    "impact": _round(
-                        min(34.0, 10.0 + len(risky_releases) * 7.0 + avg_slip * 0.4), 1
-                    )
-                    or 0.0,
-                }
+                    else "warn"
+                ),
+                component="releases",
+                component_loss=100.0 - release_score,
             )
 
-    # --- Epics: only in-sprint tasks for risk ---
+    # --- Epics: both progress and risks use only current-sprint tasks ---
     epics = (epic_timeline or {}).get("epics") or []
     epic_progress: list[float] = []
     sprint_open = 0
     sprint_risk = 0
+    sprint_carryover = 0
     for epic in epics:
-        has_sprint_task = False
-        for section in epic.get("sections") or []:
-            for task in section.get("tasks_detail") or []:
-                if task.get("in_sprint") is False:
-                    continue
-                has_sprint_task = True
-                if task.get("direction_state") == "done":
-                    continue
-                sprint_open += 1
-                if task.get("risk"):
-                    sprint_risk += 1
-        if has_sprint_task:
-            epic_progress.append(float(epic.get("progress_pct") or 0.0))
+        sprint_tasks = int(epic.get("sprint_tasks") or 0)
+        if sprint_tasks <= 0:
+            continue
+        epic_progress.append(float(epic.get("sprint_progress_pct") or 0.0))
+        sprint_open += int(epic.get("sprint_open_tasks") or 0)
+        sprint_risk += int(epic.get("sprint_risk_tasks") or 0)
+        sprint_carryover += int(epic.get("sprint_carryover_tasks") or 0)
     if epic_progress:
         avg_epic = sum(epic_progress) / len(epic_progress)
         risk_ratio = (sprint_risk / sprint_open) if sprint_open else 0.0
-        epic_score = _clamp_score(avg_epic * (1.0 - 0.45 * risk_ratio))
-        if risk_ratio >= 0.35 and sprint_risk >= 2:
-            drivers.append(
-                {
-                    "id": "epics_in_sprint_risk",
-                    "title": "Риски в эпиках спринта",
-                    "summary": (
-                        f"{sprint_risk} из {sprint_open} открытых задач эпиков "
-                        "в спринте с тегами риска "
-                        f"(средний прогресс эпиков {avg_epic:.0f}%)."
-                    ),
-                    "severity": "warn",
-                    "impact": _round(min(18.0, sprint_risk * 1.8), 1) or 0.0,
-                }
+        carryover_ratio = (sprint_carryover / sprint_open) if sprint_open else 0.0
+        epic_gap = max(0.0, time_pct - avg_epic)
+        epic_base = _clamp_score(100.0 - epic_gap * 1.25)
+        strong_loss = epic_base * 0.35 * risk_ratio
+        carryover_loss = epic_base * 0.08 * carryover_ratio
+        epic_score = _clamp_score(epic_base - strong_loss - carryover_loss)
+        if epic_gap >= 12:
+            add_driver(
+                driver_id="epics_progress",
+                title="Эпики отстают от рабочего времени",
+                summary=(
+                    f"Средний прогресс задач эпиков текущего спринта {avg_epic:.0f}%, "
+                    f"прошло {time_pct:.0f}% рабочего времени."
+                ),
+                severity="danger" if epic_gap >= 28 else "warn",
+                component="epics_in_sprint",
+                component_loss=100.0 - epic_base,
+            )
+        if sprint_risk >= 2 and risk_ratio >= 0.15:
+            add_driver(
+                driver_id="epics_in_sprint_risk",
+                title="Риски в эпиках спринта",
+                summary=(
+                    f"{sprint_risk} из {sprint_open} открытых задач эпиков имеют "
+                    "текущий риск: неактивность, отсутствие релиза или угрозу срока."
+                ),
+                severity="danger" if risk_ratio >= 0.4 else "warn",
+                component="epics_in_sprint",
+                component_loss=strong_loss,
+            )
+        if sprint_carryover >= 3 and carryover_ratio >= 0.2:
+            add_driver(
+                driver_id="epics_carryover",
+                title="Переносы в эпиках спринта",
+                summary=(
+                    f"{sprint_carryover} из {sprint_open} открытых задач эпиков "
+                    "связаны также с предыдущими или другими спринтами."
+                ),
+                severity="info",
+                component="epics_in_sprint",
+                component_loss=carryover_loss,
             )
     else:
         epic_score = 70.0
+        avg_epic = None
+        risk_ratio = 0.0
+        carryover_ratio = 0.0
 
     # Blend — completion weight grows as sprint advances
     w_schedule = 0.28
@@ -3228,14 +3442,22 @@ def _compute_team_mood(
     w_releases = 0.20
     w_epics = 0.10
     w_sum = w_schedule + w_completion + w_risks + w_releases + w_epics
-    score = (
+    normalized_weights = {
+        "schedule": w_schedule / w_sum,
+        "completion": w_completion / w_sum,
+        "task_risks": w_risks / w_sum,
+        "releases": w_releases / w_sum,
+        "epics_in_sprint": w_epics / w_sum,
+    }
+    raw_score = (
         schedule_score * w_schedule
         + completion_score * w_completion
         + risk_score * w_risks
         + release_score * w_releases
         + epic_score * w_epics
     ) / w_sum
-    score = _clamp_score(score)
+    raw_score = _clamp_score(raw_score)
+    score = raw_score
 
     # Soft floor/ceiling nudges for extreme end-states
     if total > 0 and open_n == 0 and not risky_releases:
@@ -3243,17 +3465,28 @@ def _compute_team_mood(
     if time_pct >= 85 and tasks_pct <= 5 and total > 0 and (at_risk_n or risky_releases):
         score = min(score, 18.0)
 
-    drivers.sort(key=lambda d: (-float(d.get("impact") or 0), d.get("id") or ""))
-    # keep top contributors
-    drivers = drivers[:8]
-
     # Early sprint: absence of risks ≠ victory — dampen celebratory scores.
+    early_factor = 1.0
+    evidence = 1.0
+    neutral = 66.0
+    early_cap: float | None = None
     if time_pct < 25:
         evidence = min(1.0, (tasks_pct / 20.0) + done_n * 0.04)
-        neutral = 66.0
-        score = _clamp_score(neutral + (score - neutral) * (0.30 + 0.70 * evidence))
+        early_factor = 0.30 + 0.70 * evidence
+        score = _clamp_score(neutral + (score - neutral) * early_factor)
         if tasks_pct < 12 and done_n < 3:
-            score = min(score, 74.0)
+            early_cap = 74.0
+            score = min(score, early_cap)
+
+    for driver in drivers:
+        component = str(driver.get("component") or "")
+        component_loss = float(driver.pop("_component_loss", 0.0) or 0.0)
+        driver["impact"] = _round(
+            component_loss * normalized_weights.get(component, 0.0) * early_factor,
+            1,
+        ) or 0.0
+    drivers.sort(key=lambda d: (-float(d.get("impact") or 0), d.get("id") or ""))
+    drivers = drivers[:8]
 
     recommendation, tone, emoji = _mood_copy(
         score=score,
@@ -3269,27 +3502,28 @@ def _compute_team_mood(
         "releases": _round(release_score, 0) or 0.0,
         "epics_in_sprint": _round(epic_score, 0) or 0.0,
     }
-    weights_pct = {
-        "schedule": _round(100.0 * w_schedule / w_sum, 0) or 0.0,
-        "completion": _round(100.0 * w_completion / w_sum, 0) or 0.0,
-        "task_risks": _round(100.0 * w_risks / w_sum, 0) or 0.0,
-        "releases": _round(100.0 * w_releases / w_sum, 0) or 0.0,
-        "epics_in_sprint": _round(100.0 * w_epics / w_sum, 0) or 0.0,
-    }
+    exact_weights_pct = {key: value * 100.0 for key, value in normalized_weights.items()}
+    weights_pct = {key: int(value) for key, value in exact_weights_pct.items()}
+    remainder = 100 - sum(weights_pct.values())
+    for key in sorted(
+        weights_pct,
+        key=lambda item: (-(exact_weights_pct[item] - weights_pct[item]), item),
+    )[:remainder]:
+        weights_pct[key] += 1
     components_meta = {
         "schedule": {
             "label": "Соблюдение плана",
             "hint": (
                 "Насколько % закрытых задач не отстаёт от % прошедшего времени спринта. "
-                "100 — идём в ногу или опережаем; ниже — отстаём."
+                "Учитываются рабочее время и завершения по Jira changelog внутри спринта."
             ),
             "weight_pct": weights_pct["schedule"],
         },
         "completion": {
             "label": "Темп закрытия",
             "hint": (
-                "Насколько фактическое закрытие задач соответствует ожидаемому к текущему "
-                "моменту спринта. Не «сколько всего закрыли», а «успеваем ли по календарю»."
+                "Темп завершений внутри спринта. В первые 20% рабочего времени используется "
+                "нейтральная стартовая база 55, потому что фактов ещё мало."
             ),
             "weight_pct": weights_pct["completion"],
         },
@@ -3312,8 +3546,8 @@ def _compute_team_mood(
         "epics_in_sprint": {
             "label": "Эпики в спринте",
             "hint": (
-                "Средний прогресс эпиков с задачами текущего спринта с учётом доли "
-                "рисковых задач в них."
+                "Прогресс только задач текущего спринта относительно прошедшего рабочего "
+                "времени. Текущие риски штрафуются сильнее переносов из прошлых спринтов."
             ),
             "weight_pct": weights_pct["epics_in_sprint"],
         },
@@ -3328,21 +3562,44 @@ def _compute_team_mood(
         "components": components,
         "components_meta": components_meta,
         "weights": weights_pct,
+        "calculation": {
+            "raw_score": _round(raw_score, 1) or 0.0,
+            "final_score": _round(score, 1) or 0.0,
+            "early_adjustment_applied": time_pct < 25,
+            "early_evidence_pct": _round(evidence * 100.0, 0) or 0.0,
+            "early_factor": _round(early_factor, 3) or 0.0,
+            "neutral_score": neutral,
+            "early_cap": early_cap,
+            "adjustment_pp": _round(score - raw_score, 1) or 0.0,
+        },
         "formula_hint": (
             "Итог = взвешенное среднее пяти оценок (каждая 0…100). "
             "Вес «Темпа закрытия» растёт к концу спринта. "
-            "В начале спринта высокий балл слегка приглушается, "
-            "чтобы отсутствие рисков не выглядело как победа."
+            "До 25% рабочего времени результат приближается к нейтральным 66 баллам; "
+            "коэффициент и исходный балл показаны ниже."
         ),
         "context": {
             "tasks_progress_pct": _round(tasks_pct, 0) or 0.0,
             "time_progress_pct": _round(time_pct, 0) or 0.0,
             "tasks_done": done_n,
+            "tasks_current_done": current_done_n,
+            "tasks_precompleted": precompleted_n,
             "tasks_total": total,
             "tasks_open": open_n,
             "days_left": days_left,
             "active_releases": len(active_releases),
             "epics_in_scope": len(epic_progress),
+            "risk_counts": {
+                "at_risk": at_risk_n,
+                "stale": stale_n,
+                "no_worklogs": no_wl_n,
+                "no_estimate": no_est_n,
+                "no_release": no_rel_n,
+            },
+            "epic_open_tasks": sprint_open,
+            "epic_risk_tasks": sprint_risk,
+            "epic_carryover_tasks": sprint_carryover,
+            "epic_progress_pct": _round(avg_epic, 0) if avg_epic is not None else None,
         },
     }
 

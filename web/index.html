@@ -50,9 +50,19 @@
 
       <div id="report-root" class="hidden">
         <nav id="report-nav" class="report-nav" aria-label="Разделы отчёта"></nav>
-        <section id="sprint-header" class="summary"></section>
+        <div id="page-main" class="report-page is-active" data-report-page="main">
+          <section id="sprint-header" class="summary"></section>
+          <section id="risks-section" class="panel">
+            <div class="section-head">
+              <h2>Риски спринта</h2>
+              <p class="muted">Задачи, на которые стоит обратить внимание</p>
+            </div>
+            <div id="risks" class="risks"></div>
+          </section>
+        </div>
 
-        <section id="directions-section" class="panel collapsible-panel is-open">
+        <div id="page-team" class="report-page" data-report-page="team">
+          <section id="directions-section" class="panel collapsible-panel is-open">
           <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="true">
             <div class="section-head tight">
               <h2>Направления</h2>
@@ -65,32 +75,44 @@
           </button>
           <div id="directions-mini" class="collapsible-summary"></div>
           <div id="directions-summary" class="directions-summary collapsible-body"></div>
-        </section>
+          </section>
+          <section id="direction-details"></section>
+          <section id="ratings-section" class="panel">
+            <div class="section-head">
+              <h2>Рейтинг</h2>
+              <p class="muted">Топ сотрудников по категориям спринта</p>
+            </div>
+            <div id="ratings" class="ratings-grid"></div>
+          </section>
+        </div>
 
-        <section id="releases-section" class="panel collapsible-panel hidden">
-          <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="false">
+        <div id="page-releases" class="report-page" data-report-page="releases">
+          <section id="releases-section" class="panel collapsible-panel is-open hidden">
+          <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="true">
             <div class="section-head tight">
               <h2>Релизы</h2>
               <p class="muted">Ближайшие версии</p>
             </div>
             <span class="collapse-toggle-btn">
               <span class="collapse-chevron" aria-hidden="true">▾</span>
-              <span class="collapse-label" data-collapse-label>Развернуть</span>
+              <span class="collapse-label" data-collapse-label>Свернуть</span>
             </span>
           </button>
           <div id="releases-mini" class="collapsible-summary"></div>
           <div id="releases" class="releases-list collapsible-body"></div>
-        </section>
+          </section>
+        </div>
 
-        <section id="epic-timeline-section" class="panel collapsible-panel hidden">
-          <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="false">
+        <div id="page-epics" class="report-page" data-report-page="epics">
+          <section id="epic-timeline-section" class="panel collapsible-panel is-open hidden">
+          <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="true">
             <div class="section-head tight">
               <h2>Эпики</h2>
               <p class="muted">Только эпики релизного окна · длина полосы — оценка; заливка — доля закрытых задач</p>
             </div>
             <span class="collapse-toggle-btn">
               <span class="collapse-chevron" aria-hidden="true">▾</span>
-              <span class="collapse-label" data-collapse-label>Развернуть</span>
+              <span class="collapse-label" data-collapse-label>Свернуть</span>
             </span>
           </button>
           <div id="epics-mini" class="collapsible-summary"></div>
@@ -99,19 +121,19 @@
             <p id="epic-timeline-note" class="muted epic-timeline-note"></p>
             <div id="epic-timeline" class="epic-timeline"></div>
           </div>
-        </section>
+          </section>
+        </div>
 
-        <section id="direction-details"></section>
-
-        <section id="team-section" class="panel collapsible-panel">
-          <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="false">
+        <div id="page-time" class="report-page" data-report-page="time">
+          <section id="team-section" class="panel collapsible-panel is-open">
+          <button type="button" class="collapsible-head" data-collapse-toggle aria-expanded="true">
             <div class="section-head tight">
               <h2>Списание времени</h2>
               <p class="muted">Все рабочие дни спринта</p>
             </div>
             <span class="collapse-toggle-btn">
               <span class="collapse-chevron" aria-hidden="true">▾</span>
-              <span class="collapse-label" data-collapse-label>Развернуть</span>
+              <span class="collapse-label" data-collapse-label>Свернуть</span>
             </span>
           </button>
           <div id="worklog-mini" class="collapsible-summary"></div>
@@ -124,23 +146,8 @@
             </div>
             <div id="team-by-direction"></div>
           </div>
-        </section>
-
-        <section id="risks-section" class="panel">
-          <div class="section-head">
-            <h2>Риски спринта</h2>
-            <p class="muted">Задачи, на которые стоит обратить внимание</p>
-          </div>
-          <div id="risks" class="risks"></div>
-        </section>
-
-        <section id="ratings-section" class="panel">
-          <div class="section-head">
-            <h2>Рейтинг</h2>
-            <p class="muted">Топ сотрудников по категориям спринта</p>
-          </div>
-          <div id="ratings" class="ratings-grid"></div>
-        </section>
+          </section>
+        </div>
       </div>
     </main>
 

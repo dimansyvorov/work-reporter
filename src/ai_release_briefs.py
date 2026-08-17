@@ -19,15 +19,15 @@ from .ai_brief import (
     short_model_name,
 )
 
-PROMPT_VERSION = "release-group-brief-v2"
+PROMPT_VERSION = "release-group-brief-v4"
 
 SYSTEM_PROMPT = """Ты — аналитик релизов в спринтовой разработке.
 Тебе дают JSON-снимок ГРУППЫ релизов на ОДНУ дату релиза: несколько Fix Version
 одной команды с общей датой, задачи, люди, эпики, цель спринта.
 
-Задача: дать ОДНУ общую практическую оценку «успеваем ли к этой дате релиза»
-и рекомендации на ближайшие 1–2 дня. Не оценивай каждый релиз отдельным вердиктом —
-смотри на группу целиком (команда делает задачи всех релизов даты, не всегда по очереди).
+Задача: коротко и по существу объяснить, успевает ли группа к дате релиза и что
+реально требует внимания. Не оценивай каждый релиз отдельным вердиктом — смотри
+на группу целиком.
 
 Правила:
 1. Опирайся ТОЛЬКО на факты из JSON. Не выдумывай задачи, людей, проценты, причины.
@@ -38,8 +38,9 @@ SYSTEM_PROMPT = """Ты — аналитик релизов в спринтов�
    не натягивай. Не ожидай, что в цели всегда будет дата релиза.
 5. Если в группе несколько релизов — кратко упомяни, где основной риск (по имени релиза),
    но вердикт один на всю дату.
-6. Если риск низкий / всё в графике / уже выпущено — пиши КОРОТКО (3–6 предложений).
-7. Если есть угроза сроку / отставание / перегруз — разверни риски и действия;
+6. Выпущенные релизы сюда не передаются и оценивать их не нужно.
+7. Если риск низкий — пиши 2–4 предложения. Если есть угроза сроку — разверни
+   только существенные риски и действия;
    задач упоминай точечно (обычно 2–5 ключей), не каталогом.
 8. Рекомендации мягко («стоит», «важно», «имеет смысл»). Людей — «Имя Ф.» («Роман Щ.»).
    Про людей пиши «сотрудник», «коллега», «человек», «команда».
@@ -50,29 +51,16 @@ SYSTEM_PROMPT = """Ты — аналитик релизов в спринтов�
 11. НЕ используй сырые ключи JSON (progress_pct, slip_gap_pp, at_risk…).
     Пиши по-русски: «прогресс задач», «календарь до релиза», «отставание», «нагрузка»,
     «риск срыва», «в графике», «просрочен».
-12. Пиши по-русски, спокойным деловым тоном, без эмодзи.
-
-Формат ответа:
-
-## Вердикт
-1–2 предложения про всю дату релиза: в графике / под угрозой / просрочено / выпущено.
-
-## Сигналы
-2–5 буллетов по фактам (прогресс vs календарь, ёмкость, цель, перегруз людей).
-Если рисков почти нет — 1–2 буллета.
-
-## Риски
-Только подтверждённые данными. Если явных рисков нет — одна строка
-«Явных критичных рисков в снимке нет».
-
-## Рекомендации
-1–4 действия на 1–2 дня (или «Достаточно держать текущий темп»).
-При необходимости — сотрудники и ключи задач/эпиков в бэктиках.
+12. Пиши по-русски, спокойным деловым тоном, без эмодзи и вводной воды.
+13. Не повторяй одинаковыми словами прогресс, риск и рекомендацию. Каждый абзац
+    должен добавлять новый факт или действие.
+14. Жёсткой структуры нет: используй 1–3 коротких абзаца и, только если полезно,
+    небольшой список. Первое предложение — ясный вердикт по сроку.
 """
 
-USER_PROMPT_PREFIX = """Оцени группу релизов на одну дату по JSON ниже.
-Один общий вердикт на дату. Если спокойно — будь краток.
-Если угроза сроку — практичные рекомендации и 2–5 ключей в бэктиках без названий рядом.
+USER_PROMPT_PREFIX = """Оцени группу невыпущенных релизов на одну дату по JSON ниже.
+Один общий вердикт на дату. Убери шаблонные вступления и пересказ очевидного.
+Если угроза сроку — дай практичные рекомендации и 2–5 ключей в бэктиках без названий рядом.
 Имена людей — «Имя Ф.» («Роман Щ.»).
 
 JSON:
@@ -586,6 +574,8 @@ def _generate_group(
             model=model,
             temperature=settings["temperature"],
             timeout=settings["timeout"],
+            max_tokens=min(settings["max_tokens"], 800),
+            reasoning=settings.get("reasoning", False),
             system=SYSTEM_PROMPT,
             user=user_extra
             + USER_PROMPT_PREFIX
@@ -643,7 +633,9 @@ def generate_ai_release_briefs(
         return _empty_bundle(model, reason="no_api_key")
 
     releases = [
-        r for r in (sprint_report.get("releases") or []) if isinstance(r, dict) and r.get("name")
+        r
+        for r in (sprint_report.get("releases") or [])
+        if isinstance(r, dict) and r.get("name") and not r.get("released")
     ]
     if not releases:
         return _empty_bundle(model, reason="no_releases")
@@ -698,7 +690,7 @@ def generate_ai_release_briefs(
         return _empty_bundle(model, reason="all_skipped")
 
     return {
-        "status": "ok",
+        "status": "partial" if errors else "ok",
         "generated_at": _iso_now(),
         "model": model,
         "model_label": short_model_name(model),
@@ -718,6 +710,9 @@ def _apply_briefs_to_releases(sprint_report: dict, briefs: dict[str, dict]) -> N
     """Attach the same date-group brief to every release in that group."""
     for release in sprint_report.get("releases") or []:
         if not isinstance(release, dict):
+            continue
+        if release.get("released"):
+            release.pop("ai_brief", None)
             continue
         gkey = release_group_key(release)
         brief = briefs.get(gkey)
@@ -765,7 +760,7 @@ def attach_ai_release_briefs(
         on_progress=on_progress,
     )
     sr["ai_release_briefs"] = bundle
-    if bundle.get("status") == "ok" and isinstance(bundle.get("briefs"), dict):
+    if bundle.get("status") in {"ok", "partial"} and isinstance(bundle.get("briefs"), dict):
         _apply_briefs_to_releases(sr, bundle["briefs"])
     else:
         for release in sr.get("releases") or []:

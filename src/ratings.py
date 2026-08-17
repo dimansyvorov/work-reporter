@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from statistics import pstdev
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -244,7 +244,150 @@ def _rank_all(rows: list[dict], *, reverse: bool = True) -> list[dict]:
     return _with_places(rows, reverse=reverse, limit=len(rows))
 
 
-def _count_commits_from_gitlab(gitlab_raw: dict | None) -> tuple[dict[str, int], dict[str, int]]:
+def _rating_window(
+    sprint: dict,
+    *,
+    now: datetime,
+    tz: ZoneInfo,
+) -> tuple[datetime, datetime] | None:
+    """Exact rating interval: sprint start -> now, capped by sprint end."""
+    start = date.fromisoformat(sprint["start_date"]) if sprint.get("start_date") else None
+    end = date.fromisoformat(sprint["end_date"]) if sprint.get("end_date") else None
+    if not start or not end:
+        return None
+
+    start_at = datetime.combine(start, time.min, tzinfo=tz)
+    raw_start = _parse_dt(sprint.get("start_at"))
+    if raw_start:
+        local_start = raw_start.astimezone(tz)
+        if local_start.date() == start:
+            start_at = local_start
+
+    end_at = datetime.combine(end, time.max, tzinfo=tz)
+    raw_end = _parse_dt(sprint.get("end_at"))
+    if raw_end:
+        local_end = raw_end.astimezone(tz)
+        if local_end.date() == end:
+            end_at = local_end
+
+    return start_at, min(now, end_at)
+
+
+def _canonical_assignee(issue: dict) -> str | None:
+    current = issue.get("_canonical_assignee")
+    if current:
+        return current
+    assignee = (issue.get("fields") or {}).get("assignee") or {}
+    if not isinstance(assignee, dict):
+        return canonical_team_name(str(assignee))
+    raw = (
+        assignee.get("displayName")
+        or assignee.get("name")
+        or assignee.get("emailAddress")
+    )
+    return canonical_team_name(raw)
+
+
+def completed_tasks_in_window(
+    *,
+    sprint: dict,
+    issues: list[dict],
+    changelogs: list[dict] | None,
+    now: datetime | None = None,
+) -> dict[str, list[dict]]:
+    """
+    Find tasks that entered a direction's done state inside the rating window.
+
+    The owner is reconstructed from assignee history and taken at the moment of
+    the transition. A task already done when the sprint starts is not counted.
+    """
+    tz = _rating_timezone()
+    local_now = now.astimezone(tz) if now else datetime.now(tz)
+    window = _rating_window(sprint, now=local_now, tz=tz)
+    if not window:
+        return {}
+    window_start, window_end = window
+    if window_end < window_start:
+        return {}
+
+    histories_by_key: dict[str, list[dict]] = defaultdict(list)
+    for row in changelogs or []:
+        key = (row.get("issue_key") or "").upper()
+        if key:
+            histories_by_key[key].append(row)
+
+    team_cfg = get_team_config()
+    result: dict[str, list[dict]] = defaultdict(list)
+    for issue in issues:
+        key = (issue.get("key") or "").upper()
+        if not key:
+            continue
+        fields = issue.get("fields") or {}
+        owner_after = _canonical_assignee(issue)
+        rows = sorted(
+            histories_by_key.get(key) or [],
+            key=lambda row: _parse_dt(row.get("at")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        for row in rows:
+            at = _parse_dt(row.get("at"))
+            assignee_changed = (
+                row.get("assignee_from") is not None
+                or row.get("assignee_to") is not None
+            )
+            if assignee_changed:
+                explicit_after = canonical_team_name(row.get("assignee_to"))
+                if explicit_after:
+                    owner_after = explicit_after
+            owner_before = (
+                canonical_team_name(row.get("assignee_from"))
+                if assignee_changed
+                else owner_after
+            )
+            owner_at_transition = owner_before or owner_after
+
+            status_to = row.get("status_to")
+            status_from = row.get("status_from")
+            direction = TEAM_ROSTER.get(owner_at_transition or "")
+            to_done = bool(status_to and direction) and team_cfg.is_direction_done(
+                direction, status_to, jira_done=False
+            )
+            from_done = bool(status_from and direction) and team_cfg.is_direction_done(
+                direction, status_from, jira_done=False
+            )
+            if (
+                at
+                and window_start <= at.astimezone(tz) <= window_end
+                and owner_at_transition in TEAM_ROSTER
+                and to_done
+                and not from_done
+            ):
+                result[owner_at_transition].append(
+                    {
+                        "key": key,
+                        "summary": fields.get("summary") or row.get("issue_summary") or key,
+                        "status": status_to,
+                        "completed_at": at.astimezone(tz).isoformat(),
+                        "estimate_hours": _round(_estimate_hours(fields), 2),
+                    }
+                )
+                # One rating completion per task: keep its latest done transition.
+                break
+
+            if assignee_changed:
+                owner_after = owner_before
+
+    for rows in result.values():
+        rows.sort(key=lambda row: row.get("completed_at") or "", reverse=True)
+    return dict(result)
+
+
+def _count_commits_from_gitlab(
+    gitlab_raw: dict | None,
+    *,
+    window_start: datetime,
+    window_end: datetime,
+) -> tuple[dict[str, int], dict[str, int]]:
     """
     Count commits by commit author (not MR author).
     helper = commits in projects of another direction.
@@ -270,35 +413,25 @@ def _count_commits_from_gitlab(gitlab_raw: dict | None) -> tuple[dict[str, int],
             project.get("merge_requests_open") or [],
         ):
             for mr in bucket:
-                by_author = mr.get("commits_by_author") or {}
-                if by_author:
-                    author_counts = by_author.items()
-                else:
-                    # fallback: whole MR count to MR author
-                    author_raw = mr.get("author") or {}
-                    author_name = (
-                        author_raw.get("name")
-                        or author_raw.get("username")
-                        or (author_raw if isinstance(author_raw, str) else None)
-                    )
-                    count = int(mr.get("commit_count") or 0)
-                    author_counts = [(author_name, count)] if author_name and count else []
-
-                for author_name, count in author_counts:
-                    count = int(count or 0)
-                    if count <= 0:
+                for commit in mr.get("commit_events") or []:
+                    committed = _parse_dt(commit.get("committed_at"))
+                    if not committed:
                         continue
+                    committed = committed.astimezone(window_start.tzinfo)
+                    if committed < window_start or committed > window_end:
+                        continue
+                    author_name = commit.get("author")
                     author = canonical_team_name(author_name)
                     if not author:
                         continue
-                    commits_by_person[author] += count
+                    commits_by_person[author] += 1
                     person_key = team_cfg.direction_key_for_person(author)
                     if (
                         mr_direction_key
                         and person_key
                         and mr_direction_key != person_key
                     ):
-                        helper_commits[author] += count
+                        helper_commits[author] += 1
 
     return commits_by_person, helper_commits
 
@@ -312,13 +445,15 @@ def compute_ratings(
     hours_by_issue: dict[str, float],
     hours_by_person_issue: dict[str, dict[str, float]] | None = None,
     worklogs: list[dict] | None = None,
+    changelogs: list[dict] | None = None,
     links: dict,
     gitlab_raw: dict | None,
     expected_hours: float,
+    now: datetime | None = None,
 ) -> list[dict]:
     rating_cfg = get_team_config().ratings
     tz = _rating_timezone()
-    now = datetime.now(tz)
+    now = now.astimezone(tz) if now else datetime.now(tz)
     today = now.date()
     start = date.fromisoformat(sprint["start_date"]) if sprint.get("start_date") else None
     end = date.fromisoformat(sprint["end_date"]) if sprint.get("end_date") else None
@@ -326,44 +461,57 @@ def compute_ratings(
         return []
 
     team_cfg = get_team_config()
-    day_total = max((end - start).days + 1, 1)
-    day_index = 0 if today < start else day_total if today > end else (today - start).days + 1
-    half_passed = day_index / day_total >= 0.5
+    all_workdays = _working_days(start, end)
+    elapsed_workdays = 0.0
+    for workday in all_workdays:
+        if workday < today:
+            elapsed_workdays += 1.0
+        elif workday == today and expected_hours > 0:
+            elapsed_workdays += _expected_hours_for_day(
+                workday,
+                now=now,
+                expected_hours=expected_hours,
+                start_hour=rating_cfg.workday_start_hour,
+            ) / expected_hours
+    half_passed = bool(all_workdays) and elapsed_workdays / len(all_workdays) >= 0.5
     work_until = min(end, today)
     workdays = _working_days(start, work_until)
 
-    commits_by_person, helper_commits = _count_commits_from_gitlab(gitlab_raw)
+    window = _rating_window(sprint, now=now, tz=tz)
+    if not window:
+        return []
+    window_start, window_end = window
+    commits_by_person, helper_commits = _count_commits_from_gitlab(
+        gitlab_raw,
+        window_start=window_start,
+        window_end=window_end,
+    )
 
     person_issue_hours = hours_by_person_issue or {}
+    completed_by_person = completed_tasks_in_window(
+        sprint=sprint,
+        issues=issues,
+        changelogs=changelogs,
+        now=now,
+    )
     closed_by_person: dict[str, int] = defaultdict(int)
     closed_estimate_by_person: dict[str, float] = defaultdict(float)
     over_estimate: dict[str, float] = defaultdict(float)
     under_estimate_closed: dict[str, int] = defaultdict(int)
 
-    for issue in issues:
-        fields = issue.get("fields") or {}
-        person = issue.get("_canonical_assignee")
-        direction = issue.get("_direction")
-        if not person:
-            continue
-        key = (issue.get("key") or "").upper()
-        spent = float(person_issue_hours.get(person, {}).get(key, 0.0))
-        estimate = _estimate_hours(fields)
-        status_name = ((fields.get("status") or {}).get("name"))
-        jira_done = bool(fields.get("resolution")) or (
-            ((fields.get("status") or {}).get("statusCategory") or {}).get("key") == "done"
-        )
-        direction_done = team_cfg.is_direction_done(
-            direction, status_name, jira_done=jira_done
-        )
-        if direction_done:
-            closed_by_person[person] += 1
+    for person, completed in completed_by_person.items():
+        closed_by_person[person] = len(completed)
+        for task in completed:
+            key = task.get("key") or ""
+            spent = float(person_issue_hours.get(person, {}).get(key, 0.0))
+            estimate = task.get("estimate_hours")
+            task["hours"] = _round(spent, 2) or 0.0
             if estimate is not None and estimate > 0:
                 closed_estimate_by_person[person] += float(estimate)
             if estimate is not None and spent > 0 and spent < estimate:
                 under_estimate_closed[person] += 1
-        if estimate is not None and spent > estimate:
-            over_estimate[person] += spent - estimate
+            if estimate is not None and spent > estimate:
+                over_estimate[person] += spent - estimate
 
     categories: list[dict] = []
     prize_points: dict[str, int] = defaultdict(int)
@@ -458,7 +606,8 @@ def compute_ratings(
             "description": (
                 "Темп списаний относительно уже прошедшего рабочего времени; "
                 "учитываются задние и преждевременные worklog. "
-                "При равном балле выше тот, у кого больше закрытых задач"
+                "При равном балле выше тот, у кого больше задач завершено "
+                "после начала спринта"
             ),
             "enabled": True,
             "people": stability_top,
@@ -484,7 +633,10 @@ def compute_ratings(
         {
             "id": "committer",
             "title": "Коммитёр",
-            "description": "Больше всех коммитов за спринт (по автору коммита)",
+            "description": (
+                "Больше всех коммитов с committed date внутри текущего спринта "
+                "(по автору коммита)"
+            ),
             "enabled": len(committer_rows) >= 1,
             "people": committer_top,
             "all_people": _rank_all(committer_rows),
@@ -499,6 +651,7 @@ def compute_ratings(
             "score": closed_by_person.get(name, 0),
             "value": f"{closed_by_person.get(name, 0)} задач",
             "detail": TEAM_ROSTER[name],
+            "tasks": list(completed_by_person.get(name) or []),
         }
         for name in TEAM_ROSTER
         if closed_by_person.get(name, 0) > 0
@@ -509,7 +662,10 @@ def compute_ratings(
         {
             "id": "closer",
             "title": "Статист",
-            "description": "Больше всех закрывает задачи (по правилам статуса направления)",
+            "description": (
+                "Больше всех завершил задач после начала спринта "
+                "(по changelog и правилам статуса направления)"
+            ),
             "enabled": len(list(TEAM_ROSTER)) >= 3,
             "people": statist_top,
             "all_people": _rank_all(statist_rows),
@@ -538,6 +694,7 @@ def compute_ratings(
                     f"списано {_round(hours, 1)} ч · "
                     f"закрыто {closed_n}"
                 ),
+                "tasks": list(completed_by_person.get(name) or []),
             }
         )
     efficiency_top = _with_places(efficiency_rows)
@@ -547,9 +704,10 @@ def compute_ratings(
             "id": "efficiency",
             "title": "Эффективность",
             "description": (
-                "Сколько часов оценки закрытых задач приходится на 1 час списаний "
+                "Сколько часов оценки завершённых в этом спринте задач приходится "
+                "на 1 час списаний спринта "
                 f"(минимум {min_hours:.0f} ч списаний). "
-                "При равном score выше тот, у кого больше закрытых задач"
+                "При равном score выше тот, у кого больше задач завершено в спринте"
             ),
             "enabled": len(efficiency_rows) >= 1,
             "people": efficiency_top,
@@ -564,6 +722,12 @@ def compute_ratings(
             "score": over_estimate.get(name, 0.0),
             "value": f"+{_round(over_estimate.get(name, 0.0), 1)} ч",
             "detail": "списал больше оценки",
+            "tasks": [
+                task
+                for task in (completed_by_person.get(name) or [])
+                if task.get("estimate_hours") is not None
+                and float(task.get("hours") or 0.0) > float(task["estimate_hours"])
+            ],
         }
         for name in TEAM_ROSTER
         if over_estimate.get(name, 0.0) > 0
@@ -574,7 +738,10 @@ def compute_ratings(
         {
             "id": "underestimator",
             "title": "Недооценщик",
-            "description": "Больше всех списал выше оценки задач",
+            "description": (
+                "Больше всех списал в спринте сверх Original Estimate по задачам, "
+                "завершённым в этом спринте"
+            ),
             "enabled": half_passed,
             "people": under_top,
             "all_people": _rank_all(underestimator_rows),
@@ -588,6 +755,12 @@ def compute_ratings(
             "score": under_estimate_closed.get(name, 0),
             "value": f"{under_estimate_closed.get(name, 0)} задач",
             "detail": TEAM_ROSTER[name],
+            "tasks": [
+                task
+                for task in (completed_by_person.get(name) or [])
+                if task.get("estimate_hours") is not None
+                and 0 < float(task.get("hours") or 0.0) < float(task["estimate_hours"])
+            ],
         }
         for name in TEAM_ROSTER
         if under_estimate_closed.get(name, 0) > 0
@@ -598,7 +771,9 @@ def compute_ratings(
         {
             "id": "overestimator",
             "title": "Переоценщик",
-            "description": "Закрыл больше задач со списанием ниже оценки",
+            "description": (
+                "Завершил в этом спринте больше задач со списанием спринта ниже оценки"
+            ),
             "enabled": half_passed,
             "people": over_top,
             "all_people": _rank_all(overestimator_rows),
@@ -645,7 +820,10 @@ def compute_ratings(
         {
             "id": "helper",
             "title": "Помогальщик",
-            "description": "Больше всех коммитов не в своём направлении (по автору коммита)",
+            "description": (
+                "Больше всех коммитов с датой внутри спринта не в своём направлении "
+                "(по автору коммита)"
+            ),
             "enabled": len(helper_rows) >= 1,
             "people": helper_top,
             "all_people": _rank_all(helper_rows),

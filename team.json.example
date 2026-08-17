@@ -144,8 +144,7 @@
         "name": "Kanban Ops",
         "primary": false,
         "has_epics": true,
-        "has_sprints": false,
-        "jql": "resolution is EMPTY AND updated >= -21d"
+        "has_sprints": false
       }
     ]
   },

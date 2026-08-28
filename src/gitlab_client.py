@@ -108,6 +108,48 @@ class GitLabClient:
             f"/projects/{self.project_id(project)}/merge_requests/{iid}/commits"
         )
 
+    def fetch_repository_commits(
+        self,
+        project: str,
+        *,
+        since: datetime,
+    ) -> list[dict]:
+        """Commits from every branch since the sprint start."""
+        return self._paginate(
+            f"/projects/{self.project_id(project)}/repository/commits",
+            {
+                "since": since.isoformat(),
+                "all": "true",
+                "with_stats": "false",
+            },
+        )
+
+
+def _repository_commit_events(commits: list[dict]) -> list[dict]:
+    events: list[dict] = []
+    for commit in commits:
+        commit_id = commit.get("id") or commit.get("short_id")
+        author = (
+            (commit.get("author_name") or "").strip()
+            or (commit.get("committer_name") or "").strip()
+            or (commit.get("author_email") or "").strip()
+        )
+        committed_at = (
+            commit.get("committed_date")
+            or commit.get("authored_date")
+            or commit.get("created_at")
+        )
+        if not commit_id or not author or not committed_at:
+            continue
+        events.append(
+            {
+                "id": str(commit_id),
+                "author": author,
+                "committed_at": committed_at,
+            }
+        )
+    return events
+
 
 def _collect_one_project(
     client: GitLabClient, project_ref: str, since: datetime
@@ -118,6 +160,10 @@ def _collect_one_project(
     )
     # Open MRs: keep full list for linking, but commits are enriched selectively later.
     open_mrs = client.fetch_merge_requests(project_ref, state="opened")
+    repository_commits = client.fetch_repository_commits(
+        project_ref,
+        since=since,
+    )
     return {
         "ref": project_ref,
         "id": project["id"],
@@ -125,6 +171,7 @@ def _collect_one_project(
         "web_url": project.get("web_url"),
         "merge_requests_merged": merged,
         "merge_requests_open": open_mrs,
+        "repository_commit_events": _repository_commit_events(repository_commits),
     }
 
 

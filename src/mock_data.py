@@ -119,7 +119,7 @@ def build_mock_raw(days: int = 30) -> dict:
     # Latin-ish author labels derived from roster order (no hardcoded real names)
     gl_authors = {
         name: {
-            "name": f"demo.user{i}",
+            "name": team_cfg.gitlab_username_for(name) or name,
             "avatar_url": f"https://www.gravatar.com/avatar/{100 + i}?d=identicon",
         }
         for i, name in enumerate(roster, start=1)
@@ -307,6 +307,15 @@ def build_mock_raw(days: int = 30) -> dict:
     projects_out = []
     for idx, ref in enumerate(project_refs[:3]):
         chunk = merged[idx * 2 : (idx + 1) * 2] if idx < 2 else merged[4:]
+        repository_commit_events = [
+            {
+                "id": f"demo-{mr.get('iid')}-{commit_idx}",
+                "author": event.get("author"),
+                "committed_at": event.get("committed_at"),
+            }
+            for mr in chunk
+            for commit_idx, event in enumerate(mr.get("commit_events") or [], start=1)
+        ]
         projects_out.append(
             {
                 "ref": ref,
@@ -315,6 +324,7 @@ def build_mock_raw(days: int = 30) -> dict:
                 "web_url": f"https://gitlab.example.com/{ref}",
                 "merge_requests_merged": chunk,
                 "merge_requests_open": [],
+                "repository_commit_events": repository_commit_events,
             }
         )
 

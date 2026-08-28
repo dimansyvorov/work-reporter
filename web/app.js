@@ -244,19 +244,28 @@ function normalizeSprintForDisplay(source, settings = {}, expectedHoursRaw = 8) 
     const year = Number(value);
     return year < 100 ? 2000 + year : year;
   };
-  const start = new Date(fullYear(match[3]), Number(match[2]) - 1, Number(match[1]));
-  const end = new Date(fullYear(match[6]), Number(match[5]) - 1, Number(match[4]));
+  const serverOffset = Number(settings?.server_timezone);
+  const utcOffset = Number.isFinite(serverOffset) ? serverOffset : 3;
+  const offsetMs = utcOffset * 60 * 60 * 1000;
+  const wallDate = (year, month, day) => new Date(Date.UTC(year, month, day));
+  const start = wallDate(fullYear(match[3]), Number(match[2]) - 1, Number(match[1]));
+  const end = wallDate(fullYear(match[6]), Number(match[5]) - 1, Number(match[4]));
   if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) {
     return sprint;
   }
   const isoDay = (value) =>
-    `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
-  const todayRaw = new Date();
-  const today = new Date(todayRaw.getFullYear(), todayRaw.getMonth(), todayRaw.getDate());
+    `${value.getUTCFullYear()}-${String(value.getUTCMonth() + 1).padStart(2, "0")}-${String(value.getUTCDate()).padStart(2, "0")}`;
+  const nowMs = Date.now();
+  const serverWallNow = new Date(nowMs + offsetMs);
+  const today = wallDate(
+    serverWallNow.getUTCFullYear(),
+    serverWallNow.getUTCMonth(),
+    serverWallNow.getUTCDate()
+  );
   const dayMs = 24 * 60 * 60 * 1000;
   const workdays = [];
   for (let cursor = new Date(start); cursor <= end; cursor = new Date(cursor.getTime() + dayMs)) {
-    if (cursor.getDay() !== 0 && cursor.getDay() !== 6) workdays.push(new Date(cursor));
+    if (cursor.getUTCDay() !== 0 && cursor.getUTCDay() !== 6) workdays.push(new Date(cursor));
   }
   const total = workdays.length;
   const index =
@@ -274,14 +283,26 @@ function normalizeSprintForDisplay(source, settings = {}, expectedHoursRaw = 8) 
   for (const day of workdays) {
     const hour = Math.floor(startHour);
     const minute = Math.round((startHour - hour) * 60);
-    let workStart = new Date(day.getFullYear(), day.getMonth(), day.getDate(), hour, minute);
+    let workStart = new Date(
+      Date.UTC(
+        day.getUTCFullYear(),
+        day.getUTCMonth(),
+        day.getUTCDate(),
+        hour,
+        minute
+      ) - offsetMs
+    );
     let workEnd = new Date(workStart.getTime() + expectedHours * 60 * 60 * 1000);
+    const exactStartWall = exactStart
+      ? new Date(exactStart.getTime() + offsetMs)
+      : null;
+    const exactEndWall = exactEnd ? new Date(exactEnd.getTime() + offsetMs) : null;
     if (
       exactStart &&
       !Number.isNaN(exactStart.getTime()) &&
-      exactStart.getFullYear() === day.getFullYear() &&
-      exactStart.getMonth() === day.getMonth() &&
-      exactStart.getDate() === day.getDate() &&
+      exactStartWall.getUTCFullYear() === day.getUTCFullYear() &&
+      exactStartWall.getUTCMonth() === day.getUTCMonth() &&
+      exactStartWall.getUTCDate() === day.getUTCDate() &&
       exactStart > workStart
     ) {
       workStart = exactStart;
@@ -289,9 +310,9 @@ function normalizeSprintForDisplay(source, settings = {}, expectedHoursRaw = 8) 
     if (
       exactEnd &&
       !Number.isNaN(exactEnd.getTime()) &&
-      exactEnd.getFullYear() === day.getFullYear() &&
-      exactEnd.getMonth() === day.getMonth() &&
-      exactEnd.getDate() === day.getDate() &&
+      exactEndWall.getUTCFullYear() === day.getUTCFullYear() &&
+      exactEndWall.getUTCMonth() === day.getUTCMonth() &&
+      exactEndWall.getUTCDate() === day.getUTCDate() &&
       exactEnd < workEnd
     ) {
       workEnd = exactEnd;
@@ -299,7 +320,7 @@ function normalizeSprintForDisplay(source, settings = {}, expectedHoursRaw = 8) 
     const capacity = Math.max(0, (workEnd - workStart) / (60 * 60 * 1000));
     const elapsed = Math.max(
       0,
-      (Math.min(todayRaw.getTime(), workEnd.getTime()) - workStart.getTime()) /
+      (Math.min(nowMs, workEnd.getTime()) - workStart.getTime()) /
         (60 * 60 * 1000)
     );
     totalHours += capacity;
@@ -563,8 +584,10 @@ function timeCell(spent, estimate, { warnZero = false } = {}) {
 
 function taskTitle(issue, { showTags = true } = {}) {
   if (!issue?.key && !issue?.summary) return "—";
-  const summary = issue.summary
-    ? `<span class="task-summary">${escapeHtml(issue.summary)}</span>`
+  const summaryText =
+    meaningfulIssueSummary(issue.summary, issue.key) || lookupIssueSummary(issue.key);
+  const summary = summaryText
+    ? `<span class="task-summary">${escapeHtml(summaryText)}</span>`
     : "";
   const tags = showTags ? tagsHtml(issue.tags) : "";
   const tagsRow = tags ? `<div class="task-tags">${tags}</div>` : "";
@@ -1045,26 +1068,38 @@ function aiTaskTitle(summary, maxLen = 72) {
   return `${text.slice(0, maxLen - 1).trim()}…`;
 }
 
+function meaningfulIssueSummary(summary, key) {
+  const text = String(summary || "").trim();
+  const normalizedKey = String(key || "").trim().toUpperCase();
+  if (!text || (normalizedKey && text.toUpperCase() === normalizedKey)) return null;
+  return text;
+}
+
 function lookupIssueSummary(key) {
   const k = String(key || "").trim().toUpperCase();
   if (!k) return null;
   const issue = currentSprintReport?.issues?.[k];
-  if (issue?.summary) return issue.summary;
+  const issueSummary = meaningfulIssueSummary(issue?.summary, k);
+  if (issueSummary) return issueSummary;
   for (const rel of currentSprintReport?.releases || []) {
     for (const t of rel?.tasks || []) {
-      if (String(t?.key || "").toUpperCase() === k && t?.summary) return t.summary;
+      const summary = meaningfulIssueSummary(t?.summary, k);
+      if (String(t?.key || "").toUpperCase() === k && summary) return summary;
     }
     for (const s of rel?.sections || []) {
       for (const t of s?.tasks_detail || []) {
-        if (String(t?.key || "").toUpperCase() === k && t?.summary) return t.summary;
+        const summary = meaningfulIssueSummary(t?.summary, k);
+        if (String(t?.key || "").toUpperCase() === k && summary) return summary;
       }
     }
   }
   for (const epic of currentSprintReport?.epic_timeline?.epics || []) {
-    if (String(epic?.key || "").toUpperCase() === k && epic?.summary) return epic.summary;
+    const epicSummary = meaningfulIssueSummary(epic?.summary, k);
+    if (String(epic?.key || "").toUpperCase() === k && epicSummary) return epicSummary;
     for (const s of epic?.sections || []) {
       for (const t of s?.tasks_detail || []) {
-        if (String(t?.key || "").toUpperCase() === k && t?.summary) return t.summary;
+        const summary = meaningfulIssueSummary(t?.summary, k);
+        if (String(t?.key || "").toUpperCase() === k && summary) return summary;
       }
     }
   }
@@ -3490,7 +3525,9 @@ function openIssueModal(issueKey, { jiraUrl = null } = {}) {
 
   const allTags = issue.tags || [];
   const releaseTags = allTags.filter((t) => t.id === "release");
-  const riskTags = allTags.filter((t) => t.id !== "release");
+  const riskTags = isTaskDone(issue)
+    ? []
+    : allTags.filter((t) => t.id !== "release");
   const releasesById = Object.fromEntries(
     (currentSprintReport?.releases || []).map((r) => [String(r.id), r])
   );
@@ -3797,7 +3834,7 @@ function releaseTaskRowHtml(
   const rowCls = [
     "person-task-row",
     "release-task-row",
-    forceRisk || merged.risk ? "task-row-risk" : "",
+    !done && (forceRisk || merged.risk) ? "task-row-risk" : "",
     done ? "task-row-done" : "",
     outOfSprint || merged.in_sprint === false ? "task-row-out-of-sprint" : "",
   ]
@@ -3806,6 +3843,7 @@ function releaseTaskRowHtml(
   const tags = (merged.tags || []).filter((tag) => {
     if (!tag) return false;
     if (tag.id === "release") return !!showReleaseTags;
+    if (done) return false;
     return true;
   });
   const tagsInline = tags.length
@@ -3813,8 +3851,10 @@ function releaseTaskRowHtml(
         clickableReleases: !!showReleaseTags,
       })}</span>`
     : "";
-  const summary = merged.summary
-    ? `<span class="release-task-summary" title="${escapeHtml(merged.summary)}">${escapeHtml(merged.summary)}</span>`
+  const summaryText =
+    meaningfulIssueSummary(merged.summary, key) || lookupIssueSummary(key);
+  const summary = summaryText
+    ? `<span class="release-task-summary" title="${escapeHtml(summaryText)}">${escapeHtml(summaryText)}</span>`
     : "";
   const assigneeKey = merged.assignee_canonical || merged.assignee;
   const meta = assigneeStatusNodeHtml(assigneeKey || merged.assignee, merged.status, {
@@ -4583,7 +4623,8 @@ function renderTeam(report) {
   };
   const underlogged = teamRows.filter((person) => {
     const actual = Number(person.hours_sprint) || 0;
-    return expectedToDate > 0 && actual + 0.01 < expectedToDate;
+    const target = Number(person.expected_hours_to_date ?? expectedToDate) || 0;
+    return target > 0 && actual + 0.01 < target;
   }).length;
 
   if (mini) {
@@ -4611,14 +4652,14 @@ function renderTeam(report) {
     .map((person) => {
       const profile = people[person.name] || {};
       const actual = Number(person.hours_sprint) || 0;
-      const totalLevel = valueLevel(actual, expectedToDate);
+      const personExpectedToDate =
+        Number(person.expected_hours_to_date ?? expectedToDate) || 0;
+      const totalLevel = valueLevel(actual, personExpectedToDate);
       const missingDays = byDay
         .filter((day) => {
-          if (day.is_future) return false;
-          const target = Number(day.expected_hours) || 0;
-          const fullNorm = Number(worklogs.expected_hours_per_day) || 8;
-          // Do not remind for today until the configured workday is complete.
-          return !day.is_today || target + 0.01 >= fullNorm;
+          const row = (day.people || []).find((item) => item.name === person.name) || {};
+          if (row.is_future ?? day.is_future) return false;
+          return !(row.is_today ?? day.is_today) || Boolean(row.workday_complete);
         })
         .map((day) => {
           const row = (day.people || []).find((item) => item.name === person.name) || {};
@@ -4647,12 +4688,13 @@ function renderTeam(report) {
           const weekStart = prev && Number(prev.week_index) !== Number(day.week_index);
           const row = (day.people || []).find((item) => item.name === person.name) || {};
           const hours = Number(row.hours) || 0;
-          const level = row.level || (day.is_future ? "future" : valueLevel(hours, Number(day.expected_hours) || 0));
+          const rowFuture = row.is_future ?? day.is_future;
+          const level = row.level || (rowFuture ? "future" : valueLevel(hours, Number(row.expected_hours ?? day.expected_hours) || 0));
           const value = level === "future" ? "—" : fmtNumber(hours);
           const hint = level === "future"
             ? `${fmtDay(day.date)} · будущий рабочий день`
-            : `${fmtDay(day.date)} · списано ${fmtDuration(hours)} · план ${fmtDuration(day.expected_hours)}`;
-          return `<td class="worklog-day-cell tone-${escapeHtml(level)}${weekStart ? " week-start" : ""}${day.is_today ? " is-today" : ""}" title="${escapeHtml(hint)}"><span>${escapeHtml(value)}</span></td>`;
+            : `${fmtDay(day.date)} · списано ${fmtDuration(hours)} · план ${fmtDuration(row.expected_hours ?? day.expected_hours)}`;
+          return `<td class="worklog-day-cell tone-${escapeHtml(level)}${weekStart ? " week-start" : ""}${(row.is_today ?? day.is_today) ? " is-today" : ""}" title="${escapeHtml(hint)}"><span>${escapeHtml(value)}</span></td>`;
         })
         .join("");
       return `
@@ -4662,7 +4704,7 @@ function renderTeam(report) {
             <span class="worklog-direction" style="--direction-color:${escapeHtml(person.directionColor || "var(--muted)")}">${escapeHtml(person.directionName || "")}</span>
           </td>
           ${cells}
-          <td class="worklog-total-cell tone-${totalLevel}" title="Ожидается к текущему времени: ${escapeHtml(fmtDuration(expectedToDate))}"><span>${fmtNumber(actual)}</span></td>
+          <td class="worklog-total-cell tone-${totalLevel}" title="Ожидается к текущему времени: ${escapeHtml(fmtDuration(personExpectedToDate))}"><span>${fmtNumber(actual)}</span></td>
           <td class="worklog-plan-cell"><span>${fmtNumber(planHours)}</span></td>
           <td class="worklog-reminder-cell">
             ${reminderText ? `<button type="button" class="worklog-reminder-btn" data-worklog-reminder="${escapeHtml(person.name)}" title="Будет скопировано сообщение и выполнен переход в профиль сотрудника в мессенджере">Напомнить</button>` : "—"}
@@ -4675,10 +4717,9 @@ function renderTeam(report) {
   for (const person of teamRows) {
     const completedMissing = byDay
       .filter((day) => {
-        if (day.is_future) return false;
-        const target = Number(day.expected_hours) || 0;
-        const norm = Number(worklogs.expected_hours_per_day) || 8;
-        return !day.is_today || target + 0.01 >= norm;
+        const row = (day.people || []).find((item) => item.name === person.name) || {};
+        if (row.is_future ?? day.is_future) return false;
+        return !(row.is_today ?? day.is_today) || Boolean(row.workday_complete);
       })
       .map((day) => {
         const row = (day.people || []).find((item) => item.name === person.name) || {};

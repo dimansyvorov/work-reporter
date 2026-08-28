@@ -6,7 +6,6 @@ import urllib.error
 from datetime import date, datetime, timezone
 from typing import Any
 
-from .activity import REPORT_TZ, report_today
 from .ai_brief import (
     _call_litellm_chat,
     _goal_token,
@@ -23,9 +22,10 @@ from .ai_brief import (
     short_model_name,
 )
 from .team_config import get_team_config
+from .timezone_utils import person_now
 
 NOTES_PROMPT_VERSION = "person-notes-v11"
-# Workday ends 18:00 MSK; mute "no hours today" while >2h remain → before 16:00.
+# Workday ends at 18:00 in the employee's local time; mute the signal before 16:00.
 TODAY_WORKLOG_JUDGE_AFTER_HOUR = 16
 
 SYSTEM_PROMPT = """Ты пишешь короткие живые заметки по сотрудникам спринта — как коллега-аналитик, а не как HR-отчёт.
@@ -339,12 +339,10 @@ def _person_risk_tasks(
     return result
 
 
-def _is_early_for_today_worklog(now: datetime | None = None) -> bool:
-    current = now or datetime.now(REPORT_TZ)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=REPORT_TZ)
-    else:
-        current = current.astimezone(REPORT_TZ)
+def _is_early_for_today_worklog(
+    name: str | None, now: datetime | None = None
+) -> bool:
+    current = person_now(name, now)
     return current.hour < TODAY_WORKLOG_JUDGE_AFTER_HOUR
 
 
@@ -364,11 +362,13 @@ def _build_worklog_block(
     *,
     expected: float,
 ) -> dict[str, Any]:
-    """Sprint-first worklog signals; today muted until <2h left before 18:00 MSK."""
+    """Sprint-first worklog signals in the employee's local business time."""
     expected_f = float(expected or 8.0) or 8.0
     warn_ratio = float(get_team_config().metrics.hours_warn_ratio or 0.6)
-    today = report_today()
-    early = _is_early_for_today_worklog()
+    name = person.get("name")
+    local_now = person_now(name)
+    today = local_now.date()
+    early = _is_early_for_today_worklog(name, local_now)
     weekend_today = today.weekday() >= 5
 
     try:
@@ -436,7 +436,8 @@ def _build_worklog_block(
         today_judge = False
         today_too_early = True
         today_hint = (
-            f"до {TODAY_WORKLOG_JUDGE_AFTER_HOUR}:00 МСК (>2 ч до конца дня 18:00) "
+            f"до {TODAY_WORKLOG_JUDGE_AFTER_HOUR}:00 по локальному времени "
+            "сотрудника (>2 ч до конца дня 18:00) "
             "— рано судить о списаниях за сегодня"
         )
         # Don't leak a scary today_level to the model while it's early

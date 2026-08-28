@@ -11,6 +11,8 @@ from .config import DATA_DIR, Config
 from .errors import CollectError
 from .fetch_cache import JsonFileCache
 from .parallel import map_parallel_with_client
+from .team_config import get_team_config
+from .timezone_utils import person_now, person_timezone, server_timezone, server_today
 
 ProgressCb = Callable[..., None]
 
@@ -660,7 +662,7 @@ def _sprint_from_open_sprints_jql(
             "Укажите team.json → jira.boards[].id или jira.projects / openSprints()."
         )
 
-    today = datetime.now(timezone.utc).date()
+    today = server_today()
     start = today - timedelta(days=7)
     end = today + timedelta(days=7)
     sprint = {
@@ -705,7 +707,7 @@ def _normalize_sprint(sprint: dict) -> dict:
         name=sprint.get("name"),
         start=start,
         end=end,
-        timezone_name=get_team_config().ratings.timezone,
+        utc_offset=get_team_config().server_timezone,
     )
     return {
         "id": sprint.get("id"),
@@ -989,8 +991,21 @@ def _filter_worklogs_for_window(
         started = _parse_jira_dt(log.get("started"))
         if not started:
             continue
-        day = started.date()
-        if day < since_date or day > until_date:
+        author = log.get("author") or {}
+        raw_author = (
+            author.get("displayName")
+            or author.get("name")
+            or author.get("emailAddress")
+            if isinstance(author, dict)
+            else str(author)
+        )
+        from .team import canonical_team_name
+
+        canonical = canonical_team_name(raw_author)
+        tz = person_timezone(canonical) if canonical else server_timezone()
+        day = started.astimezone(tz).date()
+        local_today = person_now(canonical).date() if canonical else server_today()
+        if day < since_date or day > min(until_date, local_today):
             continue
         out.append(
             {
@@ -1390,7 +1405,7 @@ def _collect_releases(
     start = (
         date.fromisoformat(sprint["start_date"])
         if sprint.get("start_date")
-        else datetime.now(timezone.utc).date()
+        else server_today()
     )
     end = (
         date.fromisoformat(sprint["end_date"])
@@ -1584,38 +1599,50 @@ def _collect_epics(client: JiraClient, issues: list[dict], epic_field_id: str | 
             },
         )
 
-    # Fill summaries for keys that are only links (parallel)
-    need_meta = [
+    return epics
+
+
+def _fill_missing_epic_metadata(client: JiraClient, epics: dict[str, dict]) -> int:
+    """Resolve placeholder epic titles in batched Jira search requests."""
+    missing = sorted(
         key
         for key, meta in epics.items()
-        if not meta.get("summary") or meta["summary"] == key
-    ]
-    if need_meta:
-        cfg = client.cfg
+        if not str((meta or {}).get("summary") or "").strip()
+        or str((meta or {}).get("summary") or "").strip().upper() == key.upper()
+    )
+    if not missing:
+        return 0
 
-        def worker(c: JiraClient, key: str) -> tuple[str, dict | None]:
-            try:
-                issue = c.fetch_issue(key, ["summary", "status", "issuetype"])
-            except CollectError:
-                return key, None
-            fields = issue.get("fields") or {}
-            return key, {
-                "summary": fields.get("summary") or key,
-                "status": ((fields.get("status") or {}).get("name")),
-            }
-
-        for key, meta_update in map_parallel_with_client(
-            need_meta,
-            lambda: JiraClient(cfg),
-            worker,
-            max_workers=JIRA_WORKERS,
-            progress_every=10,
-        ):
-            if not meta_update:
+    updated = 0
+    batch_count = 0
+    for offset in range(0, len(missing), 80):
+        chunk = missing[offset : offset + 80]
+        joined = ", ".join(f'"{key}"' for key in chunk)
+        batch_count += 1
+        try:
+            issues = client.search(
+                f"key in ({joined}) ORDER BY key",
+                fields=["summary", "status", "issuetype"],
+            )
+        except CollectError as exc:
+            print(f"  ! epic metadata batch: {exc}")
+            continue
+        for issue in issues:
+            key = str(issue.get("key") or "").strip().upper()
+            if key not in epics:
                 continue
-            epics[key]["summary"] = meta_update["summary"]
-            epics[key]["status"] = meta_update.get("status")
-    return epics
+            fields = issue.get("fields") or {}
+            summary = str(fields.get("summary") or "").strip()
+            if not summary or summary.upper() == key:
+                continue
+            epics[key]["summary"] = summary
+            epics[key]["status"] = ((fields.get("status") or {}).get("name"))
+            updated += 1
+    print(
+        f"  · epic metadata: {updated}/{len(missing)} titles "
+        f"in {batch_count} batch request(s)"
+    )
+    return updated
 
 
 def _jira_avatar_urls(person: dict | None) -> str | None:
@@ -1840,7 +1867,7 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
                         client, cfg, fields=["summary"]
                     )
                 except CollectError:
-                    today = datetime.now(timezone.utc).date()
+                    today = server_today()
                     primary_sprint_raw = {
                         "id": None,
                         "name": "Board issues",
@@ -1970,12 +1997,12 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
     start_date = (
         date.fromisoformat(sprint["start_date"])
         if sprint["start_date"]
-        else datetime.now(timezone.utc).date()
+        else server_today()
     )
     end_date = (
         date.fromisoformat(sprint["end_date"])
         if sprint["end_date"]
-        else datetime.now(timezone.utc).date()
+        else server_today()
     )
     # Expand worklog window across all boards' sprints
     for s, e in sprint_date_candidates:
@@ -1983,8 +2010,12 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
             start_date = s
         if e and e > end_date:
             end_date = e
-    today = datetime.now(timezone.utc).date()
-    worklog_until = min(end_date, today)
+    today = server_today()
+    # The most advanced employee timezone can already be on the next calendar
+    # day. This only shifts the common cache/window boundary; every worklog is
+    # still capped by its author's own local date in _filter_worklogs_for_window.
+    team_dates = [person_now(name).date() for name in get_team_config().roster]
+    worklog_until = min(end_date, max([today, *team_dates]))
 
     progress("jira_issues", f"Jira: ищу ссылки на GitLab MR ({len(issues)} задач)…")
     linked_mrs = _enrich_gitlab_links_from_jira(
@@ -2058,9 +2089,30 @@ def collect_jira_raw(cfg: Config, on_progress: ProgressCb | None = None) -> dict
             continue
         _apply_epic(issue, info)
         ek = info["key"]
+        summary = info.get("summary")
+        meta = epics.setdefault(
+            ek,
+            {
+                "key": ek,
+                "summary": summary or ek,
+                "status": info.get("status"),
+            },
+        )
+        if (
+            summary
+            and str(summary).strip().upper() != ek
+            and (
+                not meta.get("summary")
+                or str(meta.get("summary") or "").strip().upper() == ek
+            )
+        ):
+            meta["summary"] = summary
         if ek not in seen_epic:
             seen_epic.add(ek)
             release_epic_keys.append(ek)
+
+    # Sprint and release-only epics share one batched metadata resolution pass.
+    _fill_missing_epic_metadata(client, epics)
 
     epic_scope_issues: list[dict] = []
     if release_epic_keys:

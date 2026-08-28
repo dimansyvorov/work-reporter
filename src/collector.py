@@ -225,8 +225,11 @@ def collect_and_build(
                 )
 
             if cfg.gitlab_enabled:
-                state.run_step("gitlab", "GitLab: загружаю MR…")
-                state.set_status("collecting", "Загружаю merge requests из GitLab…")
+                state.run_step("gitlab", "GitLab: загружаю MR и коммиты…")
+                state.set_status(
+                    "collecting",
+                    "Загружаю merge requests и коммиты из GitLab…",
+                )
                 raw["gitlab"] = collect_gitlab_raw(
                     cfg, since=since, on_progress=on_progress
                 )

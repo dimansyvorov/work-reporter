@@ -3,10 +3,9 @@ from __future__ import annotations
 import json
 import re
 import urllib.error
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta
 from difflib import SequenceMatcher
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .ai_brief import (
     _call_litellm_chat,
@@ -20,6 +19,7 @@ from .ai_brief import (
 )
 from .sprint_window import sprint_name_window
 from .team_config import get_team_config
+from .timezone_utils import server_now, server_timezone
 
 
 PROMPT_VERSION = "sprint-review-v2"
@@ -54,18 +54,12 @@ JSON:
 """
 
 
-def _tz() -> ZoneInfo:
-    try:
-        return ZoneInfo(get_team_config().ratings.timezone)
-    except ZoneInfoNotFoundError:
-        return ZoneInfo("Europe/Moscow")
+def _tz():
+    return server_timezone()
 
 
 def _local_now(now: datetime | None = None) -> datetime:
-    value = now or datetime.now(timezone.utc)
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=_tz())
-    return value.astimezone(_tz())
+    return server_now(now)
 
 
 def _as_day(value: object) -> date | None:

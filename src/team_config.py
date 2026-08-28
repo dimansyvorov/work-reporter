@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
@@ -112,7 +113,6 @@ class MetricsSettings:
 class RatingsSettings:
     top_n: int = 3
     place_points: dict[int, int] = field(default_factory=lambda: {1: 3, 2: 2, 3: 1})
-    timezone: str = "Europe/Moscow"
     workday_start_hour: float = 9.0
     worklog_grace_workdays: int = 1
     advance_tolerance_hours: float = 0.5
@@ -139,6 +139,8 @@ class JiraBoardConfig:
 
 @dataclass
 class TeamConfig:
+    # Fixed UTC offset used for sprint-wide/server business time.
+    server_timezone: float = 3.0
     # key -> info
     directions: dict[str, DirectionInfo] = field(default_factory=dict)
     # display name -> key
@@ -162,6 +164,8 @@ class TeamConfig:
     gitlab_profile_urls: dict[str, str] = field(default_factory=dict)
     # person display name -> external messenger profile URL or app deep link
     messenger_urls: dict[str, str] = field(default_factory=dict)
+    # person display name -> fixed UTC offset; absent means server_timezone.
+    person_timezones: dict[str, float] = field(default_factory=dict)
     direction_order: list[str] = field(default_factory=list)  # display names
     direction_keys_order: list[str] = field(default_factory=list)
     dev_directions: set[str] = field(default_factory=set)  # display names
@@ -232,6 +236,8 @@ class TeamConfig:
     def settings_public(self) -> dict:
         """Subset of config exposed to the UI via sprint report."""
         return {
+            "server_timezone": self.server_timezone,
+            "person_timezones": dict(self.person_timezones),
             "direction_shorts": {
                 info.name: info.short or info.name for info in self.directions.values()
             },
@@ -252,7 +258,6 @@ class TeamConfig:
                 "place_points": {
                     str(k): v for k, v in sorted(self.ratings.place_points.items())
                 },
-                "timezone": self.ratings.timezone,
                 "workday_start_hour": self.ratings.workday_start_hour,
                 "worklog_grace_workdays": self.ratings.worklog_grace_workdays,
                 "advance_tolerance_hours": self.ratings.advance_tolerance_hours,
@@ -331,6 +336,12 @@ class TeamConfig:
         if not canonical:
             return None
         return self.messenger_urls.get(canonical) or None
+
+    def timezone_offset_for(self, name: str | None) -> float:
+        canonical = self.canonical_name(name) or (name or "").strip()
+        if canonical and canonical in self.person_timezones:
+            return self.person_timezones[canonical]
+        return self.server_timezone
 
     def canonical_name(self, name: str | None) -> str | None:
         if not name:
@@ -537,6 +548,18 @@ def _as_float(value, default: float) -> float:
         return default
 
 
+def _parse_timezone_offset(value: object, *, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise CollectError(f"{field_name}: ожидается число от -12 до 14.")
+    try:
+        offset = float(value)
+    except (TypeError, ValueError) as exc:
+        raise CollectError(f"{field_name}: ожидается число от -12 до 14.") from exc
+    if not math.isfinite(offset) or offset < -12 or offset > 14:
+        raise CollectError(f"{field_name}: ожидается число от -12 до 14.")
+    return int(offset) if offset.is_integer() else offset
+
+
 def _parse_metrics(raw: dict | None, *, inactive_days: int) -> MetricsSettings:
     raw = raw if isinstance(raw, dict) else {}
     stale_default = _as_int(raw.get("stale_days"), inactive_days)
@@ -574,13 +597,9 @@ def _parse_ratings(raw: dict | None) -> RatingsSettings:
                 continue
     if not place_points:
         place_points = {1: 3, 2: 2, 3: 1}
-    timezone_name = str(raw.get("timezone") or "Europe/Moscow").strip()
-    if not timezone_name:
-        timezone_name = "Europe/Moscow"
     return RatingsSettings(
         top_n=top_n,
         place_points=place_points,
-        timezone=timezone_name,
         workday_start_hour=min(
             23.99, max(0.0, _as_float(raw.get("workday_start_hour"), 9.0))
         ),
@@ -618,6 +637,15 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
     except json.JSONDecodeError as exc:
         raise CollectError(f"Некорректный JSON в {cfg_path}: {exc}") from exc
 
+    if "server_timezone" not in data:
+        raise CollectError(
+            f"В {cfg_path} не задан обязательный параметр server_timezone "
+            "(числовое смещение от UTC, например 3)."
+        )
+    server_timezone = _parse_timezone_offset(
+        data.get("server_timezone"), field_name="server_timezone"
+    )
+
     directions, keys_order = _parse_directions(data.get("directions"))
     if not directions:
         raise CollectError(f"В {cfg_path} нет справочника directions.")
@@ -636,6 +664,7 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
     gitlab_usernames: dict[str, str] = {}
     gitlab_profile_urls: dict[str, str] = {}
     messenger_urls: dict[str, str] = {}
+    person_timezones: dict[str, float] = {}
     for person in data.get("people") or []:
         name = (person.get("name") or "").strip()
         direction_raw = (person.get("direction") or "").strip()
@@ -689,6 +718,10 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
         messenger_url = str(person.get("messenger_url") or "").strip()
         if messenger_url:
             messenger_urls[name] = messenger_url
+        if "timezone" in person:
+            person_timezones[name] = _parse_timezone_offset(
+                person.get("timezone"), field_name=f"people[{name}].timezone"
+            )
         for alias in person.get("aliases") or []:
             alias_s = str(alias).strip()
             if alias_s:
@@ -803,6 +836,7 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
     ui = _parse_ui(data.get("ui"))
 
     cfg = TeamConfig(
+        server_timezone=server_timezone,
         directions=directions,
         name_to_key=name_to_key,
         roster_keys=roster_keys,
@@ -816,6 +850,7 @@ def load_team_config(path: Path | None = None, *, reload: bool = False) -> TeamC
         gitlab_usernames=gitlab_usernames,
         gitlab_profile_urls=gitlab_profile_urls,
         messenger_urls=messenger_urls,
+        person_timezones=person_timezones,
         aliases=aliases,
         direction_order=direction_order,
         direction_keys_order=keys_order,

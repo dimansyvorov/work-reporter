@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .activity import build_people_activity, report_today
 from .linking import link_sprint_issues
@@ -17,6 +16,7 @@ from .team import (
     canonical_team_name,
 )
 from .team_config import get_team_config
+from .timezone_utils import person_now, person_timezone, server_now
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -177,12 +177,7 @@ def _hours_level(hours: float, expected: float, warn_ratio: float | None = None)
 
 
 def _report_local_now() -> datetime:
-    timezone_name = get_team_config().ratings.timezone
-    try:
-        tz = ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError:
-        tz = ZoneInfo("Europe/Moscow")
-    return datetime.now(tz)
+    return server_now()
 
 
 def _expected_hours_at(
@@ -613,6 +608,9 @@ def _build_task_tags(
 ) -> list[dict]:
     tags: list[dict] = []
     tags.extend(_release_version_tags(fields))
+    # Closed tasks keep release context, but cannot carry operational risk tags.
+    if direction_state == "done":
+        return tags
     # Auxiliary tasks (display_task_filters) stay out of «Без релиза» risk.
     if (
         direction_state == "active"
@@ -876,7 +874,7 @@ def _build_epic_timeline(
             "web_url": f"{browse_base}/browse/{key}" if browse_base and key else None,
             "epic_key": epic_key,
             "tags": tags,
-            "risk": _has_risk_tags(tags),
+            "risk": kind != "done" and _has_risk_tags(tags),
             "hidden_from_display": team_cfg.is_hidden_from_display(summary),
             "in_sprint": in_sprint,
             "version_ids": version_ids,
@@ -1541,7 +1539,7 @@ def _build_releases(
                 "web_url": f"{browse_base}/browse/{key}" if browse_base and key else None,
                 "epic_key": row["issue"].get("_epic_key"),
                 "tags": tags,
-                "risk": _has_risk_tags(tags),
+                "risk": kind != "done" and _has_risk_tags(tags),
                 "hidden_from_display": team_cfg.is_hidden_from_display(summary),
                 "in_current_sprint": _issue_in_sprint(fields, sprint_id),
                 "sprints": _compact_issue_sprints(fields),
@@ -1906,7 +1904,7 @@ def _build_people_profiles(
                 "web_url": f"{browse_base}/browse/{key}" if browse_base and key else None,
                 "epic_key": issue.get("_epic_key"),
                 "tags": tags,
-                "risk": _has_risk_tags(tags),
+                "risk": kind != "done" and _has_risk_tags(tags),
                 "hidden_from_display": team_cfg.is_hidden_from_display(summary),
             }
         )
@@ -1918,6 +1916,7 @@ def _build_people_profiles(
         issue_summary_by_key=issue_summary_by_key,
         browse_base=browse_base,
         current_assignee_by_key=current_assignee_by_key,
+        now=_report_local_now(),
     )
 
     rating_hits: dict[str, list[dict]] = defaultdict(list)
@@ -1975,7 +1974,7 @@ def _build_people_profiles(
             ]
         else:
             chart_days = list(sprint_days)
-        today_s = report_today().isoformat()
+        today_s = person_now(name).date().isoformat()
         day_hours = []
         for day in chart_days:
             day_total = _round(hours_by_person_day.get(name, {}).get(day, 0.0), 2) or 0.0
@@ -2170,7 +2169,7 @@ def _build_issues_index(
             "epic_summary": issue.get("_epic_summary")
             or ((epics_meta.get((issue.get("_epic_key") or "").upper()) or {}).get("summary")),
             "tags": tags,
-            "risk": _has_risk_tags(tags),
+            "risk": kind != "done" and _has_risk_tags(tags),
             "hidden_from_display": team_cfg.is_hidden_from_display(
                 fields.get("summary")
             ),
@@ -2429,7 +2428,7 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
         started = _parse_dt(log.get("started"))
         if not started:
             continue
-        day = started.date().isoformat()
+        day = started.astimezone(person_timezone(canonical)).date().isoformat()
         hours = float(log.get("time_spent_seconds") or 0) / 3600.0
         hours_by_person_day[canonical][day] += hours
         if log.get("issue_key"):
@@ -2512,9 +2511,49 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
     for name in sorted(people, key=lambda x: x.lower()):
         direction = TEAM_ROSTER[name]
         tasks = tasks_by_person.get(name) or {"done": 0, "open": 0, "mr_count": 0}
-        hours_today = _round(hours_by_person_day.get(name, {}).get(selected_day, 0.0), 2) or 0.0
+        local_person_now = person_now(name, local_now)
+        person_today = local_person_now.date()
+        person_sprint_dates = [
+            day for day in sprint_calendar_dates if day <= person_today
+        ]
+        person_selected_day_date = (
+            person_today
+            if person_today in sprint_calendar_dates
+            else (person_sprint_dates[-1] if person_sprint_dates else person_today)
+        )
+        person_selected_day = person_selected_day_date.isoformat()
+        person_selected_is_weekend = _is_weekend(person_selected_day_date)
+        expected_today = (
+            0.0
+            if person_selected_is_weekend
+            else _expected_hours_at(
+                person_selected_day_date,
+                now=local_person_now,
+                expected_hours=expected,
+                start_hour=team_cfg.ratings.workday_start_hour,
+            )
+        )
+        expected_for_person = sum(
+            _expected_hours_at(
+                day,
+                now=local_person_now,
+                expected_hours=expected,
+                start_hour=team_cfg.ratings.workday_start_hour,
+            )
+            for day in sprint_work_dates
+        )
+        hours_today = (
+            _round(
+                hours_by_person_day.get(name, {}).get(person_selected_day, 0.0), 2
+            )
+            or 0.0
+        )
         hours_sprint = _round(sum(hours_by_person_day.get(name, {}).values()), 2) or 0.0
-        level = "skip" if selected_is_weekend else _hours_level(hours_today, expected)
+        level = (
+            "skip"
+            if person_selected_is_weekend
+            else _hours_level(hours_today, expected_today)
+        )
         gender = team_cfg.gender_for(name)
         links_for = _profile_links_for(
             name,
@@ -2536,7 +2575,11 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
             "tasks_total": tasks["done"] + tasks["open"],
             "hours_today": hours_today,
             "hours_sprint": hours_sprint,
-            "expected_hours_today": expected,
+            "expected_hours_today": _round(expected_today, 2) or 0.0,
+            "expected_hours_to_date": _round(expected_for_person, 2) or 0.0,
+            "selected_date": person_selected_day,
+            "selected_is_weekend": person_selected_is_weekend,
+            "timezone": team_cfg.timezone_offset_for(name),
             "hours_level": level,
             "worklog_ok": level in {"ok", "skip"},
             "tracked": True,
@@ -2738,12 +2781,20 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
             week_starts[monday] = len(week_starts) + 1
         rows = []
         for name in sorted(people, key=lambda x: x.lower()):
+            local_person_now = person_now(name, local_now)
+            person_target_hours = _expected_hours_at(
+                day,
+                now=local_person_now,
+                expected_hours=expected,
+                start_hour=team_cfg.ratings.workday_start_hour,
+            )
+            person_future = day > local_person_now.date()
             hours = _round(hours_by_person_day.get(name, {}).get(day_key, 0.0), 2) or 0.0
-            if future or target_hours <= 0:
+            if person_future or person_target_hours <= 0:
                 level = "future"
             elif hours <= 0:
                 level = "bad"
-            elif hours + 0.01 >= target_hours:
+            elif hours + 0.01 >= person_target_hours:
                 level = "ok"
             else:
                 level = "warn"
@@ -2755,10 +2806,14 @@ def compute_sprint_report(jira_raw: dict, gitlab_raw: dict | None) -> dict:
                     ),
                     "direction": TEAM_ROSTER[name],
                     "hours": hours,
-                    "expected_hours": target_hours,
+                    "expected_hours": _round(person_target_hours, 2) or 0.0,
+                    "is_future": person_future,
+                    "is_today": day == local_person_now.date(),
+                    "workday_complete": person_target_hours + 0.01 >= expected,
+                    "timezone": team_cfg.timezone_offset_for(name),
                     "level": level,
                     "ok": level in {"ok", "future"},
-                    "delta_hours": _round(hours - target_hours, 2),
+                    "delta_hours": _round(hours - person_target_hours, 2),
                 }
             )
         rows.sort(key=lambda r: (r["ok"], r["hours"], r["name"].lower()))

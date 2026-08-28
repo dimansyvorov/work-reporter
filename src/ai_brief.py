@@ -668,7 +668,7 @@ def _llm_settings() -> dict[str, Any]:
         "reasoning": reasoning,
         "url": (os.getenv("CORP_LLM_URL") or "").strip(),
         "token": (os.getenv("CORP_LLM_TOKEN") or "").strip(),
-        "model": (os.getenv("CORP_LLM_MODEL") or "/models/Qwen3.6").strip(),
+        "model": (os.getenv("CORP_LLM_MODEL") or "Qwen3.8").strip(),
         "temperature": float(os.getenv("CORP_LLM_TEMPERATURE") or "0.2"),
         "max_tokens": int(float(os.getenv("CORP_LLM_MAX_TOKENS") or "4096")),
         "timeout": int(float(os.getenv("CORP_LLM_TIMEOUT_SEC") or "45")),

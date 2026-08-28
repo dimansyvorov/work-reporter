@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 
 from .team import TEAM_ROSTER, canonical_team_name
 from .team_config import get_team_config
-
-REPORT_TZ = ZoneInfo("Europe/Moscow")
+from .timezone_utils import person_now, person_timezone, server_today
 
 # Higher = more important when collapsing per issue/day.
 _EVENT_PRIORITY = {
@@ -55,17 +53,17 @@ def _parse_dt(value: str | None) -> datetime | None:
         return None
 
 
-def _local_day(value: str | None) -> date | None:
+def _local_day(value: str | None, tz: tzinfo) -> date | None:
     dt = _parse_dt(value)
     if not dt:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(REPORT_TZ).date()
+    return dt.astimezone(tz).date()
 
 
 def report_today() -> date:
-    return datetime.now(REPORT_TZ).date()
+    return server_today()
 
 
 def previous_workday(day: date) -> date:
@@ -420,13 +418,15 @@ def build_people_activity(
     browse_base: str,
     current_assignee_by_key: dict[str, str] | None = None,
     today: date | None = None,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """
     Build yesterday/today activity blocks keyed by roster display name.
     """
-    today = today or report_today()
-    yesterday = previous_workday(today)
-    target_days = {yesterday, today}
+    person_days: dict[str, tuple[date, date]] = {}
+    for name in people_names:
+        local_today = today or person_now(name, now).date()
+        person_days[name] = (previous_workday(local_today), local_today)
     browse_base = (browse_base or "").rstrip("/")
 
     histories = _enrich_changelogs_with_assignee(
@@ -440,9 +440,6 @@ def build_people_activity(
     )
 
     for hist in histories:
-        day = _local_day(hist.get("at"))
-        if day not in target_days:
-            continue
         candidates: set[str] = set()
         for raw in (hist.get("assignee_from"), hist.get("assignee_to")):
             c = canonical_team_name(raw)
@@ -451,6 +448,9 @@ def build_people_activity(
         if not candidates:
             continue
         for person in candidates:
+            day = _local_day(hist.get("at"), person_timezone(person))
+            if day not in set(person_days.get(person) or ()):
+                continue
             direction = TEAM_ROSTER.get(person)
             ev = _classify_history_for_person(
                 hist,
@@ -465,6 +465,7 @@ def build_people_activity(
     for person, by_day in (hours_by_person_day_issue or {}).items():
         if person not in TEAM_ROSTER:
             continue
+        target_days = set(person_days.get(person) or ())
         for day_s, by_issue in by_day.items():
             try:
                 day = date.fromisoformat(day_s)
@@ -481,7 +482,9 @@ def build_people_activity(
                 duration = _fmt_hours_minutes(float(hours))
                 buckets[person][day].append(
                     _event(
-                        at=f"{day_s}T12:00:00+03:00",
+                        at=datetime.combine(
+                            day, time(hour=12), tzinfo=person_timezone(person)
+                        ).isoformat(),
                         etype="progress",
                         issue_key=key,
                         summary=issue_summary_by_key.get(key),
@@ -494,8 +497,9 @@ def build_people_activity(
 
     out: dict[str, dict] = {}
     for name in people_names:
+        yesterday, today_for_person = person_days[name]
         y_events = buckets.get(name, {}).get(yesterday, [])
-        t_events = buckets.get(name, {}).get(today, [])
+        t_events = buckets.get(name, {}).get(today_for_person, [])
         out[name] = {
             "yesterday": _day_bucket(
                 yesterday,
@@ -503,7 +507,7 @@ def build_people_activity(
                 events=y_events,
             ),
             "today": _day_bucket(
-                today,
+                today_for_person,
                 title="Сегодня",
                 events=t_events,
             ),

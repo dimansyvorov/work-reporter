@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from statistics import pstdev
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .team import TEAM_ROSTER, canonical_team_name
 from .team_config import get_team_config
+from .timezone_utils import person_now, server_now, server_timezone
 
 
 def _place_points() -> dict[int, int]:
@@ -44,15 +44,11 @@ def _parse_dt(value: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _rating_timezone() -> ZoneInfo:
-    name = get_team_config().ratings.timezone
-    try:
-        return ZoneInfo(name)
-    except ZoneInfoNotFoundError:
-        return ZoneInfo("Europe/Moscow")
+def _rating_timezone() -> tzinfo:
+    return server_timezone()
 
 
-def _workday_start(day: date, tz: ZoneInfo, start_hour: float) -> datetime:
+def _workday_start(day: date, tz: tzinfo, start_hour: float) -> datetime:
     hour = int(start_hour)
     minute = int(round((start_hour - hour) * 60))
     if minute >= 60:
@@ -203,6 +199,21 @@ def _round(value: float | None, digits: int = 1) -> float | None:
     return round(value, digits)
 
 
+def _task_count_label(value: int) -> str:
+    number = abs(int(value))
+    if number % 10 == 1 and number % 100 != 11:
+        word = "задача"
+    elif number % 10 in {2, 3, 4} and number % 100 not in {12, 13, 14}:
+        word = "задачи"
+    else:
+        word = "задач"
+    return f"{value} {word}"
+
+
+def _hours_label(value: float) -> str:
+    return f"{float(_round(value, 1) or 0.0):g}"
+
+
 def _estimate_hours(fields: dict) -> float | None:
     seconds = (
         fields.get("timeoriginalestimate")
@@ -248,7 +259,7 @@ def _rating_window(
     sprint: dict,
     *,
     now: datetime,
-    tz: ZoneInfo,
+    tz: tzinfo,
 ) -> tuple[datetime, datetime] | None:
     """Exact rating interval: sprint start -> now, capped by sprint end."""
     start = date.fromisoformat(sprint["start_date"]) if sprint.get("start_date") else None
@@ -302,7 +313,7 @@ def completed_tasks_in_window(
     the transition. A task already done when the sprint starts is not counted.
     """
     tz = _rating_timezone()
-    local_now = now.astimezone(tz) if now else datetime.now(tz)
+    local_now = server_now(now)
     window = _rating_window(sprint, now=local_now, tz=tz)
     if not window:
         return {}
@@ -400,6 +411,7 @@ def _count_commits_from_gitlab(
     team_cfg = get_team_config()
     project_dir_keys = dict(team_cfg.gitlab_projects_keys)
 
+    seen_commits: set[tuple[str, str]] = set()
     for project in gitlab_raw.get("projects") or []:
         project_ref = project.get("ref") or ""
         mr_direction_key = project_dir_keys.get(project_ref)
@@ -408,30 +420,28 @@ def _count_commits_from_gitlab(
             name = team_cfg.gitlab_projects.get(project_ref)
             mr_direction_key = team_cfg.resolve_direction_key(name)
 
-        for bucket in (
-            project.get("merge_requests_merged") or [],
-            project.get("merge_requests_open") or [],
-        ):
-            for mr in bucket:
-                for commit in mr.get("commit_events") or []:
-                    committed = _parse_dt(commit.get("committed_at"))
-                    if not committed:
-                        continue
-                    committed = committed.astimezone(window_start.tzinfo)
-                    if committed < window_start or committed > window_end:
-                        continue
-                    author_name = commit.get("author")
-                    author = canonical_team_name(author_name)
-                    if not author:
-                        continue
-                    commits_by_person[author] += 1
-                    person_key = team_cfg.direction_key_for_person(author)
-                    if (
-                        mr_direction_key
-                        and person_key
-                        and mr_direction_key != person_key
-                    ):
-                        helper_commits[author] += 1
+        project_token = str(project_ref or project.get("id") or "")
+        for commit in project.get("repository_commit_events") or []:
+            commit_id = str(commit.get("id") or "").strip()
+            if not project_token or not commit_id:
+                continue
+            committed = _parse_dt(commit.get("committed_at"))
+            if not committed:
+                continue
+            committed = committed.astimezone(window_start.tzinfo)
+            if committed < window_start or committed > window_end:
+                continue
+            author = canonical_team_name(commit.get("author"))
+            if not author:
+                continue
+            commit_token = (project_token, commit_id)
+            if commit_token in seen_commits:
+                continue
+            seen_commits.add(commit_token)
+            commits_by_person[author] += 1
+            person_key = team_cfg.direction_key_for_person(author)
+            if mr_direction_key and person_key and mr_direction_key != person_key:
+                helper_commits[author] += 1
 
     return commits_by_person, helper_commits
 
@@ -453,7 +463,7 @@ def compute_ratings(
 ) -> list[dict]:
     rating_cfg = get_team_config().ratings
     tz = _rating_timezone()
-    now = now.astimezone(tz) if now else datetime.now(tz)
+    now = server_now(now)
     today = now.date()
     start = date.fromisoformat(sprint["start_date"]) if sprint.get("start_date") else None
     end = date.fromisoformat(sprint["end_date"]) if sprint.get("end_date") else None
@@ -474,9 +484,6 @@ def compute_ratings(
                 start_hour=rating_cfg.workday_start_hour,
             ) / expected_hours
     half_passed = bool(all_workdays) and elapsed_workdays / len(all_workdays) >= 0.5
-    work_until = min(end, today)
-    workdays = _working_days(start, work_until)
-
     window = _rating_window(sprint, now=now, tz=tz)
     if not window:
         return []
@@ -498,11 +505,15 @@ def compute_ratings(
     closed_estimate_by_person: dict[str, float] = defaultdict(float)
     over_estimate: dict[str, float] = defaultdict(float)
     under_estimate_closed: dict[str, int] = defaultdict(int)
+    under_estimate_hours: dict[str, float] = defaultdict(float)
+    underestimator_tasks: dict[str, list[dict]] = defaultdict(list)
+    completed_keys: set[str] = set()
 
     for person, completed in completed_by_person.items():
         closed_by_person[person] = len(completed)
         for task in completed:
             key = task.get("key") or ""
+            completed_keys.add(key.upper())
             spent = float(person_issue_hours.get(person, {}).get(key, 0.0))
             estimate = task.get("estimate_hours")
             task["hours"] = _round(spent, 2) or 0.0
@@ -510,8 +521,41 @@ def compute_ratings(
                 closed_estimate_by_person[person] += float(estimate)
             if estimate is not None and spent > 0 and spent < estimate:
                 under_estimate_closed[person] += 1
+                under_estimate_hours[person] += float(estimate) - spent
+                task["difference_hours"] = _round(spent - float(estimate), 2)
             if estimate is not None and spent > estimate:
                 over_estimate[person] += spent - estimate
+                task["difference_hours"] = _round(spent - float(estimate), 2)
+                underestimator_tasks[person].append(task)
+
+    # «Недооценщик» also includes current-sprint tasks that have not entered a
+    # final direction status. Completed tasks keep their owner-at-transition;
+    # every other task belongs to its current assignee.
+    for issue in issues:
+        key = (issue.get("key") or "").upper()
+        if not key or key in completed_keys:
+            continue
+        person = _canonical_assignee(issue)
+        if person not in TEAM_ROSTER:
+            continue
+        fields = issue.get("fields") or {}
+        estimate = _estimate_hours(fields)
+        spent = float(person_issue_hours.get(person, {}).get(key, 0.0))
+        if estimate is None or estimate <= 0 or spent <= estimate:
+            continue
+        excess = spent - estimate
+        over_estimate[person] += excess
+        underestimator_tasks[person].append(
+            {
+                "key": key,
+                "summary": fields.get("summary") or key,
+                "status": ((fields.get("status") or {}).get("name")),
+                "completed_at": None,
+                "estimate_hours": _round(estimate, 2),
+                "hours": _round(spent, 2) or 0.0,
+                "difference_hours": _round(excess, 2),
+            }
+        )
 
     categories: list[dict] = []
     prize_points: dict[str, int] = defaultdict(int)
@@ -530,6 +574,13 @@ def compute_ratings(
     # 1) Человек-стабильность: pace vs elapsed work time + worklog discipline.
     stability_rows = []
     for name in TEAM_ROSTER:
+        local_now = person_now(name, now)
+        person_work_until = min(end, local_now.date())
+        workdays = (
+            _working_days(start, person_work_until)
+            if person_work_until >= start
+            else []
+        )
         daily = []
         day_targets = []
         for day in workdays:
@@ -537,7 +588,7 @@ def compute_ratings(
             day_targets.append(
                 _expected_hours_for_day(
                     day,
-                    now=now,
+                    now=local_now,
                     expected_hours=expected_hours,
                     start_hour=rating_cfg.workday_start_hour,
                 )
@@ -562,7 +613,7 @@ def compute_ratings(
         discipline = _worklog_discipline(
             name,
             worklogs=worklogs or [],
-            now=now,
+            now=local_now,
             expected_hours=expected_hours,
             start_hour=rating_cfg.workday_start_hour,
             grace_workdays=rating_cfg.worklog_grace_workdays,
@@ -634,8 +685,8 @@ def compute_ratings(
             "id": "committer",
             "title": "Коммитёр",
             "description": (
-                "Больше всех коммитов с committed date внутри текущего спринта "
-                "(по автору коммита)"
+                "Больше всех уникальных коммитов во всех ветках настроенных "
+                "проектов с committed date внутри текущего спринта"
             ),
             "enabled": len(committer_rows) >= 1,
             "people": committer_top,
@@ -720,14 +771,13 @@ def compute_ratings(
             "name": name,
             "direction": TEAM_ROSTER[name],
             "score": over_estimate.get(name, 0.0),
-            "value": f"+{_round(over_estimate.get(name, 0.0), 1)} ч",
+            "tiebreak": len(underestimator_tasks.get(name) or []),
+            "value": (
+                f"{_task_count_label(len(underestimator_tasks.get(name) or []))} · "
+                f"+{_hours_label(over_estimate.get(name, 0.0))} ч"
+            ),
             "detail": "списал больше оценки",
-            "tasks": [
-                task
-                for task in (completed_by_person.get(name) or [])
-                if task.get("estimate_hours") is not None
-                and float(task.get("hours") or 0.0) > float(task["estimate_hours"])
-            ],
+            "tasks": list(underestimator_tasks.get(name) or []),
         }
         for name in TEAM_ROSTER
         if over_estimate.get(name, 0.0) > 0
@@ -739,8 +789,8 @@ def compute_ratings(
             "id": "underestimator",
             "title": "Недооценщик",
             "description": (
-                "Больше всех списал в спринте сверх Original Estimate по задачам, "
-                "завершённым в этом спринте"
+                "Больше всех списал в спринте сверх Original Estimate по задачам "
+                "текущего спринта независимо от их статуса"
             ),
             "enabled": half_passed,
             "people": under_top,
@@ -752,9 +802,13 @@ def compute_ratings(
         {
             "name": name,
             "direction": TEAM_ROSTER[name],
-            "score": under_estimate_closed.get(name, 0),
-            "value": f"{under_estimate_closed.get(name, 0)} задач",
-            "detail": TEAM_ROSTER[name],
+            "score": under_estimate_hours.get(name, 0.0),
+            "tiebreak": under_estimate_closed.get(name, 0),
+            "value": (
+                f"{_task_count_label(under_estimate_closed.get(name, 0))} · "
+                f"-{_hours_label(under_estimate_hours.get(name, 0.0))} ч"
+            ),
+            "detail": "завершил с меньшими списаниями",
             "tasks": [
                 task
                 for task in (completed_by_person.get(name) or [])
@@ -772,7 +826,8 @@ def compute_ratings(
             "id": "overestimator",
             "title": "Переоценщик",
             "description": (
-                "Завершил в этом спринте больше задач со списанием спринта ниже оценки"
+                "Наибольшая суммарная разница между Original Estimate и "
+                "списаниями по завершённым в этом спринте задачам"
             ),
             "enabled": half_passed,
             "people": over_top,

@@ -37,7 +37,7 @@ class SprintWindowTest(unittest.TestCase):
             name="Sprint 14",
             start=datetime(2026, 8, 3, tzinfo=timezone.utc),
             end=datetime(2026, 8, 14, 21, tzinfo=timezone.utc),
-            timezone_name="Europe/Moscow",
+            utc_offset=3,
         )
 
         self.assertEqual(window.end, date(2026, 8, 14))

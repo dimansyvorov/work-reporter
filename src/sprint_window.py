@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import date, datetime, timedelta, timezone
 
 
 _NAME_RANGE_RE = re.compile(
@@ -45,28 +44,24 @@ def sprint_name_window(name: str | None) -> SprintWindow | None:
     return SprintWindow(start=start, end=end, source="name")
 
 
-def _local_day(value: datetime | None, timezone_name: str) -> date | None:
+def _fixed_timezone(utc_offset: float):
+    return timezone(timedelta(hours=float(utc_offset)))
+
+
+def _local_day(value: datetime | None, utc_offset: float) -> date | None:
     if value is None:
         return None
-    try:
-        tz = ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError:
-        tz = ZoneInfo("Europe/Moscow")
     if value.tzinfo is None:
         return value.date()
-    return value.astimezone(tz).date()
+    return value.astimezone(_fixed_timezone(utc_offset)).date()
 
 
-def _local_datetime(value: datetime | None, timezone_name: str) -> datetime | None:
+def _local_datetime(value: datetime | None, utc_offset: float) -> datetime | None:
     if value is None:
         return None
-    try:
-        tz = ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError:
-        tz = ZoneInfo("Europe/Moscow")
     if value.tzinfo is None:
         return value
-    return value.astimezone(tz)
+    return value.astimezone(_fixed_timezone(utc_offset))
 
 
 def normalize_sprint_window(
@@ -74,7 +69,7 @@ def normalize_sprint_window(
     name: str | None,
     start: datetime | None,
     end: datetime | None,
-    timezone_name: str = "Europe/Moscow",
+    utc_offset: float = 3.0,
 ) -> SprintWindow:
     """Return one inclusive sprint interval used by all report calculations.
 
@@ -86,9 +81,9 @@ def normalize_sprint_window(
     if named:
         return named
 
-    start_day = _local_day(start, timezone_name)
-    end_day = _local_day(end, timezone_name)
-    local_end = _local_datetime(end, timezone_name)
+    start_day = _local_day(start, utc_offset)
+    end_day = _local_day(end, utc_offset)
+    local_end = _local_datetime(end, utc_offset)
     raw_midnight = end is not None and not any(
         (end.hour, end.minute, end.second, end.microsecond)
     )

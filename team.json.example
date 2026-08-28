@@ -1,4 +1,5 @@
 {
+  "server_timezone": 3,
   "directions": {
     "analytics": {
       "name": "Аналитика",
@@ -67,7 +68,6 @@
       "2": 2,
       "3": 1
     },
-    "timezone": "Europe/Moscow",
     "workday_start_hour": 9,
     "worklog_grace_workdays": 1,
     "advance_tolerance_hours": 0.5
@@ -79,6 +79,7 @@
     {
       "name": "Иванов Иван Иванович",
       "direction": "mobile",
+      "timezone": 10,
       "lead": true,
       "gender": "мужской",
       "aliases": ["Ivan Ivanov", "ivan.ivanov"],

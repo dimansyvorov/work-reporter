@@ -2172,7 +2172,7 @@ function renderRatings(ratings) {
     if (category.id !== "stability" || !person.stability) {
       return person.detail || person.direction || "";
     }
-    return `темп ${stabilityPct(person.stability.pace_pct)} · вовремя ${stabilityPct(person.stability.timely_pct)}`;
+    return `темп ${stabilityPct(person.stability.pace_pct)} · сроки ${stabilityPct(person.stability.timely_pct)}`;
   };
 
   root.innerHTML = ordered
@@ -3717,12 +3717,30 @@ function openRatingModal(catId) {
     if (cat.id !== "stability" || !stability) {
       return `<div class="muted rating-score-detail">${escapeHtml(person.detail || "")}</div>`;
     }
+    const timing = stability.recording_timing;
+    const timingRows = [
+      ["same_day", "День в день"],
+      ["next_workday", "На следующий рабочий день"],
+      ["later", "Позже"],
+      ...(timing?.before_workday?.pct > 0 || timing?.before_workday?.hours > 0
+        ? [["before_workday", "До даты работ"]]
+        : []),
+    ];
+    const timingHtml = timing
+      ? `<div class="rating-worklog-timing" title="Доли списанных часов с известным временем внесения, в часовом поясе сотрудника. Внесение в выходные за пятницу относится к следующему рабочему дню.">
+          ${timingRows.map(([key, label]) => `<span>${escapeHtml(label)} <strong>${escapeHtml(stabilityPct(timing[key]?.pct))}</strong> · ${escapeHtml(fmtNumber(timing[key]?.hours))} ч</span>`).join("")}
+        </div>`
+      : `<span class="rating-worklog-timing">Нет данных о сроках внесения</span>`;
+    const cadenceHtml = stability.cadence_pct == null
+      ? ""
+      : `<span>Равномерность <strong>${escapeHtml(stabilityPct(stability.cadence_pct))}</strong></span>`;
     return `
       <div class="rating-stability-details">
         <span>Темп <strong>${escapeHtml(stabilityPct(stability.pace_pct))}</strong></span>
-        <span>Вовремя <strong>${escapeHtml(stabilityPct(stability.timely_pct))}</strong></span>
+        <span>Своевременность <strong>${escapeHtml(stabilityPct(stability.timely_pct))}</strong></span>
+        ${timingHtml}
         <span>Наперёд <strong>${escapeHtml(fmtNumber(stability.advance_hours || 0))} ч</strong> за ${escapeHtml(fmtNumber(stability.advance_days || 0))} дн.</span>
-        <span>Равномерность <strong>${escapeHtml(stabilityPct(stability.cadence_pct))}</strong></span>
+        ${cadenceHtml}
         <span>Закрыто задач <strong>${escapeHtml(fmtNumber(stability.closed_tasks || 0))}</strong></span>
       </div>`;
   };

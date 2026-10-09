@@ -12,9 +12,10 @@ from typing import Any
 from dotenv import load_dotenv
 
 from .config import ROOT
+from .release_timing import RELEASE_PUBLICATION_POLICY, release_publication_facts
 from .team_config import get_team_config
 
-PROMPT_VERSION = "sprint-brief-v8"
+PROMPT_VERSION = "sprint-brief-v9"
 
 SYSTEM_PROMPT = """Ты — аналитик спринтовой разработки. Тебе дают только JSON-снимок спринта (уже агрегированные метрики команды).
 
@@ -31,6 +32,13 @@ SYSTEM_PROMPT = """Ты — аналитик спринтовой разрабо
    текущего спринта. Не рассуждай о релизах за его пределами и не проси данные о них.
    Учитывай description, key_topics и key_tasks: это бизнесовый состав релиза и
    ключевая работа для достижения цели спринта.
+   Плановая дата релиза — это весь календарный день: штатно публикация выполняется
+   вечером после завершения рабочего дня. Поэтому released=false при days_left=0
+   НЕ означает, что релиз опоздал, уже должен был быть выпущен или блокирует цель.
+   В этот день оценивай только готовность к вечернему окну по задачам и явно говори,
+   что само отсутствие публикации пока не является задержкой. Просрочка публикации
+   начинается только со следующего календарного дня. Поля risk/risk_label описывают
+   готовность работ и не отменяют подготовленный publication_overdue=false.
 7. Различай срочные и несрочные задачи в нагрузке человека:
    - urgent / on_goal_release — важны для цели/ближайшего релиза;
    - carryover (перенос из прошлых спринтов, tag «Задержка») — часто раздувают % нагрузки,
@@ -160,6 +168,7 @@ def _release_row(rel: dict) -> dict:
         "risk": rel.get("risk"),
         "label": rel.get("risk_label") or rel.get("label"),
         "days_left": rel.get("days_left"),
+        "publication": release_publication_facts(rel),
         "description": (str(rel.get("description") or "")[:240] or None),
         "key_topics": topics,
         "key_tasks": [
@@ -527,6 +536,7 @@ def build_ai_snapshot(sprint_report: dict) -> dict:
         )
 
     return {
+        "release_publication_policy": RELEASE_PUBLICATION_POLICY,
         "sprint": {
             "name": sprint.get("name"),
             "start_date": sprint.get("start_date"),

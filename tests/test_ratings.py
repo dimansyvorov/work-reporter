@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from src.ratings import compute_ratings
 from src.team import TEAM_ROSTER
+from src.team_config import get_team_config
 
 
 TZ = ZoneInfo("Europe/Moscow")
@@ -211,6 +212,38 @@ class RatingsWindowTest(unittest.TestCase):
             row for row in category["all_people"] if row["name"] == person
         )
         self.assertLess(person_row["stability"]["pace_pct"], 100)
+
+    def test_stability_next_day_penalty_is_2_45_points_and_exports_breakdown(self):
+        person = next(iter(TEAM_ROSTER))
+        scores = []
+        settings = get_team_config().ratings
+        for day in (17, 18):
+            recorded = f"2026-08-{day}T17:00:00+03:00"
+            with (
+                patch("src.ratings.person_now", side_effect=lambda name, now: now.astimezone(TZ)),
+                patch.object(settings, "worklog_grace_workdays", 1),
+                patch.object(settings, "workday_start_hour", 9),
+            ):
+                rows = _ratings(
+                    now=datetime(2026, 8, 18, 18, tzinfo=TZ),
+                    hours_by_person_day={person: {"2026-08-17": 8}},
+                    worklogs=[{
+                        "author": {"displayName": person},
+                        "started": "2026-08-17T09:00:00+03:00",
+                        "created": recorded,
+                        "updated": recorded,
+                        "time_spent_seconds": 8 * 3600,
+                    }],
+                )
+            category = _category(rows, "stability")
+            scores.append(next(row for row in category["all_people"] if row["name"] == person))
+
+        same_day, next_day = scores
+        self.assertAlmostEqual(same_day["score"] - next_day["score"], 2.45)
+        self.assertEqual(next_day["stability"]["timely_pct"], 90)
+        self.assertEqual(next_day["stability"]["recording_timing"]["next_workday"], {"hours": 8, "pct": 100})
+        for key in ("pace_pct", "advance_hours", "advance_days", "cadence_pct", "spread", "closed_tasks"):
+            self.assertEqual(same_day["stability"][key], next_day["stability"][key])
 
     def test_underestimator_includes_active_tasks_and_shows_task_count(self):
         person = next(iter(TEAM_ROSTER))

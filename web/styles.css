@@ -3333,6 +3333,14 @@ body.modal-open {
   font-weight: 700;
 }
 
+.rating-worklog-timing {
+  display: grid;
+  gap: 0.18rem;
+  margin-bottom: 0.2rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--line);
+}
+
 .rating-modal-row.place-1 {
   background: linear-gradient(90deg, rgba(240, 193, 75, 0.18), rgba(255, 255, 255, 0.75));
 }

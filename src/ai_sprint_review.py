@@ -17,12 +17,13 @@ from .ai_brief import (
     humanize_ai_text,
     short_model_name,
 )
+from .release_timing import RELEASE_PUBLICATION_POLICY, release_publication_facts
 from .sprint_window import sprint_name_window
 from .team_config import get_team_config
 from .timezone_utils import server_now, server_timezone
 
 
-PROMPT_VERSION = "sprint-review-v2"
+PROMPT_VERSION = "sprint-review-v3"
 
 SYSTEM_PROMPT = """Ты — аналитик завершения спринта. Python уже разобрал Jira changelog,
 списания, даты, переходы статусов, текущие и планируемые релизы и передал тебе только
@@ -40,6 +41,10 @@ SYSTEM_PROMPT = """Ты — аналитик завершения спринта
    ниже 0.58 или match_state=uncertain, пиши «не удалось уверенно сопоставить», а не
    утверждай, что задача отсутствует.
 6. Если интервал следующего спринта forecast=true, называй его прогнозным.
+   Если один из итогов приходится на текущую плановую дату, учитывай штатный процесс:
+   релиз обычно публикуется вечером после рабочего дня. released=false в этот день
+   ещё не означает задержку или невыполнение цели; оцени готовность по задачам.
+   Просрочка публикации начинается только со следующего календарного дня.
 7. Задачи упоминай только ключом в бэктиках. Людей — коротко и нейтрально.
 8. Пиши по-русски, спокойно, конкретно, без эмодзи и общих советов. 140–230 слов.
 9. Удобный формат: короткий итог, несколько содержательных буллетов и 2–4
@@ -315,6 +320,7 @@ def build_sprint_review_snapshot(sprint_report: dict, *, now: datetime | None = 
                     "date": release_day.isoformat(),
                     "description": release.get("description") or None,
                     "tasks_total": len(tasks),
+                    "publication": release_publication_facts(release),
                     "key_topics": [
                         _match_topic(
                             topic,
@@ -329,6 +335,7 @@ def build_sprint_review_snapshot(sprint_report: dict, *, now: datetime | None = 
 
     in_sprint_releases = [r for r in releases if r.get("in_sprint") is True]
     return {
+        "release_publication_policy": RELEASE_PUBLICATION_POLICY,
         "sprint": {
             "id": sprint.get("id"),
             "name": sprint.get("name"),
@@ -353,6 +360,7 @@ def build_sprint_review_snapshot(sprint_report: dict, *, now: datetime | None = 
                 "active": release.get("tasks_active"),
                 "risk": release.get("risk"),
                 "description": release.get("description") or None,
+                "publication": release_publication_facts(release),
             }
             for release in in_sprint_releases
         ],

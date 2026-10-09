@@ -9,6 +9,9 @@ from .team_config import get_team_config
 from .timezone_utils import person_now, server_now, server_timezone
 
 
+_WORKLOG_GRACE_CREDIT = 0.9
+
+
 def _place_points() -> dict[int, int]:
     return dict(get_team_config().ratings.place_points)
 
@@ -124,19 +127,39 @@ def _worklog_discipline(
         return {
             "score": 100.0,
             "timely_pct": None,
+            "recording_timing": None,
             "advance_hours": 0.0,
             "advance_days": 0,
             "cadence_pct": None,
             "known_hours": 0.0,
         }
 
-    timely_hours = 0.0
+    timely_credit_hours = 0.0
+    timing_hours = dict.fromkeys(
+        ("same_day", "next_workday", "later", "before_workday"), 0.0
+    )
     advance_hours = 0.0
     by_day: dict[date, list[dict]] = defaultdict(list)
     for row in rows:
+        recorded_day = row["recorded"].date()
+        work_day = row["work_day"]
+        if recorded_day < work_day:
+            timing_bucket = "before_workday"
+        elif recorded_day == work_day:
+            timing_bucket = "same_day"
+        elif recorded_day <= _next_workday(work_day):
+            # Friday logs entered over the weekend or on Monday share this bucket.
+            timing_bucket = "next_workday"
+        else:
+            timing_bucket = "later"
+        timing_hours[timing_bucket] += row["hours"]
+
         allowed_day = _allowed_record_day(row["work_day"], grace_workdays)
-        if row["recorded"].date() <= allowed_day:
-            timely_hours += row["hours"]
+        if recorded_day <= work_day:
+            # Early entries retain their separate advance-hours penalty.
+            timely_credit_hours += row["hours"]
+        elif recorded_day <= allowed_day:
+            timely_credit_hours += row["hours"] * _WORKLOG_GRACE_CREDIT
         by_day[row["work_day"]].append(row)
 
     cadence_values: list[float] = []
@@ -174,7 +197,7 @@ def _worklog_discipline(
             span = (record_times[-1] - record_times[0]).total_seconds() / 3600.0
             cadence_values.append(min(1.0, max(0.0, span / (expected_hours * 0.6))))
 
-    timely_pct = timely_hours / total_hours
+    timely_pct = timely_credit_hours / total_hours
     advance_ratio = min(1.0, advance_hours / total_hours)
     cadence_pct = (
         sum(cadence_values) / len(cadence_values) if cadence_values else None
@@ -186,6 +209,10 @@ def _worklog_discipline(
     return {
         "score": max(0.0, min(100.0, score)),
         "timely_pct": timely_pct * 100.0,
+        "recording_timing": {
+            bucket: {"hours": round(hours, 2), "pct": round(hours / total_hours * 100.0, 1)}
+            for bucket, hours in timing_hours.items()
+        },
         "advance_hours": advance_hours,
         "advance_days": advance_days,
         "cadence_pct": cadence_pct * 100.0 if cadence_pct is not None else None,
@@ -633,13 +660,14 @@ def compute_ratings(
                 "value": f"{_round(score, 0)} баллов",
                 "detail": (
                     f"темп {_round(mean_day * 100.0, 0)}% · "
-                    f"вовремя {timely_text} · "
+                    f"сроки {timely_text} · "
                     f"наперёд {_round(discipline.get('advance_hours') or 0.0, 1)} ч "
                     f"за {int(discipline.get('advance_days') or 0)} дн."
                 ),
                 "stability": {
                     "pace_pct": _round(mean_day * 100.0, 1),
                     "timely_pct": _round(timely, 1),
+                    "recording_timing": discipline["recording_timing"],
                     "advance_hours": _round(discipline.get("advance_hours"), 2),
                     "advance_days": int(discipline.get("advance_days") or 0),
                     "cadence_pct": _round(discipline.get("cadence_pct"), 1),
@@ -657,6 +685,8 @@ def compute_ratings(
             "description": (
                 "Темп списаний относительно уже прошедшего рабочего времени; "
                 "учитываются задние и преждевременные worklog. "
+                "Своевременность по часам: день в день — 100%, "
+                "в пределах допуска — 90%, позже — 0%. "
                 "При равном балле выше тот, у кого больше задач завершено "
                 "после начала спринта"
             ),

@@ -18,8 +18,9 @@ from .ai_brief import (
     humanize_ai_text,
     short_model_name,
 )
+from .release_timing import RELEASE_PUBLICATION_POLICY, release_publication_facts
 
-PROMPT_VERSION = "release-group-brief-v4"
+PROMPT_VERSION = "release-group-brief-v5"
 
 SYSTEM_PROMPT = """Ты — аналитик релизов в спринтовой разработке.
 Тебе дают JSON-снимок ГРУППЫ релизов на ОДНУ дату релиза: несколько Fix Version
@@ -39,6 +40,13 @@ SYSTEM_PROMPT = """Ты — аналитик релизов в спринтов�
 5. Если в группе несколько релизов — кратко упомяни, где основной риск (по имени релиза),
    но вердикт один на всю дату.
 6. Выпущенные релизы сюда не передаются и оценивать их не нужно.
+   Если сегодня плановая дата, релиз обычно публикуется вечером после рабочего дня.
+   Поэтому released=false при days_left=0 — штатное состояние, а не просрочка и не
+   доказательство того, что релиз уже должен был быть выпущен. Не называй публикацию
+   задержанной и не объявляй её блокером только на этом основании. Вместо этого оцени,
+   готова ли группа к вечернему выпуску по незавершённым задачам. Просрочка публикации
+   начинается со следующего календарного дня. risk/risk_label описывают готовность
+   работ и не отменяют подготовленный publication_overdue=false.
 7. Если риск низкий — пиши 2–4 предложения. Если есть угроза сроку — разверни
    только существенные риски и действия;
    задач упоминай точечно (обычно 2–5 ключей), не каталогом.
@@ -330,6 +338,7 @@ def build_release_snapshot(sprint_report: dict, release: dict) -> dict:
             "capacity_hours": release.get("capacity_hours"),
             "risk": release.get("risk"),
             "risk_label": release.get("risk_label"),
+            "publication": release_publication_facts(release),
             "on_sprint_goal": on_goal,
         },
         "sprint_goal": {
@@ -379,6 +388,8 @@ def build_release_group_snapshot(sprint_report: dict, releases: list[dict]) -> d
                 "risk": rmeta.get("risk"),
                 "risk_label": rmeta.get("risk_label"),
                 "released": rmeta.get("released"),
+                "publication": rmeta.get("publication")
+                or release_publication_facts(rel),
                 "on_sprint_goal": rmeta.get("on_sprint_goal"),
             }
         )
@@ -443,6 +454,7 @@ def build_release_group_snapshot(sprint_report: dict, releases: list[dict]) -> d
             days_left = d if days_left is None else min(days_left, d)
 
     return {
+        "release_publication_policy": RELEASE_PUBLICATION_POLICY,
         "release_date": None if date_key == "undated" else date_key,
         "group_key": date_key,
         "releases": release_rows,
